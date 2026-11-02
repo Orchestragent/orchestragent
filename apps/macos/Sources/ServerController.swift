@@ -72,18 +72,21 @@ final class ServerController {
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             if data.isEmpty { handle.readabilityHandler = nil }
-            Task { @MainActor in self?.consumeOutput(data, id: id) }
+            guard let owner = self else { return }
+            Task { @MainActor in owner.consumeOutput(data, id: id) }
         }
         stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             if data.isEmpty { handle.readabilityHandler = nil }
-            Task { @MainActor in self?.consumeError(data, id: id) }
+            guard let owner = self else { return }
+            Task { @MainActor in owner.consumeError(data, id: id) }
         }
         child.terminationHandler = { [weak self] _ in
+            guard let owner = self else { return }
             Task { @MainActor in
-                guard let self, self.launchID == id else { return }
-                self.isRunning = false
-                if self.handshake == nil { self.launchError = self.failure(L("orch exited before the startup handshake.", "orch 在启动握手前退出。")) }
+                guard owner.launchID == id else { return }
+                owner.isRunning = false
+                if owner.handshake == nil { owner.launchError = owner.failure(L("orch exited before the startup handshake.", "orch 在启动握手前退出。")) }
             }
         }
         do { try child.run(); isRunning = true } catch { shutdown(); throw error }
