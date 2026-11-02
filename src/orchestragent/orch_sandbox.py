@@ -97,8 +97,11 @@ def mac_profile(workdir: Path, toolchain: Toolchain) -> str:
     readable = " ".join(f"(subpath {dumps(str(p.resolve()))})" for p in toolchain.read_only)
     return (
         "(version 1)(deny default)(deny network*)"
-        '(allow network* (local ip "localhost:*") (remote ip "localhost:*"))'
-        '(allow network* (remote unix-socket))'
+        # Loopback only. Outbound is filtered on the remote end: a `local ip` filter also
+        # matches outbound connects (CI macos-14 reached 1.1.1.1 through it).
+        '(allow network-outbound (remote ip "localhost:*"))'
+        '(allow network-bind network-inbound (local ip "localhost:*"))'
+        '(allow network-outbound (remote unix-socket))'
         "(allow process-fork)(allow signal (target same-sandbox))"
         "(allow process-info*)(allow sysctl-read)(allow mach-lookup)(allow ipc-posix-shm)"
         f"(allow process-exec (subpath {dumps(str(workdir))}) "

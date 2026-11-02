@@ -58,3 +58,11 @@ def test_output_is_bounded(tmp_path: Path) -> None:
     result = run(tmp_path, ["/bin/sh", "-c", "yes x | head -c 200000"], SHELL, timeout=30,
                  output_limit=10000)
     assert result.truncated and len(result.output) <= 10000 and not result.ok
+
+
+def test_profile_never_allows_outbound_by_local_address(tmp_path: Path) -> None:
+    from orchestragent.orch_sandbox import mac_profile
+
+    profile = mac_profile(tmp_path, SHELL)
+    assert "(local ip" not in profile.split("network-bind", 1)[0]
+    assert '(allow network-outbound (remote ip "localhost:*"))' in profile
