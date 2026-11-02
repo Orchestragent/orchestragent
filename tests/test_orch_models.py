@@ -26,6 +26,7 @@ def test_the_default_is_the_verified_benchmark_set(tmp_path: Path) -> None:
     ("planner", "openai/gpt:high"), ("planner", "claude/claude-opus-5-5:extreme"),
     ("builder", "claude/claude-opus-5-5:extreme"), ("test_designer", "dsh/deepseek-chat:low"),
     ("builder", "kimi/k3"), ("builder", "unregistered/model"), ("builder", "codex/"),
+    ("builder", "dsh/deepseek-v4-pro:low"),  # not offered
     ("reviewer", "gpt"), ("pilot", "x"),
 ])
 def test_unsupported_choices_are_refused_with_the_allowed_form(role: str, value: str) -> None:
@@ -36,10 +37,10 @@ def test_unsupported_choices_are_refused_with_the_allowed_form(role: str, value:
 def test_set_reset_and_precedence_env_over_config_over_verified(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert "unverified" in set_role("builder", "dsh/deepseek-v4-pro:low", tmp_path)
-    assert effective(tmp_path)["builder"] == ("dsh/deepseek-v4-pro:low", "config")
-    monkeypatch.setenv("ORCHESTRA_BUILDER", "dsh/deepseek-flash:high")
-    assert effective(tmp_path)["builder"] == ("dsh/deepseek-flash:high", "env")
+    assert "unverified" in set_role("builder", "dsh/deepseek-flash:high", tmp_path)
+    assert effective(tmp_path)["builder"] == ("dsh/deepseek-flash:high", "config")
+    monkeypatch.setenv("ORCHESTRA_BUILDER", "dsh/deepseek-flash:max")
+    assert effective(tmp_path)["builder"] == ("dsh/deepseek-flash:max", "env")
     monkeypatch.delenv("ORCHESTRA_BUILDER")
     assert "Custom: builder" in table(tmp_path)[-1]
     reset("builder", tmp_path)
@@ -60,7 +61,7 @@ def test_older_single_purpose_variables_still_work(monkeypatch: pytest.MonkeyPat
 
 
 def test_the_engine_uses_the_configured_roles(tmp_path: Path) -> None:
-    set_role("builder", "dsh/deepseek-v4-pro:low", tmp_path)
+    set_role("builder", "dsh/deepseek-flash:high", tmp_path)
     set_role("reviewer", "off", tmp_path)
     env = {**os.environ, "ORCHESTRA_DATA_DIR": str(tmp_path),
            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
@@ -70,7 +71,7 @@ def test_the_engine_uses_the_configured_roles(tmp_path: Path) -> None:
              "print(o.DSF.model, o.DSF_EXTENDED.model, o.COVERAGE_REVIEW, o.PLANNER.effort)")
     out = subprocess.run([sys.executable, "-c", probe], env=env, capture_output=True,
                          text=True, check=True).stdout.split()
-    assert out == ["deepseek-v4-pro", "deepseek-v4-pro", "False", "medium"]
+    assert out == ["deepseek-flash", "deepseek-flash", "False", "medium"]
 
 
 def test_byoc_and_registered_byok_providers_serve_any_model_role(tmp_path: Path) -> None:

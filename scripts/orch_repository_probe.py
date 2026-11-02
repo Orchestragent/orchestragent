@@ -297,7 +297,7 @@ def single_agent(orch, clients, case, output, base, trial, result, phases, timeo
     request = dumps({"prompt": prompt, "schema": schema})
     receipt = Call("single-opus-" + uuid.uuid4().hex[:12], "single-opus", "claude",
                    "claude-opus-5-5", "single-agent", time.time(), scope="baseline",
-                   effort="high", prompt_hash=digest(request), request_bytes=len(request.encode()),
+                   effort=effort, prompt_hash=digest(request), request_bytes=len(request.encode()),
                    base_revision=base)
     started = time.monotonic()
     print("[single-agent] Opus reads, edits and tests the same repository", flush=True)

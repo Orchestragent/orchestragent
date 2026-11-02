@@ -37,7 +37,7 @@ class Choice:
 
 CLAUDE_EFFORTS = ("low", "medium", "high", "max")
 CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max")
-DSF_MODELS = ("deepseek-flash", "deepseek-v4-pro")
+DSF_MODELS = ("deepseek-flash",)  # V4 Pro is not offered (maintainer decision)
 DSF_EFFORTS = ("off", "low", "high", "max")
 BYOK_EFFORTS = ("", "low", "medium", "high")
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}")
@@ -51,7 +51,10 @@ VERIFIED: dict[str, str] = {
     "planner": "claude/claude-opus-5-5:medium",
     "test_designer": "dsh/deepseek-flash:low",
     "builder": "dsh/deepseek-flash:low",
-    "reviewer": "planner",
+    # Off by default: on NetworkX (2026-11-02) the shard review added US$1-3 and 100-300 s of
+    # planning per run without a consistent acceptance gain; the decisive-assertion rule in
+    # test design fixed the misses it targeted (rollout 8/8, 975 s, review off).
+    "reviewer": "off",
 }
 DESCRIPTIONS = {
     "planner": "splits the spec into tasks, boundaries and interfaces",
@@ -89,7 +92,7 @@ def parse(role: str, value: str, data_dir: Path | None = None) -> Choice | str:
                "dsh": DSF_EFFORTS}
     if provider == "dsh" and model not in DSF_MODELS:
         raise ValueError("dsh serves " + " or ".join(DSF_MODELS)
-                         + "; register other DeepSeek models as a provider")
+                         + "; other models: register a provider (orch providers add)")
     if provider in allowed:
         if effort not in allowed[provider]:
             raise ValueError(f"{provider} effort must be one of "

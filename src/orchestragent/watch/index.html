@@ -176,12 +176,14 @@ function columns() {
 }
 function layout() {
   const cols = columns(), n = cols.length, pos = {};
-  const w = Math.min(190, (W - 40) / n - 30), h = 62, margin = w / 2 + 14;
+  const w = Math.min(190, (W - 40) / n - 14), h = 62, margin = w / 2 + 14;
   const step = (W - 2 * margin) / Math.max(1, n - 1);
   const stack = (ids, x, align) => {
     const gap = Math.min(86, (H - 60) / ids.length), total = gap * (ids.length - 1);
     const top = align === 'top' ? 60 : align === 'bottom' ? H - 50 - total : H / 2 - total / 2;
-    ids.forEach((id, k) => { pos[id] = {x, y: top + k * gap, w, h, col: cols.indexOf(cols.find(c => c.includes(id)))}; });
+    // Tall columns get compact boxes (no subtitle) so neighbours never overlap.
+    const hh = gap >= h + 4 ? h : Math.max(36, gap - 4), compact = hh < h;
+    ids.forEach((id, k) => { pos[id] = {x, y: top + k * gap, w, h: hh, compact, col: cols.indexOf(cols.find(c => c.includes(id)))}; });
   };
   cols.forEach((col, i) => {
     const x = margin + i * step;
@@ -192,6 +194,17 @@ function layout() {
     else stack(col, x, 'bottom');
   });
   return pos;
+}
+function fitText(el, text, max) {  // set text, cutting it with an ellipsis to fit max px
+  el.textContent = text || '';
+  if (!text || el.getComputedTextLength() <= max) return;
+  let lo = 0, hi = text.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    el.textContent = text.slice(0, mid) + '…';
+    if (el.getComputedTextLength() <= max) lo = mid; else hi = mid - 1;
+  }
+  el.textContent = lo ? text.slice(0, lo) + '…' : '';
 }
 function edgePath(a, b) {
   if (a.col === b.col) {
@@ -222,12 +235,26 @@ function build() {
     grp.addEventListener('click', () => select(n.id));
     svg('rect', {class: 'box', width: g.w, height: g.h, rx: 10}, grp);
     const dot = svg('circle', {cx: 13, cy: 15, r: 4.5}, grp);
-    const title = svg('text', {class: 'title', x: 24, y: 19}, grp); title.textContent = n.label;
-    const sub = svg('text', {class: 'sub', x: 10, y: 34}, grp); sub.textContent = n.sub.length > 30 ? n.sub.slice(0, 29) + '…' : n.sub;
-    const st = svg('text', {class: 'state', x: 10, y: 51}, grp);
-    const nums = svg('text', {class: 'nums', x: g.w - 9, y: 51, 'text-anchor': 'end'}, grp);
-    if (n.critical) { const c = svg('text', {class: 'critmark', x: g.w - 9, y: 18, 'text-anchor': 'end'}, grp); c.textContent = 'CRIT'; }
-    g.refs = {grp, dot, st, nums, node: n};
+    const title = svg('text', {class: 'title', x: 24, y: 19}, grp);
+    const crit = n.critical ? svg('text', {class: 'critmark', x: g.w - 9, y: 18, 'text-anchor': 'end'}, grp) : null;
+    const fits = mark => {  // try the title at a few sizes next to the critical-path mark
+      if (crit) crit.textContent = mark;
+      const room = g.w - 34 - (crit ? crit.getComputedTextLength() + 6 : 0);
+      title.textContent = n.label;
+      for (const size of [13.5, 12.5, 11.5]) {
+        title.style.fontSize = size + 'px';
+        if (title.getComputedTextLength() <= room) return true;
+      }
+      return false;
+    };
+    if (!fits('CRIT') && crit && !fits('◆')) fitText(title, n.label, g.w - 40 - crit.getComputedTextLength());
+    else if (!crit && !fits('')) fitText(title, n.label, g.w - 34);
+    const tip = svg('title', {}, grp); tip.textContent = n.label + (n.sub ? ' — ' + n.sub : '');
+    const row = g.compact ? g.h - 9 : 51;
+    if (!g.compact) { const sub = svg('text', {class: 'sub', x: 10, y: 34}, grp); fitText(sub, n.sub, g.w - 20); }
+    const st = svg('text', {class: 'state', x: 10, y: row}, grp);
+    const nums = svg('text', {class: 'nums', x: g.w - 9, y: row, 'text-anchor': 'end'}, grp);
+    g.refs = {grp, dot, st, nums, node: n, shown: ''};
   }
   const legend = $('legend'); legend.textContent = '';
   for (const k of ['request', 'result', 'retry', 'context', 'testfail', 'verify', 'merge']) {
@@ -274,8 +301,19 @@ function paintNodes(t) {
     const r = st[n.id];
     const infra = ['guard', 'provider', 'sandbox', 'merge'].includes(n.group);
     let txt = state + (busy && since !== null && !infra ? ' ' + dur(t - since) : '') + (infra && r.live > 1 ? ' ×' + r.live : '') + (n.group === 'task' && busy && info ? ' ' + info : '');
-    g.refs.st.textContent = txt; g.refs.st.style.fill = colour;
-    g.refs.nums.textContent = [r.output ? amount(r.output) + ' out' : '', yuan(r.cny) || usd(r.usd)].filter(Boolean).join(' · ');
+    const money = yuan(r.cny) || usd(r.usd), tokens = r.output ? amount(r.output) : '';
+    const choices = [[tokens && tokens + ' out', money], [tokens, money], [money], [tokens]]
+      .map(parts => parts.filter(Boolean).join(' · '));
+    const key = txt + '|' + choices[0];
+    g.refs.st.style.fill = colour;
+    if (g.refs.shown !== key) {  // measure only when the text changes
+      g.refs.shown = key;
+      fitText(g.refs.st, txt, g.w - 20);
+      const room = g.w - 27 - g.refs.st.getComputedTextLength();
+      g.refs.nums.textContent = '';
+      for (const c of choices) { g.refs.nums.textContent = c; if (g.refs.nums.getComputedTextLength() <= room) break; }
+      if (g.refs.nums.getComputedTextLength() > room) g.refs.nums.textContent = '';
+    }
   }
 }
 function spawn(prev, t) {
