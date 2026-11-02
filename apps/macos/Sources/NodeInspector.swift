@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 
+@MainActor
 struct NodeInspector: View {
     let store: AppStore
     @State private var tab = InspectorTab.conversation
@@ -339,6 +340,7 @@ private enum InspectorTab: String, CaseIterable, Identifiable {
     }
 }
 
+@MainActor
 private struct InspectorCode: View {
     var title: String
     var content: String

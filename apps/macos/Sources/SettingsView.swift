@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 
+@MainActor
 struct StudioSettingsView: View {
     let store: AppStore
     @State private var section = SettingsSection.providers
@@ -233,6 +234,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
     }
 }
 
+@MainActor
 private struct ProviderSettingsRow: View {
     let provider: Provider
     let store: AppStore

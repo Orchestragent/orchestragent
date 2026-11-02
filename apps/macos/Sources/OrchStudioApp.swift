@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 
 @main
+@MainActor
 struct OrchStudioApp: App {
     @NSApplicationDelegateAdaptor(StudioAppDelegate.self) private var delegate
     @State private var store = AppStore()
@@ -34,6 +35,7 @@ final class StudioAppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) { store?.shutdown() }
 }
 
+@MainActor
 struct StudioCommands: Commands {
     var store: AppStore
     private func post(_ name: String) { NotificationCenter.default.post(name: Notification.Name(name), object: nil) }

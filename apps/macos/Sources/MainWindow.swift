@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+@MainActor
 struct MainWindow: View {
     @Bindable var store: AppStore
     @State private var showNewRun = false
@@ -9,7 +10,6 @@ struct MainWindow: View {
     @State private var cancelID: String?
     @State private var didStart = false
     @State private var columns = NavigationSplitViewVisibility.all
-    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
@@ -129,7 +129,7 @@ struct MainWindow: View {
                 Text(store.connected ? L("Connected", "已连接") : L("Offline", "未连接"))
                 Spacer()
                 if store.boot?.demo == true { Text("DEMO").fontWeight(.semibold) }
-                Button { openSettings() } label: { Image(systemName: "gearshape") }.buttonStyle(.plain)
+                SettingsLink { Image(systemName: "gearshape") }.buttonStyle(.plain)
             }.font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.bottom, 12)
         }
     }
@@ -169,7 +169,7 @@ struct MainWindow: View {
                 Text(L("Light", "浅色")).tag("light")
                 Text(L("Dark", "深色")).tag("dark")
             } } label: { Image(systemName: "circle.lefthalf.filled") }
-            Button { openSettings() } label: { Image(systemName: "gearshape") }.help(L("Settings", "设置"))
+            SettingsLink { Image(systemName: "gearshape") }.help(L("Settings", "设置"))
         }
     }
     private var appearanceBinding: Binding<String> {
@@ -239,6 +239,7 @@ struct MainWindow: View {
     }
 }
 
+@MainActor
 private struct RunRow: View {
     var run: RunSummary
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -261,6 +262,7 @@ private struct RunRow: View {
     }
 }
 
+@MainActor
 private struct NewRunSheet: View {
     var store: AppStore
     @Environment(\.dismiss) private var dismiss

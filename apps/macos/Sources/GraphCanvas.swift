@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 
+@MainActor
 struct GraphCanvas: View {
     @Bindable var store: AppStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -66,7 +67,10 @@ struct GraphCanvas: View {
                 changeZoom((magnifyStart ?? zoom) * value.magnification)
             }.onEnded { _ in magnifyStart = nil })
             .onAppear { viewport = geometry.size; synchronize(reset: true) }
-            .onChange(of: geometry.size) { _, size in viewport = size }
+            .onChange(of: geometry.size) { previous, size in
+                viewport = size
+                if previous.width < 120 || previous.height < 200 { fit() }
+            }
             .onChange(of: layoutIdentity) { _, _ in synchronize(reset: true) }
             .onChange(of: nodes.map(\.id)) { _, _ in synchronize(reset: false) }
             .onChange(of: store.selectedNodeID) { _, id in
@@ -360,7 +364,7 @@ struct GraphCanvas: View {
     }
 
     private func fit() {
-        guard !positions.isEmpty, viewport.width > 0 else { return }
+        guard !positions.isEmpty, viewport.width > 120, viewport.height > 200 else { return }
         let bounds = GraphLayout.bounds(positions)
         withAnimation(motion ? .easeInOut(duration: 0.3) : nil) {
             zoom = min(2, max(0.25, min(max(120, viewport.width - 120) / bounds.width,
@@ -443,6 +447,7 @@ struct GraphCanvas: View {
     }
 }
 
+@MainActor
 private struct GraphNodeCard: View {
     let node: StudioNode
     let selected: Bool
@@ -536,6 +541,7 @@ private struct GraphNodeCard: View {
 
 /// Keeps native trackpad momentum and command-wheel zoom within the canvas bounds.
 /// Returning events outside this view leaves inspector and sidebar scrolling alone.
+@MainActor
 private struct GraphScrollInput: NSViewRepresentable {
     var onPan: (CGSize) -> Void
     var onZoom: (CGFloat) -> Void
