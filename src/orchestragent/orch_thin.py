@@ -63,6 +63,17 @@ BOUNDARY_STAGE = (
 
 # The same structural rules for the author, any reviewer and controller feedback. Acceptance
 # owner, file writer and dependency are separate: only reqs route frozen tests and failures.
+# Contracts drive test design and building, so a contract that drifts from the spec is
+# frozen into the tests: rollout (7ccc8a8) R7 "reopening with a different plan/config raises
+# ValueError" became "raised by the mutating and snapshot calls", and hidden acceptance
+# (constructor raises) failed although tests and builder followed the contract faithfully.
+CONTRACT_FIDELITY = (
+    "Contracts must state each error the spec defines at the operation the spec names: "
+    "'<operation> raises' means that call raises, never a later one (reopening or "
+    "constructing over conflicting persisted state raises in the constructor). A module "
+    "that uses another requirement's values keeps that requirement's conventions exactly "
+    "(signs, units, direction, ordering, key shapes); never invert or reinterpret them."
+)
 BOUNDARY_RULES = (
     "Controller boundary rules, checked before test design: "
     "(1) every requirement R has exactly one acceptance task listing it in reqs; its frozen "
@@ -197,6 +208,7 @@ def boundary_review_prompt(
         "must state the affected tasks' resulting reqs, files and depends_on and must still "
         "satisfy these rules. Concentrate on missing requirements, incorrect contracts, "
         "cross-module compatibility and whether interface-only dependencies really suffice. "
+        "Check this contract rule: " + CONTRACT_FIDELITY + " "
         "Reject explicit contradictions and undefined cross-module shapes, not the absence "
         "of a copy of behaviour already fixed by the original spec. Do not demand internal "
         "implementation pseudocode or repeated validation lists. "
@@ -239,7 +251,8 @@ def boundary_prompt(
         "every task.tests must be []. Define all distinct requirements R1,R2,..., final typed "
         "interface stubs (raise NotImplementedError), and disjoint T-001,... tasks with reqs, "
         "depends_on and concise contracts covering inputs/outputs, exceptions, mutation and "
-        "ordering guarantees. interface_depends_on is a subset of depends_on: use it only "
+        "ordering guarantees. " + CONTRACT_FIDELITY + " interface_depends_on is a subset of "
+        "depends_on: use it only "
         "when frozen interfaces and contracts suffice to build before those dependencies "
         "finish; otherwise use []. Integration always waits for all dependencies. "
         + BOUNDARY_RULES + " For a requirement listed in spec_requirement_ids that you keep "

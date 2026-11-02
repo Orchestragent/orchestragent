@@ -119,12 +119,23 @@ _AF_UNIX = 1
 _X32_SYSCALL_BIT = 0x40000000
 
 
-def seccomp_filter(machine: str | None = None) -> bytes:
-    """Classic BPF program (struct sock_filter[]) for this host; fails closed elsewhere."""
+_IO_URING_SETUP = 425
+
+
+def seccomp_filter(machine: str | None = None, *, processes: bool = False) -> bytes:
+    """Classic BPF program (struct sock_filter[]) for this host; fails closed elsewhere.
+
+    processes=True is the toolchain policy: compilers and test runners may fork, exec and
+    use loopback sockets (vitest, jest and Gradle talk to their own workers); bwrap's
+    namespaces isolate mounts and PIDs, and its empty network namespace has no route out.
+    io_uring and x32 syscalls stay denied.
+    """
     machine = machine or platform.machine()
     if machine not in _SECCOMP_ARCH:
         raise RuntimeError(f"No sandbox seccomp filter for {machine}")
     arch, socket, clone, denied = _SECCOMP_ARCH[machine]
+    if processes:
+        denied = (_IO_URING_SETUP,)
     load, jeq, jge, jset, ret = 0x20, 0x15, 0x35, 0x45, 0x06
     allow, kill = 0x7FFF0000, 0x80000000
     eperm, enosys = 0x00050000 | 1, 0x00050000 | 38
@@ -133,12 +144,14 @@ def seccomp_filter(machine: str | None = None) -> bytes:
         program += [(jge, 0, 1, _X32_SYSCALL_BIT), (ret, 0, 0, eperm)]
     for number in denied:
         program += [(jeq, 0, 1, number), (ret, 0, 0, eperm)]
-    program += [(jeq, 0, 1, _CLONE3), (ret, 0, 0, enosys)]
-    # The first syscall argument (low 32 bits) is clone flags / socket domain.
-    program += [(jeq, 0, 4, clone), (load, 0, 0, 16), (jset, 0, 1, _CLONE_THREAD),
-                (ret, 0, 0, allow), (ret, 0, 0, eperm)]
-    program += [(jeq, 0, 4, socket), (load, 0, 0, 16), (jeq, 0, 1, _AF_UNIX),
-                (ret, 0, 0, allow), (ret, 0, 0, eperm)]
+    if not processes:
+        program += [(jeq, 0, 1, _CLONE3), (ret, 0, 0, enosys)]
+        # The first syscall argument (low 32 bits) is clone flags / socket domain.
+        program += [(jeq, 0, 4, clone), (load, 0, 0, 16), (jset, 0, 1, _CLONE_THREAD),
+                    (ret, 0, 0, allow), (ret, 0, 0, eperm)]
+    if not processes:  # with processes, the empty network namespace is the boundary
+        program += [(jeq, 0, 4, socket), (load, 0, 0, 16), (jeq, 0, 1, _AF_UNIX),
+                    (ret, 0, 0, allow), (ret, 0, 0, eperm)]
     program.append((ret, 0, 0, allow))
     return b"".join(struct.pack("=HBBI", *instruction) for instruction in program)
 
