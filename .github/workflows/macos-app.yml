@@ -1,0 +1,52 @@
+name: macOS app
+
+on:
+  pull_request:
+    paths: ['apps/macos/**', '.github/workflows/macos-app.yml']
+  push:
+    branches: [main]
+    paths: ['apps/macos/**', '.github/workflows/macos-app.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  studio:
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - name: Install the no-cost demo backend
+        run: uv sync --locked --no-editable
+      - name: Verify generated project and translations
+        run: |
+          python3 apps/macos/scripts/update_strings.py
+          python3 apps/macos/scripts/generate_project.py
+          git diff --exit-code -- apps/macos/OrchStudio.xcodeproj apps/macos/Resources/Localizable.xcstrings
+      - name: Decode, SSE, layout, sending rules and live demo integration
+        run: |
+          export TEST_RUNNER_ORCH_STUDIO_EXECUTABLE="$PWD/.venv/bin/orch"
+          export ORCH_STUDIO_EXECUTABLE="$PWD/.venv/bin/orch"
+          xcodebuild -project apps/macos/OrchStudio.xcodeproj -scheme OrchStudio \
+            -configuration Debug -destination 'platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioTest" \
+            -resultBundlePath "$RUNNER_TEMP/StudioTests.xcresult" test CODE_SIGN_IDENTITY=- ONLY_ACTIVE_ARCH=YES
+      - name: Release app and ad-hoc signature
+        run: |
+          xcodebuild -project apps/macos/OrchStudio.xcodeproj -scheme OrchStudio \
+            -configuration Release -derivedDataPath "$RUNNER_TEMP/StudioRelease" build CODE_SIGN_IDENTITY=-
+          APP="$RUNNER_TEMP/StudioRelease/Build/Products/Release/OrchStudio.app"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/OrchStudio.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OrchStudio-app
+          path: ${{ runner.temp }}/OrchStudio.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: OrchStudio-tests
+          path: ${{ runner.temp }}/StudioTests.xcresult
