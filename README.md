@@ -55,6 +55,10 @@ On macOS with Homebrew (installs shell completion for zsh, bash and fish too):
 brew install orchestragent/tap/orchestragent
 ```
 
+On macOS, `orch app install` adds **Orch.app** to `~/Applications`: open it, choose a
+project, and its live dashboard opens in your browser (open it again to switch projects).
+`orch run --notify` posts a notification when a run finishes.
+
 Or by hand:
 
 ```sh

@@ -50,3 +50,15 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           git init -q /tmp/empty && git -C /tmp/empty commit -q --allow-empty -m init
           orch --repo /tmp/empty watch --once | grep -q 'no orchestration run yet'
+      - name: macOS Orch.app bundle validates and its launcher serves the dashboard
+        if: runner.os == 'macOS'
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          orch app install --dest /tmp/Orch.app
+          plutil -lint /tmp/Orch.app/Contents/Info.plist
+          test -x /tmp/Orch.app/Contents/MacOS/Orch
+          ORCH_APP_DRY=1 ORCH_APP_REPO=/tmp/empty /tmp/Orch.app/Contents/MacOS/Orch | tee /tmp/app.out
+          URL=$(sed -n 's/^dashboard: \([^ ]*\) .*/\1/p' /tmp/app.out)
+          curl -sf -o /dev/null "$URL"
+          kill "$(cat "$HOME/Library/Application Support/orch/app/server.pid")"
+

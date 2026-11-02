@@ -93,7 +93,12 @@ if [ "$OS" = Darwin ] && [ -d "/Applications/Claude.app" ]; then
 fi
 if [ -d "$HOME/.cursor" ]; then run orch mcp --install cursor || true; fi
 
-# 5. Final check.
+# 5. macOS: a double-click dashboard in ~/Applications.
+if [ "$OS" = Darwin ] && ask "Add Orch.app to ~/Applications (choose a project, see it live)?"; then
+  run orch app install
+fi
+
+# 6. Final check.
 say ""
 if [ "$DRY" = 1 ]; then say "  would run: orch doctor"; else orch doctor || true; fi
 say ""

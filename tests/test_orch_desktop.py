@@ -92,3 +92,51 @@ def test_notify_is_best_effort(monkeypatch: pytest.MonkeyPatch) -> None:
     assert notify('run "r1" done', "repo → orch/r1") is True
     assert calls[0][:2] == ["osascript", "-e"]
     assert '"run \\"r1\\" done"' in calls[0][2]  # quoted for AppleScript, not interpolated raw
+
+
+def test_orch_app_bundle_is_valid_and_its_launcher_serves_the_dashboard(
+    tmp_path: Path,
+) -> None:
+    import os
+    import plistlib
+    import signal
+    import time
+    import urllib.request
+
+    from orchestragent.orch_desktop import install_app
+    app = tmp_path / "Orch.app"
+    assert "installed" in install_app(app)
+    info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
+    assert (info["CFBundleExecutable"], info["CFBundlePackageType"],
+            info["CFBundleIdentifier"]) == ("Orch", "APPL", "dev.orchestragent.orch")
+    launcher = app / "Contents" / "MacOS" / "Orch"
+    assert os.access(launcher, os.X_OK)
+    assert subprocess.run(["sh", "-n", str(launcher)]).returncode == 0
+    repo = tmp_path / "project"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    home = tmp_path / "home"
+    env = {**os.environ, "HOME": str(home), "ORCH_APP_DRY": "1", "ORCH_APP_REPO": str(repo)}
+    out = subprocess.run([str(launcher)], env=env, capture_output=True, text=True,
+                         timeout=60).stdout
+    state = home / "Library" / "Application Support" / "orch" / "app"
+    pid = int((state / "server.pid").read_text())
+    try:
+        url = out.split("dashboard: ", 1)[1].split()[0]
+        for _ in range(20):
+            try:
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    assert response.status == 200
+                break
+            except OSError:
+                time.sleep(0.25)
+        else:
+            raise AssertionError("dashboard did not answer")
+    finally:
+        os.kill(pid, signal.SIGTERM)
+    install_app(app)  # reinstall over its own bundle is fine
+    with pytest.raises(ValueError):
+        install_app(tmp_path / "Orch")
+    (tmp_path / "Other.app").mkdir()
+    with pytest.raises(ValueError, match="not an app bundle"):
+        install_app(tmp_path / "Other.app")

@@ -748,6 +748,11 @@ def parser() -> argparse.ArgumentParser:
     models_reset = models_commands.add_parser("reset", help="back to the verified set")
     models_reset.add_argument("role", nargs="?", default="",
                               choices=("", "planner", "test_designer", "builder", "reviewer"))
+    app = commands.add_parser("app", help="macOS: install Orch.app, a double-click dashboard")
+    app_commands = app.add_subparsers(dest="app_command", required=True)
+    app_install = app_commands.add_parser("install", help="write Orch.app")
+    app_install.add_argument("--dest", type=Path,
+                             default=Path.home() / "Applications" / "Orch.app")
     completion = commands.add_parser(
         "completion", help="print shell completion (bash, zsh, fish) for orch")
     completion.add_argument("shell", choices=("bash", "zsh", "fish"))
@@ -845,6 +850,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(orch_models.reset(args.role, data_dir))
             else:
                 print("\n".join(orch_models.table(data_dir)))
+            return 0
+        if args.command == "app":
+            from orchestragent.orch_desktop import install_app
+            from orchestragent.platform import is_macos
+            if not is_macos():
+                print("orch app: Orch.app is for macOS; on Linux use `orch watch` "
+                      "(or `orch watch --web`)", file=sys.stderr)
+            print(install_app(cast(Path, args.dest).expanduser()))
             return 0
         if args.command == "completion":
             from orchestragent.orch_completion import render
