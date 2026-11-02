@@ -434,13 +434,19 @@ struct GraphCanvas: View {
         guard let id = store.selectedNodeID, let origin = positions[id] else {
             Task { await store.selectNode(ids[0]) }; return .handled
         }
-        let nearest = ids.filter { candidate in
-            guard candidate != id, let point = positions[candidate] else { return false }
-            return (point.x - origin.x) * direction.x + (point.y - origin.y) * direction.y > 0
-        }.min { left, right in
-            let a = positions[left] ?? origin, b = positions[right] ?? origin
-            let da = hypot(a.x - origin.x, a.y - origin.y), db = hypot(b.x - origin.x, b.y - origin.y)
-            return da == db ? left < right : da < db
+        var nearest: String?
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        // Explicit scalar steps also keep Swift 5.10's type checker bounded.
+        for candidate in ids where candidate != id {
+            guard let point = positions[candidate] else { continue }
+            let dx: CGFloat = point.x - origin.x
+            let dy: CGFloat = point.y - origin.y
+            guard dx * direction.x + dy * direction.y > 0 else { continue }
+            let distance: CGFloat = dx * dx + dy * dy
+            if distance < bestDistance {
+                bestDistance = distance
+                nearest = candidate
+            }
         }
         if let nearest { Task { await store.selectNode(nearest) } }
         return .handled
