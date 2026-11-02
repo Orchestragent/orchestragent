@@ -370,8 +370,8 @@ def test_doctor_passes_when_every_prerequisite_holds(orch_repo: Path, tmp_path: 
 @pytest.mark.parametrize(
     ("providers", "budget", "fix"),
     [
-        ({**READY, "claude": {"ready": False, "auth": "logged_out"}}, BUDGET, "choose Claude"),
-        ({**READY, "dsh": {"credential_ready": False}}, BUDGET, "choose DSH"),
+        ({**READY, "claude": {"ready": False, "auth": "logged_out"}}, BUDGET, "claude auth login"),
+        ({**READY, "dsh": {"credential_ready": False}}, BUDGET, "orch keys dsh"),
     ],
 )
 def test_doctor_names_the_fix_for_each_missing_prerequisite(

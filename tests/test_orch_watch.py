@@ -490,3 +490,19 @@ def test_scheduler_detail_names_its_state_once_and_counts_the_runs_calls(
     state = line.split(" Orchestrator ", 1)[1].split()[0]
     assert line.count(f" {state} ") == 1
     assert f"calls {len(model['calls'])}" in text
+
+
+def test_plain_once_prints_the_state_so_far_and_returns(model: dict[str, Any]) -> None:
+    import io
+
+    from orchestragent.orch_watch_tui import plain
+    out = io.StringIO()
+    assert plain(lambda: None, out, replay=False, speed=1, once=True) == 0
+    assert "no orchestration run yet" in out.getvalue()
+    out = io.StringIO()
+    slept: list[float] = []
+    assert plain(lambda: model, out, replay=False, speed=1, once=True,
+                 sleep=slept.append, clock=lambda: float(model["t1"]) + 60) == 0
+    text = out.getvalue()
+    assert slept == [] and text.splitlines()[-1].startswith("status run=")
+    assert len(text.splitlines()) > 3

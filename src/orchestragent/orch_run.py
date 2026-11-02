@@ -7,6 +7,7 @@ the integration branch. The failure ladder lives in orch_ladder.
 
 import fcntl
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -136,6 +137,7 @@ from orchestragent.orch_rules import (
 from orchestragent.orch_state import FINISHED, IN_FLIGHT, OrchState, OrchTask, Run, plan_hash
 from orchestragent.orch_thin import (
     BOUNDARY_REVIEW_SCHEMA,
+    COVERAGE_SCHEMA,
     TEST_SCHEMA,
     BoundaryStop,
     assemble,
@@ -144,6 +146,8 @@ from orchestragent.orch_thin import (
     boundary_prompt,
     boundary_review_prompt,
     canonical_boundary,
+    citing_tasks,
+    coverage_prompt,
     fill_requirements,
     integration_targets,
     review_verdict,
@@ -233,6 +237,17 @@ MAX_REBASES = 3
 MAX_REGRESSIONS = 2  # final-gate bisect rounds before the run gives up
 MAX_TEST_REVIEWS = 3  # a successful test correction may expose another independent error
 MAX_REPLAN_REVISIONS = 1  # a rejected replacement subtree gets one corrected proposal
+# A reviewer checks each linted test shard against its requirements' verbatim text and the
+# designer adds tests for stated behaviour nothing asserts (see coverage_prompt).
+# ORCHESTRA_COVERAGE_REVIEW=0 turns it off for comparison.
+COVERAGE_REVIEW = os.environ.get("ORCHESTRA_COVERAGE_REVIEW", "1") != "0"
+MAX_TEST_REVIEWS_PER_SHARD = 2
+# Who reviews frozen test shards: the planner (Opus, default), Sonnet, or DSF itself.
+# Opus reviewed 22 shards for US$3.19 on rollout (f6cdf35); the cheaper reviewers are for
+# measured comparison.
+REVIEW_MODEL = os.environ.get("ORCHESTRA_REVIEW_MODEL", "planner")
+if REVIEW_MODEL not in {"planner", "opus-low", "sonnet", "dsf"}:
+    raise ValueError("ORCHESTRA_REVIEW_MODEL must be planner, opus-low, sonnet or dsf")
 DEFAULT_TEST_JOBS = 16  # concurrent DSF test-design shards unless a frozen policy says otherwise
 MAX_FORMAT_REPAIRS = 1  # DSF self-repairs of a settled unparseable/unappliable answer per attempt
 # Repeats of one planning call after a transient transport/provider failure (run r073174b7
@@ -776,68 +791,111 @@ class Orchestrator:
         environment = self.environment_override
         self.bind_environment()
         project_report = ""
+        # The project's own pytest baseline only proves the base revision is healthy, so it
+        # runs beside planning instead of before it (NetworkX: ~105 s of 5446 tests that
+        # used to delay the planner) and is checked before anything is committed.
+        baseline_pool: ThreadPoolExecutor | None = None
+        baseline: Future[tuple[bool, str]] | None = None
         if environment is not None:
             try:
                 self.bind_environment(str(environment.root), environment.fingerprint)
                 assert self.environment is not None
                 environment = self.environment
-                passed, project_report = self._project_tests(run_id, base_sha, environment)
             except Exception as error:
                 raise PlanError(
                     f"project pytest baseline unavailable: {type(error).__name__}"
                 ) from None
-            if not passed:
-                raise PlanError("project pytest baseline failed", [project_report[-4000:]])
-        self.policies.observe_spec(spec)
-        notes = [] if thin else self._settle_planner_rules()
-        rules_text, rule_ids, evicted = layer(
-            [] if thin and self.policy is None else self._rules("planner"), "planner")
-        for rule in evicted:
-            self.state.save_rule(replace(rule, status="retired", note="evicted by rule budget"))
-            notes.append(("rule.retired", {"rule": rule.id, "note": "budget"}))
-        trial = None if thin else self._planner_trial(run_id)
-        coupling = self.index.cochange(base_sha)
-        inputs = PlanInputs(
-            spec, base_sha,
-            frozenset(self.git(self.repo, "ls-tree", "-r", "--name-only", base_sha).splitlines()),
-            (self.index.at(base_sha).planning_map(spec) if distributed else
-             self.index.at(base_sha).repo_map(PLANNER_MAP_BYTES)), coupling_text(coupling),
-            rules_text, trial[0].text if trial is not None and trial[1] else "",
-            tuple([*rule_ids, *([trial[0].id] if trial is not None and trial[1] else [])]),
-        )
-        count = 1 if modules else max(1, min(samples, len(PLAN_HINTS)))
-        if distributed:
-            outcomes: list[Draft | PlanError] = [
-                self._draft_thin(run_id, inputs, attempts, distributed=True, jobs=test_jobs,
-                                 reviewed_boundary=reviewed_boundary,
-                                 integration_checks=integration_checks)]
-        elif modules:
-            outcomes = [self._draft_modules(run_id, inputs, attempts)]
-        else:
-            with ThreadPoolExecutor(max_workers=count) as pool:
-                outcomes = list(pool.map(
-                    lambda i: self._draft(run_id, inputs, PLAN_HINTS[i] if count > 1 else "",
-                                          f"s{i + 1}" if count > 1 else "", attempts),
-                    range(count),
-                ))
-        drafts = [item for item in outcomes if isinstance(item, Draft)]
-        if not thin:
-            for draft in drafts:
-                for errors in draft.errors:
-                    for text in lint_lessons(errors):
-                        self._learn("", text, f"{run_id} lint", "planner")
-        clean = [draft for draft in drafts if draft.plan is not None]
-        if not clean:
-            rejected = [errors for draft in drafts for errors in draft.errors[-1:]]
-            if rejected:
-                raise PlanError("plan failed lint", rejected[-1])
-            raise next(item for item in outcomes if isinstance(item, PlanError))
-        for draft in clean:
-            self._score(run_id, base_sha, draft, coupling)
-        best = max(clean, key=lambda draft: draft.score)
-        assert best.plan is not None
-        shown = [*rule_ids, *([trial[0].id] if trial is not None and trial[1] else [])]
-        run = self._checkpoint(run_id, spec, base_sha, best.plan, best, shown, environment)
+            baseline_pool = ThreadPoolExecutor(max_workers=1)
+            baseline = baseline_pool.submit(self._project_tests, run_id, base_sha, environment)
+        stopped_by_baseline = threading.Event()
+
+        def baseline_error() -> PlanError | None:
+            """Wait for the baseline; the PlanError a red or unusable baseline means."""
+            if baseline is None:
+                return None
+            try:
+                passed, report = baseline.result()
+            except Exception as error:
+                return PlanError(f"project pytest baseline unavailable: {type(error).__name__}")
+            return None if passed else PlanError("project pytest baseline failed",
+                                                 [report[-4000:]])
+
+        def stop_planning(done: Future[tuple[bool, str]]) -> None:
+            # A red base stops in-flight planning calls at once: nothing is built on it.
+            failed = done.exception() is not None or not done.result()[0]
+            if failed and not self.cancel.is_set():
+                stopped_by_baseline.set()
+                self.cancel.set()
+
+        if baseline is not None:
+            baseline.add_done_callback(stop_planning)
+        try:
+            self.policies.observe_spec(spec)
+            notes = [] if thin else self._settle_planner_rules()
+            rules_text, rule_ids, evicted = layer(
+                [] if thin and self.policy is None else self._rules("planner"), "planner")
+            for rule in evicted:
+                self.state.save_rule(replace(rule, status="retired", note="evicted by rule budget"))
+                notes.append(("rule.retired", {"rule": rule.id, "note": "budget"}))
+            trial = None if thin else self._planner_trial(run_id)
+            coupling = self.index.cochange(base_sha)
+            inputs = PlanInputs(
+                spec, base_sha,
+                frozenset(self.git(self.repo, "ls-tree", "-r", "--name-only",
+                                   base_sha).splitlines()),
+                (self.index.at(base_sha).planning_map(spec) if distributed else
+                 self.index.at(base_sha).repo_map(PLANNER_MAP_BYTES)), coupling_text(coupling),
+                rules_text, trial[0].text if trial is not None and trial[1] else "",
+                tuple([*rule_ids, *([trial[0].id] if trial is not None and trial[1] else [])]),
+            )
+            count = 1 if modules else max(1, min(samples, len(PLAN_HINTS)))
+            if distributed:
+                outcomes: list[Draft | PlanError] = [
+                    self._draft_thin(run_id, inputs, attempts, distributed=True, jobs=test_jobs,
+                                     reviewed_boundary=reviewed_boundary,
+                                     integration_checks=integration_checks)]
+            elif modules:
+                outcomes = [self._draft_modules(run_id, inputs, attempts)]
+            else:
+                with ThreadPoolExecutor(max_workers=count) as pool:
+                    outcomes = list(pool.map(
+                        lambda i: self._draft(run_id, inputs, PLAN_HINTS[i] if count > 1 else "",
+                                              f"s{i + 1}" if count > 1 else "", attempts),
+                        range(count),
+                    ))
+            drafts = [item for item in outcomes if isinstance(item, Draft)]
+            if not thin:
+                for draft in drafts:
+                    for errors in draft.errors:
+                        for text in lint_lessons(errors):
+                            self._learn("", text, f"{run_id} lint", "planner")
+            clean = [draft for draft in drafts if draft.plan is not None]
+            if not clean:
+                rejected = [errors for draft in drafts for errors in draft.errors[-1:]]
+                if rejected:
+                    raise PlanError("plan failed lint", rejected[-1])
+                raise next(item for item in outcomes if isinstance(item, PlanError))
+            for draft in clean:
+                self._score(run_id, base_sha, draft, coupling)
+            best = max(clean, key=lambda draft: draft.score)
+            assert best.plan is not None
+            shown = [*rule_ids, *([trial[0].id] if trial is not None and trial[1] else [])]
+            failure = baseline_error()
+            if failure is not None:
+                raise failure
+            if baseline is not None:
+                project_report = baseline.result()[1]
+            run = self._checkpoint(run_id, spec, base_sha, best.plan, best, shown, environment)
+        except Exception:
+            failure = baseline_error()
+            if failure is not None:
+                raise failure from None  # the base, not the interrupted planning, is the cause
+            raise
+        finally:
+            if baseline_pool is not None:
+                baseline_pool.shutdown(wait=True)  # never leave the baseline worktree behind
+            if stopped_by_baseline.is_set():
+                self.cancel.clear()
         if distributed:
             self.state.record(run_id, "plan.distributed", {
                 "map_bytes": len(inputs.repo_map.encode()), "test_jobs": test_jobs,
@@ -1070,7 +1128,7 @@ class Orchestrator:
         assignments = [(task, False) for task in tasks]
         if integration_checks:
             scope = self.planning.session(run_id).integration_scope
-            selected = set(integration_targets(graph, scope))
+            selected = set(integration_targets(graph, scope)) | citing_tasks(boundary)
             assignments += [(task, True) for task in tasks if task["id"] in selected]
         shard_sources: dict[str, dict[str, str]] = {}
         for task in tasks:
@@ -1107,7 +1165,16 @@ class Orchestrator:
             # A complete, well-formed draft whose Python does not compile is revised in
             # place with EDIT_SCHEMA edits, not regenerated; it still uses a lint revision.
             draft = ""
-            for number in range(1, attempts + MAX_FORMAT_REPAIRS + 2):
+            # Up to two reviews: the first may add tests for missing behaviour; the second
+            # checks the revised draft and acts only on wrong tests, so added tests are
+            # validated before freezing and missing items cannot ping-pong.
+            reviews = MAX_TEST_REVIEWS_PER_SHARD if not COVERAGE_REVIEW else 0
+            # The last lint-passing draft a review asked to improve: if that improvement
+            # fails, this draft is frozen instead of redesigning the shard (timeflow at
+            # 5588d86 spent 144 s regenerating one after a failed review repair).
+            fallback: list[dict[str, str]] | None = None
+            for number in range(1, attempts + MAX_FORMAT_REPAIRS + 2
+                                + MAX_TEST_REVIEWS_PER_SHARD):
                 if revisions >= attempts:
                     break
                 if self.cancel.is_set() or stopped.is_set():
@@ -1137,6 +1204,10 @@ class Orchestrator:
                 except BaseException:
                     stopped.set()  # do not dispatch queued shards after an infrastructure failure
                     raise
+                if result.outcome != "ok" and fallback is not None:
+                    self.notify(f"[plan] {tid} test-design {number}: review repair "
+                                f"{result.outcome}; keep the reviewed draft")
+                    return fallback, rejected
                 if result.outcome != "ok":
                     if output_cut(result.usage) and not unresolved(result.outcome, result.usage):
                         # Already the widest budget the reservation covers: the same request
@@ -1198,14 +1269,40 @@ class Orchestrator:
                         "source_bytes": sum(len(text.encode())
                                             for text in shard_sources[tid].values()),
                     }))
+                    if not errors and reviews < MAX_TEST_REVIEWS_PER_SHARD:
+                        reviews += 1  # a revised draft is linted again before its review
+                        gaps = self._coverage_gaps(run_id, inputs.base, boundary, graph, task,
+                                                   integration, files, number)
+                        if reviews > 1:
+                            gaps = [gap for gap in gaps if gap.startswith("wrong ")]
+                        if gaps and len(files) == 1:
+                            errors = ["Test review before freezing. For each 'missing' item "
+                                      "add a focused test of that stated behaviour; for each "
+                                      "'wrong' item correct that test to what the "
+                                      "requirement implies. Keep every other test unchanged: "
+                                      + "; ".join(gaps)]
+                            draft = files[0]["content"]  # revise this draft in place next
+                            fallback = files
+                            rejected.append(errors)
+                            self.notify(f"[plan] {tid} test-design {number}: test review "
+                                        f"found {len(gaps)} gap(s) or wrong test(s)")
+                            continue
                     if not errors:
                         return files, rejected
+                    if fallback is not None:
+                        self.notify(f"[plan] {tid} test-design {number}: review repair failed "
+                                    "lint; keep the reviewed draft")
+                        return fallback, [*rejected, errors]
                     errors = [*errors, "Compact repetitive test setup with subTest tables. "
                               "Preserve coverage and expected behaviour for every assigned "
                               "requirement; do not omit assertions just to fit the budget."]
                     self.notify(f"[plan] {tid} test-design {number}: builder capacity; "
                                 "repair only this shard")
                 except (ValueError, TypeError, KeyError, SyntaxError) as error:
+                    if fallback is not None:
+                        self.notify(f"[plan] {tid} test-design {number}: review repair "
+                                    f"unusable ({str(error)[:120]}); keep the reviewed draft")
+                        return fallback, [*rejected, [str(error)]]
                     errors = [str(error)]
                     context = (source_context(design_data, error.lineno or 0)
                                if isinstance(error, SyntaxError) else "")
@@ -1280,6 +1377,43 @@ class Orchestrator:
             if self.cancel.wait(TRANSIENT_RETRY_DELAYS[retry]):
                 return result
         return result
+
+    def _coverage_gaps(
+        self, run_id: str, base: str, boundary: dict[str, Any], graph: dict[str, Any],
+        task: dict[str, Any], integration: bool, files: list[dict[str, str]], number: int,
+    ) -> list[str]:
+        """Stated behaviours of the shard's requirements that no test asserts ([] if none,
+        or if the review itself fails: it never blocks planning)."""
+        texts = {item["id"]: item["text"] for item in boundary.get("requirements", [])
+                 if isinstance(item, dict) and isinstance(item.get("text"), str)}
+        owners = (closure(graph, task["id"]) | {task["id"]}) if integration else {task["id"]}
+        reqs = sorted({req for item in boundary["tasks"] if item["id"] in owners
+                       for req in item["reqs"]})
+        assigned = {req: texts[req] for req in reqs if req in texts}
+        if not assigned or len(files) != 1:
+            return []
+        prompt = coverage_prompt(assigned, files[0]["path"], files[0]["content"], integration)
+        purpose = "integration-coverage-review" if integration else "coverage-review"
+        route = {"planner": self._claude_route(run_id, planning=True),
+                 "opus-low": replace(CLAUDE_PLAN, effort="low"), "sonnet": SONNET_PLAN,
+                 "dsf": DSF_EXTENDED}[REVIEW_MODEL]
+        result = self._call_planning(
+            run_id, route, prompt, COVERAGE_SCHEMA,
+            f"orch-{run_id}-{purpose}-{task['id']}-{number}-{uuid.uuid4().hex[:12]}",
+            purpose=purpose, task_id=task["id"], attempt=number, base=base,
+        )
+        if result.outcome != "ok":
+            return []
+        missing, wrong = result.data.get("missing"), result.data.get("wrong")
+        gaps = [f"missing {item['req']}: {item['clause']}"[:300]
+                for item in (missing if isinstance(missing, list) else [])[:8]
+                if isinstance(item, dict) and isinstance(item.get("req"), str)
+                and isinstance(item.get("clause"), str)]
+        gaps += [f"wrong {item['test']}: {item['problem']}"[:300]
+                 for item in (wrong if isinstance(wrong, list) else [])[:8]
+                 if isinstance(item, dict) and isinstance(item.get("test"), str)
+                 and isinstance(item.get("problem"), str)]
+        return gaps
 
     def _ask_planner(
         self, call_id: str, prompt: str, schema: dict[str, object], *, run_id: str,
@@ -1692,9 +1826,34 @@ class Orchestrator:
     def _project_tests(
         self, run_id: str, revision: str, environment: PytestEnvironment,
     ) -> tuple[bool, str]:
-        """All project pytest tests, at pinned bytes, through the existing verification pool."""
-        with self.worktree(run_id, "project", revision) as tree:
-            return self.verify(tree, self.scratch(run_id), revision, None,
+        """All project pytest tests, at pinned bytes, through the existing verification pool.
+
+        A large suite runs as size-balanced shards of test files in parallel sandboxes
+        (NetworkX: ~5400 tests, ~105 s in one process, on the critical path at the end of
+        every run). Only an all-green sharded run is accepted as green; any red shard is
+        confirmed by the original single full run, whose verdict stands.
+        """
+        groups = project_test_shards(
+            self.git(self.repo, "ls-tree", "-r", "-l", revision),
+            min(PROJECT_TEST_SHARDS, self.max_verify_jobs))
+        if len(groups) < 2:
+            return self._project_tests_once(run_id, revision, environment, None, "project")
+        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+            results = list(pool.map(
+                lambda item: self._project_tests_once(
+                    run_id, revision, environment, item[1], f"project-{item[0]}"),
+                enumerate(groups)))
+        if all(passed for passed, _ in results):
+            return True, "\n".join(f"[shard {index + 1}/{len(groups)}] {report.strip()[-1500:]}"
+                                   for index, (_, report) in enumerate(results))
+        return self._project_tests_once(run_id, revision, environment, None, "project")
+
+    def _project_tests_once(
+        self, run_id: str, revision: str, environment: PytestEnvironment,
+        names: list[str] | None, label: str,
+    ) -> tuple[bool, str]:
+        with self.worktree(run_id, label, revision) as tree:
+            return self.verify(tree, self.scratch(run_id), revision, names,
                                runner=partial(LiveWorkspace.run_pytest, environment=environment),
                                timeout=PROJECT_TEST_TIMEOUT)
 
@@ -3751,6 +3910,39 @@ def mutant_limit(baseline: float) -> float:
     """Per-mutant deadline from the unmutated run: a mutant that loops forever must not
     cost a whole sandbox deadline."""
     return min(25.0, max(3.0, 4 * baseline + 1))
+
+
+PROJECT_TEST_SHARDS = 4
+PROJECT_SHARD_MIN_FILES = 24  # below this a suite runs as one process
+# pytest's default norecursedirs: explicit file arguments bypass them, so skip them here.
+_NORECURSE = re.compile(r"(^|/)(\.[^/]*|_darcs|build|CVS|dist|node_modules|venv|[^/]*\.egg|"
+                        r"\{arch\})/")
+
+
+def project_test_shards(tree_listing: str, shards: int) -> list[list[str]]:
+    """Size-balanced groups of the files pytest collects by default (`git ls-tree -r -l`).
+
+    Returns [] when the suite is too small to be worth splitting or `shards` < 2.
+    """
+    files: list[tuple[int, str]] = []
+    for line in tree_listing.splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) != 4 or parts[1] != "blob" or not parts[3].isdigit():
+            continue
+        name = PurePosixPath(path).name
+        if ((name.startswith("test_") or name.endswith("_test.py")) and name.endswith(".py")
+                and not _NORECURSE.search(path) and LiveWorkspace.safe_path(path)):
+            files.append((int(parts[3]), path))
+    if shards < 2 or len(files) < PROJECT_SHARD_MIN_FILES:
+        return []
+    groups: list[list[str]] = [[] for _ in range(shards)]
+    sizes = [0] * shards
+    for size, path in sorted(files, reverse=True):  # largest first, into the lightest group
+        index = sizes.index(min(sizes))
+        groups[index].append(path)
+        sizes[index] += size
+    return [sorted(group) for group in groups if group]
 
 
 def default_verify_jobs() -> int:

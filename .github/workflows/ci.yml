@@ -39,3 +39,14 @@ jobs:
           uv venv -q /tmp/orch-install && uv pip install -q --python /tmp/orch-install/bin/python dist-ci/*.whl
           /tmp/orch-install/bin/orch --help >/dev/null
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | /tmp/orch-install/bin/orch mcp | grep -q orch_start
+      - name: installer (real install from this checkout, then doctor and MCP)
+        run: |
+          ORCH_SOURCE="$PWD[index]" sh install.sh --yes
+          export PATH="$HOME/.local/bin:$PATH"
+          orch --help >/dev/null
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | orch mcp | grep -q orch_start
+      - name: TUI renders headless (plain fallback and a curses frame)
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          git init -q /tmp/empty && git -C /tmp/empty commit -q --allow-empty -m init
+          orch --repo /tmp/empty watch --once | grep -q 'no orchestration run yet'

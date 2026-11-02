@@ -1620,3 +1620,157 @@ def test_planner_effort_switch_changes_only_the_orchestrated_planner(
     planned = [c for c in orch.state.usage.calls() if c.provider == "claude"]
     assert planned and {c.effort for c in planned} == {"medium"}
     assert CLAUDE_PLAN.effort == "high"  # the single-agent baseline's route is untouched
+
+
+GAP_EDIT = NativeResult("ok", {
+    "status": "DONE", "summary": "", "reason": "", "need_files": [],
+    "edits": [{"path": "test_orch_t_001.py",
+               "search": "        self.assertEqual(add(2, 3), 5)\n",
+               "replace": "        self.assertEqual(add(2, 3), 5)\n\n"
+                          "    def test_r1_zero(self):\n        self.assertEqual(add(0, 0), 0)\n"}],
+})
+
+
+def test_coverage_review_has_unasserted_behaviour_added_in_place(
+    resumable_case: tuple[Orchestrator, ScriptedCaller], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", True)
+    orch, caller = resumable_case
+    caller.responses["claude:T-001"] = [
+        NativeResult("ok", {"missing": [{"req": "R1", "clause": "add(0, 0) returns 0"}],
+                            "wrong": [{"test": "test_r1_value", "problem": "fine, kept"}]}),
+        # Second look at the revised draft: only `wrong` counts, so no third edit.
+        NativeResult("ok", {"missing": [{"req": "R1", "clause": "add(1, 1) returns 2"}],
+                            "wrong": []}),
+    ]
+    caller.responses["claude:T-002"] = [NativeResult("ok", {"missing": [], "wrong": []})]
+    caller.responses["dsh:T-001"].insert(1, GAP_EDIT)
+    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+    calls = orch.state.usage.calls(run.id)
+    t1 = [(c.provider, c.purpose) for c in calls if c.task_id == "T-001"]
+    assert t1 == [("dsh", "test-design"), ("claude", "coverage-review"), ("dsh", "test-repair"),
+                  ("claude", "coverage-review")]
+    review = next(p for _, key, p in caller.calls if key == "claude:T-001")
+    assert "ASSIGNED REQUIREMENTS" in review and "def test_r1_value" in review
+    repair = [p for _, key, p in caller.calls if key == "dsh:T-001"][1]
+    assert "Test review before freezing" in repair and "missing R1: add(0, 0) returns 0" in repair
+    assert "LOCAL REPAIR OF YOUR DRAFT" in repair and "wrong test_r1_value" in repair
+    frozen = orch.git(orch.repo, "show", f"{run.checkpoint}:test_orch_t_001.py")
+    assert "def test_r1_zero" in frozen and "def test_r1_value" in frozen
+    tasks = {task.id: task for task in orch.state.tasks(run.id)}
+    assert "test_orch_t_001.TestContract.test_r1_zero" in tasks["T-001"].tests
+
+
+@pytest.mark.parametrize("review", [
+    NativeResult("ok", {"missing": []}),
+    NativeResult("failed", {}, message="DSH upstream HTTP 400", usage={"rejected": 400}),
+], ids=["covered", "review-failed"])
+def test_coverage_review_without_gaps_or_failing_never_blocks_planning(
+    resumable_case: tuple[Orchestrator, ScriptedCaller], monkeypatch: pytest.MonkeyPatch,
+    review: NativeResult,
+) -> None:
+    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", True)
+    orch, caller = resumable_case
+    caller.responses["claude:T-001"] = [review]
+    caller.responses["claude:T-002"] = [NativeResult("ok", {"missing": []})]
+    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+    purposes = [c.purpose for c in orch.state.usage.calls(run.id) if c.task_id == "T-001"]
+    assert purposes == ["test-design", "coverage-review"]
+
+
+def test_second_review_corrects_a_wrong_added_test_once_more(
+    resumable_case: tuple[Orchestrator, ScriptedCaller], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", True)
+    orch, caller = resumable_case
+    fix_zero = NativeResult("ok", {
+        "status": "DONE", "summary": "", "reason": "", "need_files": [],
+        "edits": [{"path": "test_orch_t_001.py",
+                   "search": "self.assertEqual(add(0, 0), 0)",
+                   "replace": "self.assertEqual(add(0, 1), 1)"}],
+    })
+    caller.responses["claude:T-001"] = [
+        NativeResult("ok", {"missing": [{"req": "R1", "clause": "zero"}], "wrong": []}),
+        NativeResult("ok", {"missing": [], "wrong": [
+            {"test": "test_r1_zero", "problem": "use add(0, 1) == 1"}]}),
+    ]
+    caller.responses["claude:T-002"] = [NativeResult("ok", {"missing": [], "wrong": []})]
+    caller.responses["dsh:T-001"][1:1] = [GAP_EDIT, fix_zero]
+    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+    t1 = [c.purpose for c in orch.state.usage.calls(run.id) if c.task_id == "T-001"]
+    assert t1 == ["test-design", "coverage-review", "test-repair", "coverage-review",
+                  "test-repair"]
+    frozen = orch.git(orch.repo, "show", f"{run.checkpoint}:test_orch_t_001.py")
+    assert "add(0, 1), 1" in frozen and "add(0, 0), 0" not in frozen
+
+
+
+def test_a_failed_review_repair_freezes_the_reviewed_draft_without_redesign(
+    resumable_case: tuple[Orchestrator, ScriptedCaller], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", True)
+    orch, caller = resumable_case
+    unusable = NativeResult("ok", {
+        "status": "DONE", "summary": "", "reason": "", "need_files": [],
+        "edits": [{"path": "test_orch_t_001.py", "search": "not in the draft",
+                   "replace": "anything"}],
+    })
+    caller.responses["claude:T-001"] = [
+        NativeResult("ok", {"missing": [{"req": "R1", "clause": "zero"}], "wrong": []})]
+    caller.responses["claude:T-002"] = [NativeResult("ok", {"missing": [], "wrong": []})]
+    caller.responses["dsh:T-001"].insert(1, unusable)
+    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+    t1 = [c.purpose for c in orch.state.usage.calls(run.id) if c.task_id == "T-001"]
+    assert t1 == ["test-design", "coverage-review", "test-repair"]  # no second full design
+    frozen = orch.git(orch.repo, "show", f"{run.checkpoint}:test_orch_t_001.py")
+    assert "def test_r1_value" in frozen and "anything" not in frozen
+
+
+def test_shard_prompts_and_review_demand_decisive_assertions(
+    boundary: dict[str, object],
+) -> None:
+    from orchestragent.orch_thin import coverage_prompt
+    for integration in (False, True):
+        prompt = design_prompt("spec", boundary, "", [], task_id="T-001",
+                               integration=integration)
+        assert "Never write try/except or if/else that lets either of two behaviours pass" in prompt
+    review = coverage_prompt({"R1": "add raises ValueError"}, "t.py", "pass")
+    assert "does not assert it: list it in `missing`" in review
+
+
+@pytest.mark.parametrize(("model", "provider"), [("sonnet", "claude"), ("dsf", "dsh")])
+def test_review_model_switch_routes_the_shard_review(
+    resumable_case: tuple[Orchestrator, ScriptedCaller], monkeypatch: pytest.MonkeyPatch,
+    model: str, provider: str,
+) -> None:
+    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", True)
+    monkeypatch.setattr("orchestragent.orch_run.REVIEW_MODEL", model)
+    orch, caller = resumable_case
+    clean = NativeResult("ok", {"missing": [], "wrong": []})
+    for tid in ("T-001", "T-002"):
+        key = f"{provider}:{tid}"
+        caller.responses.setdefault(key, [])
+        caller.responses[key].insert(1 if provider == "dsh" else 0, clean)
+    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+    reviews = [c for c in orch.state.usage.calls(run.id) if c.purpose == "coverage-review"]
+    assert len(reviews) == 2 and {c.provider for c in reviews} == {provider}
+
+
+def test_tasks_citing_an_upstream_requirement_get_integration_shards() -> None:
+    from orchestragent.orch_thin import citing_tasks
+    boundary: dict[str, object] = {
+        "requirements": [
+            {"id": "R1", "text": "solve() returns a schedule."},
+            {"id": "R2", "text": "audit() computes baseline R1 cost per scenario."},
+            {"id": "R3", "text": "report() formats R2 results; see also R9."},
+            {"id": "R4", "text": "cli() mentions R1 but does not depend on it."},
+        ],
+        "tasks": [
+            {"id": "T-001", "reqs": ["R1"], "depends_on": []},
+            {"id": "T-002", "reqs": ["R2"], "depends_on": ["T-001"]},
+            {"id": "T-003", "reqs": ["R3"], "depends_on": ["T-002"]},
+            {"id": "T-004", "reqs": ["R4"], "depends_on": []},  # cites R1, no upstream link
+        ],
+    }
+    assert citing_tasks(boundary) == {"T-002", "T-003"}
+    assert citing_tasks({"tasks": [], "requirements": []}) == set()

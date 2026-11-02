@@ -294,7 +294,7 @@ def doctor_lines(
         claude.get("ready") is True,
         f"claude subscription login: {claude.get('auth', 'unknown')}"
         + ("" if claude.get("ready") is True
-           else " -> claude auth login (Mac: scripts/login.command, choose Claude)"),
+           else " -> claude auth login"),
     ))
     dsh = cast(dict[str, object], providers.get("dsh", {}))
     spent = cast(int, budget.get("spent_cents", 0))
@@ -303,7 +303,7 @@ def doctor_lines(
         "  ok  jev (typesafe-ai/jev) ready for triage and pre-screen"
         if jev.get("ready") is True
         else "  opt jev (typesafe-ai/jev) not configured; deterministic triage is used "
-        "-> orch keys jev (Mac: scripts/login.command, choose Jev)"
+        "-> orch keys jev"
     )
     transport = str(dsh.get("transport", "cli"))
     authentication = cast(dict[str, object], dsh.get("authentication", {}))
@@ -331,7 +331,7 @@ def doctor_lines(
             dsh.get("credential_ready") is True,
             f"dsh ({DSF.model}) API key "
             + ("loaded" if dsh.get("credential_ready") is True
-               else "missing -> orch keys dsh (Mac: scripts/login.command, choose DSH)"),
+               else "missing -> orch keys dsh"),
         ),
         (
             True,  # informational: no local cap; only the provider's own balance can stop calls
@@ -699,6 +699,9 @@ def parser() -> argparse.ArgumentParser:
                        help="authorize retry despite unresolved possibly billable calls")
     retry.add_argument("--discard-candidate", action="store_true",
                        help="discard saved code and authorize fresh generation")
+    completion = commands.add_parser(
+        "completion", help="print shell completion (bash, zsh, fish) for orch")
+    completion.add_argument("shell", choices=("bash", "zsh", "fish"))
     mcp = commands.add_parser(
         "mcp", help="serve orch to other agent harnesses over MCP (stdio JSON-RPC)")
     mcp.add_argument("--install", choices=("claude-code", "cursor", "claude-desktop"),
@@ -711,6 +714,8 @@ def parser() -> argparse.ArgumentParser:
     watch.add_argument("--replay", action="store_true", help="replay the run in time order")
     watch.add_argument("--speed", type=float, default=8.0, help="replay speed multiplier")
     watch.add_argument("--plain", action="store_true", help="one text line per event, no curses")
+    watch.add_argument("--once", action="store_true",
+                       help="print what has happened so far and the status, then exit")
     watch.add_argument("--ascii", action="store_true", help="ASCII instead of Unicode drawing")
     watch.add_argument("--web", action="store_true", help="serve the browser view instead")
     watch.add_argument("--bind", default="127.0.0.1", help="web: listen address (non-loopback "
@@ -736,7 +741,9 @@ def watch_command(args: argparse.Namespace, repo: Path) -> int:
         path = watch_export(model, cast(Path, args.export).resolve(), args.speed)
         print(f"orch watch: wrote {path} (self-contained; open it in any browser, no network)")
         return 0
-    mode = choose(web=args.web, plain=args.plain, stdout_tty=sys.stdout.isatty(),
+    if args.once and (args.web or args.replay):
+        raise ValueError("--once prints the current state as text; not with --web or --replay")
+    mode = choose(web=args.web, plain=args.plain or args.once, stdout_tty=sys.stdout.isatty(),
                   stdin_tty=sys.stdin.isatty(), term=os.environ.get("TERM", ""))
     if mode == "web":
         token = args.token or ("" if is_loopback(args.bind) else new_token())
@@ -763,7 +770,7 @@ def watch_command(args: argparse.Namespace, repo: Path) -> int:
                 print(f"orch watch: terminal UI unavailable ({type(error).__name__}: {error}); "
                       "falling back to plain text", file=sys.stderr)
         return plain(load, sys.stdout, replay=args.replay, speed=args.speed,
-                     ascii_only=args.ascii)
+                     ascii_only=args.ascii, once=args.once)
     except KeyboardInterrupt:
         return 0
     finally:
@@ -781,6 +788,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "watch":
             return watch_command(args, repo)
+        if args.command == "completion":
+            from orchestragent.orch_completion import render
+            print(render(args.shell, parser()), end="")
+            return 0
         if args.command == "mcp":
             if args.install:
                 from orchestragent.orch_desktop import install

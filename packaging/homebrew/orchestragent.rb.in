@@ -1,0 +1,38 @@
+# Homebrew formula for orch (tap: Orchestragent/homebrew-tap), rendered for each release
+# by scripts/render_formula.py from the release wheel. Install:
+#   brew install orchestragent/tap/orchestragent
+class Orchestragent < Formula
+  include Language::Python::Virtualenv
+
+  desc "Plan with a strong model, build in parallel with a cheap one, gate merges on tests"
+  homepage "https://github.com/Orchestragent/orchestragent"
+  url "https://github.com/Orchestragent/orchestragent/releases/download/v@VERSION@/orchestragent-@VERSION@-py3-none-any.whl"
+  sha256 "@SHA256@"
+  license "Apache-2.0"
+
+  depends_on "python@3.12"
+
+  def install
+    # A pure-Python wheel with no runtime dependencies: nothing to build.
+    venv = virtualenv_create(libexec, "python3.12")
+    venv.pip_install_and_link buildpath/"orchestragent-#{version}-py3-none-any.whl"
+    generate_completions_from_executable(bin/"orch", "completion")
+  end
+
+  def caveats
+    <<~EOS
+      orch plans with Claude Code (log in once: claude auth login) and builds with
+      DeepSeek (store your key once: orch keys dsh). Then check everything with:
+        orch doctor
+      Let Claude Code, Claude Desktop or Cursor hand builds to orch:
+        orch mcp --install claude-code
+    EOS
+  end
+
+  test do
+    assert_match "usage: orch", shell_output("#{bin}/orch --help")
+    request = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+    assert_match "orch_start", pipe_output("#{bin}/orch mcp", "#{request}\n")
+    assert_match "#compdef orch", shell_output("#{bin}/orch completion zsh")
+  end
+end

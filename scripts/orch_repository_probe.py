@@ -260,7 +260,8 @@ def agent_test(output: Path, nodeids: list[str] | None = None) -> None:
     raise SystemExit(0 if passed else 1)
 
 
-def single_agent(orch, clients, case, output, base, trial, result, phases, timeout):
+def single_agent(orch, clients, case, output, base, trial, result, phases, timeout,
+                 effort="high"):
     """One native subscription agent with real file tools and a fixed sandbox test command."""
     passed, log = orch._project_tests("single-opus", base, orch.environment_override)
     (output / "baseline.log").write_text(log)
@@ -290,7 +291,7 @@ def single_agent(orch, clients, case, output, base, trial, result, phases, timeo
             "--strict-mcp-config", "--mcp-config", dumps({"mcpServers": {}}),
             "--permission-prompts", "none", "--permission-mode", "dontAsk",
             "--no-session-persistence", "--print", "--verbose", "--output-format", "stream-json",
-            "--json-schema", dumps(schema), "--model", "claude-opus-5-5", "--effort", "high",
+            "--json-schema", dumps(schema), "--model", "claude-opus-5-5", "--effort", effort,
             "--disable-slash-commands", "--no-chrome"]
     trial["run_id"] = "single-opus"
     request = dumps({"prompt": prompt, "schema": schema})
@@ -375,6 +376,8 @@ def main() -> None:
                         "distributed path is Opus 5.5/high boundary planning with DSF tests")
     parser.add_argument("--integration-checks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--single-agent", action="store_true")
+    parser.add_argument("--single-effort", choices=("low", "medium", "high", "max"),
+                        default="high", help="native single Opus reasoning effort (baseline)")
     parser.add_argument("--test-jobs", type=int, default=None,
                         help="test-design concurrency (default: orch's own default)")
     parser.add_argument("--cold", action="store_true",
@@ -449,6 +452,7 @@ def main() -> None:
         "reviewed_boundary": args.reviewed_boundary,
         "integration_checks": args.distributed and args.integration_checks,
         "single_agent": args.single_agent,
+        "single_effort": args.single_effort if args.single_agent else None,
         "max_calls": args.max_calls, "max_cents": args.max_cents,
         "dsf_context_window_tokens": DshClient.context_window_tokens,
         "dsf_transport_payload_limit_bytes": DshClient.input_limit,
@@ -514,7 +518,8 @@ def main() -> None:
             os.environ["ORCHESTRA_NATIVE_TIMEOUT"] = str(args.timeout)
             clients = providers(ROOT / ".data")
             if args.single_agent:
-                single_agent(orch, clients, case, output, base, trial, result, phases, args.timeout)
+                single_agent(orch, clients, case, output, base, trial, result, phases, args.timeout,
+                             effort=args.single_effort)
                 return
             admission = _Admission(args.max_calls, args.max_cents,
                                    deadline=started + args.wall_limit)

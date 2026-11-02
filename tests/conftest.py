@@ -28,6 +28,12 @@ class CaseProjectFactory(Protocol):
                  *, acceptance: bool = True) -> Path: ...
 
 
+
+@pytest.fixture(autouse=True)
+def no_coverage_review(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scripted callers predate the coverage review; tests that cover it turn it back on."""
+    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", False)
+
 @pytest.fixture
 def dependency_environment(tmp_path: Path, request: pytest.FixtureRequest) -> PytestEnvironment:
     return PytestEnvironment.create(tmp_path / "dependencies", packages=("typing_extensions",),

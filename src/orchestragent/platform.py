@@ -162,6 +162,27 @@ def _seccomp_prelude() -> str:
     )
 
 
+def sandbox_python(python: str) -> str:
+    """The interpreter binary the sandbox may run directly.
+
+    A macOS framework Python (python.org, Homebrew, GitHub's macOS runners; often behind
+    a venv symlink) starts as a launcher that posix_spawns Resources/Python.app; Seatbelt
+    forbids that spawn, so every sandboxed test failed there (CI on macos-14). Tests run
+    isolated (-I -S) with explicit paths, so the real binary needs nothing the launcher
+    sets up.
+    """
+    if not is_macos():
+        return python
+    resolved = Path(python).resolve()
+    parts = resolved.parts
+    if "Python.framework" in parts and len(parts) >= 3 and parts[-2] == "bin":
+        version_dir = resolved.parents[1]  # .../Python.framework/Versions/X.Y
+        app = version_dir / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+        if app.is_file():
+            return str(app)
+    return python
+
+
 def sandbox_command(
     workdir: Path, python: str, script: str, profile: str = "",
     read_only: tuple[Path, ...] = (),
@@ -177,7 +198,7 @@ def sandbox_command(
             "/usr/bin/sandbox-exec",
             "-p",
             profile or _seatbelt_profile(workdir),
-            python,
+            sandbox_python(python),
             "-I",
             "-S",
             "-B",  # no bytecode: a rewritten file (mutation testing) is never stale

@@ -43,7 +43,7 @@ class JevClient:
 
     def decide(self, state: object, questions: dict[str, object], run_id: str) -> Decision:
         if not self.access.key("jev"):
-            return Decision("auth_required", message="Jev key missing: scripts/login.command")
+            return Decision("auth_required", message="Jev key missing: orch keys jev")
         if self.access.status("jev")["authorized"] is not True:
             return Decision("waiting_approval", message="Jev budget not authorized")
         body = dumps({"model": MODEL, "state": state, "questions": questions}).encode()

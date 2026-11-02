@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import cast
@@ -84,10 +85,12 @@ def test_project_baseline_and_final_gate_pin_full_suite_and_record_evidence(
 
 
 @pytest.mark.parametrize("failure", ["red", "zero", "unsupported", "tampered"])
-def test_failed_project_baseline_never_dispatches_a_provider(
+def test_failed_project_baseline_never_builds_or_commits(
     project_orchestrator: Orchestrator, project_gate: Mock, project_caller: ScriptedCaller,
     project_environment: PytestEnvironment, failure: str,
 ) -> None:
+    # The baseline runs beside planning (it no longer delays the planner); a red base
+    # cancels planning, reports the baseline, and nothing is built or committed on it.
     if failure == "unsupported":
         project_gate.side_effect = RuntimeError("unsupported sandbox")
     elif failure == "tampered":
@@ -96,8 +99,12 @@ def test_failed_project_baseline_never_dispatches_a_provider(
         project_gate.return_value = False, "zero tests" if failure == "zero" else "failed test"
     with pytest.raises(PlanError, match="project pytest baseline"):
         project_orchestrator.plan("must not dispatch")
-    assert project_caller.calls == [] and project_orchestrator.state.usage.calls() == []
     assert project_orchestrator.state.runs() == []
+    assert not any(call.scope == "execution"
+                   for call in project_orchestrator.state.usage.calls())
+    assert project_orchestrator.git(project_orchestrator.repo, "branch", "--list",
+                                    "orch/*") == ""
+    assert not project_orchestrator.cancel.is_set()  # the orchestrator stays usable
 
 
 def test_final_pytest_regression_cannot_be_reported_done(
@@ -367,3 +374,86 @@ def test_project_harden_is_blocked_before_calls_and_preserves_done_tag(
     assert Workspace.git(project_orchestrator.integration(run.id), "rev-parse", "HEAD") == head
     assert Workspace.git(project_orchestrator.repo, "tag", "-l", f"orch/{run.id}/done") == tag
     assert project_orchestrator.state.run(run.id).status == status
+
+
+def test_project_baseline_runs_beside_the_planner_not_before_it(
+    project_orchestrator: Orchestrator, project_gate: Mock, project_caller: ScriptedCaller,
+) -> None:
+    import threading
+    import time
+
+    planner_called = threading.Event()
+    order: list[str] = []
+
+    def slow_baseline(*_: object, **__: object) -> tuple[bool, str]:
+        # Finishes only after the planner has been asked: they overlap.
+        assert planner_called.wait(10), "planner waited for the project baseline"
+        order.append("baseline done")
+        return True, "project tests passed"
+
+    original = project_orchestrator.call
+
+    def call(provider: str, model: str, prompt: str, schema: dict[str, object],
+             run_id: str, cancelled: Callable[[], bool], *, effort: str = "") -> NativeResult:
+        planner_called.set()
+        order.append("planner called")
+        time.sleep(0.05)
+        return original(provider, model, prompt, schema, run_id, cancelled, effort=effort)
+
+    project_gate.side_effect = slow_baseline
+    project_orchestrator.call = call
+    run = project_orchestrator.plan("add and double")
+    assert order[:2] == ["planner called", "baseline done"]
+    assert any(event.kind == "plan.project_baseline"
+               for event in project_orchestrator.state.events(run.id))
+
+
+def test_project_test_shards_balance_default_collection_only() -> None:
+    from orchestragent.orch_run import project_test_shards
+
+    rows = [f"100644 blob {'a' * 40} {size}\tpkg/tests/test_{i}.py"
+            for i, size in enumerate(range(100, 3100, 100))]
+    rows += [f"100644 blob {'b' * 40} 9999\tbuild/tests/test_x.py",      # norecursedirs
+             f"100644 blob {'c' * 40} 9999\t.venv/lib/test_y.py",
+             f"100644 blob {'d' * 40} 9999\tpkg/helpers.py",              # not a test file
+             f"100644 blob {'e' * 40} 500\tpkg/core_test.py",
+             f"160000 commit {'f' * 40}       -\tvendor/sub"]
+    groups = project_test_shards("\n".join(rows), 4)
+    flat = [path for group in groups for path in group]
+    assert len(groups) == 4 and len(flat) == len(set(flat)) == 31
+    assert "pkg/core_test.py" in flat and not any(p.startswith(("build/", ".venv/")) for p in flat)
+    sizes = [sum(int(r.split()[3]) for r in rows if r.split("\t")[1] in group)
+             for group in groups]
+    assert max(sizes) - min(sizes) <= 3000  # greedy balance within one largest file
+    assert project_test_shards("\n".join(rows[:5]), 4) == []  # small suites stay whole
+    assert project_test_shards("\n".join(rows), 1) == []
+
+
+def test_a_red_shard_is_confirmed_by_one_full_run(
+    project_orchestrator: Orchestrator, project_gate: Mock, project_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("orchestragent.orch_run.PROJECT_SHARD_MIN_FILES", 2)
+    for i in range(4):
+        (project_repo / f"test_extra_{i}.py").write_text("def test_ok():\n    assert True\n")
+    project_orchestrator.git(project_repo, "add", ".")
+    project_orchestrator.git(project_repo, "commit", "-m", "more tests")
+    calls: list[list[str] | None] = []
+
+    def gate(execution: Path, scratch: Path, revision: str, names: list[str] | None = None,
+             **_: object) -> tuple[bool, str]:
+        calls.append(names)
+        if names is None:
+            return True, "full: 9 passed"
+        return ("test_extra_0.py" not in names), "shard"
+
+    project_gate.side_effect = gate
+    head = project_orchestrator.git(project_repo, "rev-parse", "HEAD")
+    run_id = "rshardtest"
+    project_orchestrator.run_dir(run_id).mkdir(parents=True)
+    assert project_orchestrator.environment is not None
+    passed, report = project_orchestrator._project_tests(
+        run_id, head, project_orchestrator.environment)
+    sharded = [names for names in calls if names is not None]
+    assert len(sharded) >= 2 and calls[-1] is None  # the full run decides
+    assert (passed, report) == (True, "full: 9 passed")

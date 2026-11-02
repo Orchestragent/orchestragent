@@ -813,11 +813,17 @@ def entry_key(entry: Json) -> tuple[object, ...]:
 
 def plain(load: Callable[[], Json | None], out: TextIO, *, replay: bool, speed: float,
           poll: float = 0.5, sleep: Callable[[float], None] = time.sleep,
-          clock: Callable[[], float] = time.time, ascii_only: bool = False) -> int:
-    """One line per event (same facts as the TUI); follows a live run until it ends."""
+          clock: Callable[[], float] = time.time, ascii_only: bool = False,
+          once: bool = False) -> int:
+    """One line per event (same facts as the TUI); follows a live run until it ends.
+
+    `once` prints what has happened so far and the current status, then returns."""
     encoding = (getattr(out, "encoding", "") or "").lower()
     caps = Caps(0, not ascii_only and encoding.startswith("utf"))
     model = load()
+    if model is None and once:
+        out.write("orch watch: no orchestration run yet (orch plan)\n")
+        return 0
     if model is None:
         out.write("orch watch: waiting for an orchestration run (orch plan) ...\n")
         out.flush()
@@ -849,6 +855,8 @@ def plain(load: Callable[[], Json | None], out: TextIO, *, replay: bool, speed: 
             phase = str(seen["phase"])
             out.write(status_line(model, now, caps) + "\n")
         out.flush()
+        if once:  # the first pass already printed every event so far and the status
+            return 0
         if model["terminal"] and not seen["in_flight"]:
             return 0
         sleep(poll)

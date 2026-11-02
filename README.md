@@ -34,13 +34,31 @@ live (`orch watch`).
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/Orchestragent/orchestragent/main/install.sh | sh
+```
+
+The installer (macOS and Linux) checks git and the sandbox, installs [uv](https://astral.sh/uv)
+and orch as an isolated tool, offers to store your DeepSeek key, registers `orch mcp` with
+Claude Code / Claude Desktop / Cursor when present, and finishes with `orch doctor`.
+`sh install.sh --dry-run` shows every step without changing anything.
+
+On macOS with Homebrew (installs shell completion for zsh, bash and fish too):
+
+```sh
+brew install orchestragent/tap/orchestragent
+```
+
+Or by hand:
+
+```sh
 uv tool install "orchestragent[index] @ git+https://github.com/Orchestragent/orchestragent"
 # or: pipx install "orchestragent[index] @ git+https://github.com/Orchestragent/orchestragent"
 orch keys dsh        # paste your DeepSeek key (stored locally, 0600 / Keychain)
 orch doctor          # checks models, keys and the sandbox
 ```
 
-`[index]` adds tree-sitter for non-Python code indexing; without it orch falls back to
+Shell completion without Homebrew: `orch completion zsh > "${fpath[1]}/_orch"` (or `bash`,
+`fish`). `[index]` adds tree-sitter for non-Python code indexing; without it orch falls back to
 Python's `ast`. Data (keys, spend ledger) lives in `~/.local/share/orch`
 (`~/Library/Application Support/orch` on macOS) or `$ORCHESTRA_DATA_DIR`.
 
@@ -108,10 +126,20 @@ Boltons "resumable checkpoint queue" case — 4 requirements, existing 18k-line 
 | orch (Opus medium plan + DeepSeek Flash) | 4 | 4/4 | 444 s | ≈ $0.50–0.86 |
 
 On this medium-sized task orch delivers the same result at roughly a third of the cost and
-similar wall time. **Larger projects are work in progress**: on earlier engine versions,
-three larger cases (up to a 116k-line repository) were won by the single agent because
-orch's planning failed or rework accumulated; current-engine reruns are underway and will
-be published whether or not they favour orch.
+similar wall time.
+
+**Larger projects (work in progress).** Three multi-module features on existing
+repositories, 8 hidden acceptance tests each, single runs, cold caches:
+
+| case (repository) | single Opus 5.5 high | orch |
+|---|---|---|
+| build graph + cache + runner (Boltons, 18k lines) | 8/8 · 778 s · $3.32 | **8/8 · 511 s · ≈ $0.61** |
+| rollout controller (NetworkX, 116k lines) | 8/8 · 1030 s · $2.72 | 7/8 · 984–1325 s · $1.0–4.1 |
+| time-expanded flows (NetworkX, 116k lines) | 8/8 · 1078 s · $3.82 | 7/8–8/8 · 1259–1443 s · $2.5–3.5 |
+
+orch now wins clearly on the Boltons case. On the NetworkX cases it still misses one
+requirement clause in some runs: frozen tests that did not pin a stated behaviour down
+(work on test review is ongoing). These numbers will be updated as runs complete.
 
 ## How it is built
 

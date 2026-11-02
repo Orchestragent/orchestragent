@@ -1,0 +1,46 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: version matches the tag
+        run: test "v$(uv version --short)" = "$GITHUB_REF_NAME"
+      - run: uv build -o dist
+      - run: python3 scripts/render_formula.py dist/orchestragent-*-py3-none-any.whl > dist/orchestragent.rb
+      - name: GitHub release with wheel, sdist and the rendered Homebrew formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  homebrew-check:
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: install with Homebrew from the rendered formula, then brew test
+        run: |
+          brew tap-new --no-git local/orch
+          cp dist/orchestragent.rb "$(brew --repository)/Library/Taps/local/homebrew-orch/Formula/"
+          brew install --formula local/orch/orchestragent
+          brew test local/orch/orchestragent
+          orch doctor || true
+          zsh -c 'autoload -U compinit && compinit -u && whence -w _orch'

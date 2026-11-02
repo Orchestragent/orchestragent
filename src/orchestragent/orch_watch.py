@@ -604,6 +604,9 @@ def _log(event: OrchEvent) -> Json:
     bits = [f"{key}={value}" for key, value in data.items()
             if key in {"status", "category", "signature", "outcome", "passed", "tests",
                        "level", "next", "requests", "route", "sample"}]
+    if event.kind == "plan.outcome":
+        # Not the run's result: whether the plan needed no repairs, splits or vacuous tests.
+        bits = [f"plan clean={data.get('passed')}"]
     return {"seq": event.seq, "at": event.at, "kind": event.kind, "task": event.task_id,
             "node": node, "summary": clean(" ".join(bits), 140), "data": data,
             "attempt": attempt_of(event.span)}
