@@ -75,6 +75,7 @@ struct NodeInspector: View {
             Text(detail.node.goal).font(.headline).lineLimit(4).help(detail.node.goal).textSelection(.enabled)
             if !detail.node.diagnosis.summary.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
+                    Text(diagnosisTitle(detail.node.diagnosis.kind)).font(.caption.weight(.semibold))
                     Label(detail.node.diagnosis.summary, systemImage: diagnosisIcon(detail.node.diagnosis.kind))
                         .font(.callout).fixedSize(horizontal: false, vertical: true)
                     if !detail.node.diagnosis.blamed.isEmpty {
@@ -233,12 +234,12 @@ struct NodeInspector: View {
                             VStack(alignment: .leading, spacing: 5) {
                                 HStack {
                                     Text(attempt.label).font(.system(.headline, design: .monospaced))
-                                    Text(attempt.outcome).font(.caption).foregroundStyle(attempt.outcome == "passed" ? .green : attempt.outcome == "failed" ? .orange : .secondary)
+                                    Text(outcomeTitle(attempt.outcome)).font(.caption).foregroundStyle(attempt.outcome == "passed" ? .green : attempt.outcome == "failed" ? .orange : .secondary)
                                     Spacer()
                                     Text(String(format: "%.1fs", max(0, (attempt.ended ?? Date().timeIntervalSince1970) - attempt.started))).font(.caption).foregroundStyle(.secondary)
                                 }
                                 RouteChip(route: attempt.route)
-                                Text(rungTitle(attempt.rung) + " · " + attempt.category).font(.caption).foregroundStyle(.secondary)
+                                Text(rungTitle(attempt.rung) + (attempt.category.isEmpty ? "" : " · " + categoryTitle(attempt.category))).font(.caption).foregroundStyle(.secondary)
                             }
                         }.padding(12).background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 9)).id(attempt.n)
                     }
@@ -255,7 +256,6 @@ struct NodeInspector: View {
                 if detail.checks.isEmpty { empty(L("No frozen checks", "暂无冻结检查")) }
                 ForEach(detail.checks) { check in
                     VStack(alignment: .leading, spacing: 10) {
-                        Text(check.id).font(.headline)
                         InspectorCode(title: L("Command", "命令"), content: check.command)
                         ForEach(check.files) { file in InspectorCode(title: file.path, content: file.content, numbered: true) }
                     }
@@ -273,7 +273,7 @@ struct NodeInspector: View {
                         HStack {
                             Text(file.path).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
                             Spacer()
-                            if let state = file.state { Text(state).font(.caption).foregroundStyle(.secondary) }
+                            if let state = file.state { Text(fileStateTitle(state)).font(.caption).foregroundStyle(.secondary) }
                         }
                         HStack {
                             Button(L("Reveal in Finder", "在 Finder 中显示"), systemImage: "folder") { reveal([file.path]) }

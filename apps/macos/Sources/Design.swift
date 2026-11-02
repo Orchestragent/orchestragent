@@ -114,3 +114,54 @@ func routeOrder(_ lhs: Route, _ rhs: Route) -> Bool {
     let left = efforts[lhs.effort, default: 99], right = efforts[rhs.effort, default: 99]
     return left == right ? lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending : left < right
 }
+
+func outcomeTitle(_ value: String) -> String {
+    switch value {
+    case "passed": L("Passed", "通过")
+    case "failed": L("Failed", "失败")
+    case "running": L("Running", "进行中")
+    case "error": L("Error", "出错")
+    default: value
+    }
+}
+func fileStateTitle(_ value: String) -> String {
+    switch value {
+    case "stub": L("Stub", "待实现")
+    case "built": L("Built", "已构建")
+    case "candidate": L("Candidate", "候选版本")
+    default: value
+    }
+}
+func roleTitle(_ role: Role) -> String {
+    switch role.role {
+    case "planner": L("Planner", "规划者")
+    case "test_designer": L("Test designer", "测试设计者")
+    case "builder": L("Builder", "构建者")
+    case "reviewer": L("Reviewer", "审查者")
+    default: role.title
+    }
+}
+func diagnosisTitle(_ value: String) -> String {
+    switch value {
+    case "done": L("Completed", "已完成")
+    case "running": L("In progress", "进行中")
+    case "queued": L("Queued", "排队中")
+    case "waiting": L("Waiting on upstream", "等待上游")
+    case "own": L("Own checks failing", "自身测试失败")
+    case "upstream": L("Upstream implicated", "上游可能有问题")
+    case "test": L("Test dispute", "测试有争议")
+    case "environment": L("Environment issue", "环境问题")
+    case "replanned": L("Replanned", "已重新规划")
+    default: value
+    }
+}
+func categoryTitle(_ value: String) -> String {
+    switch value {
+    case "test": L("Tests", "测试")
+    case "integration": L("Integration", "集成检查")
+    case "edit": L("File changes", "文件改动")
+    case "provider": L("Provider", "提供商")
+    case "environment": L("Environment", "环境")
+    default: value
+    }
+}

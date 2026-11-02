@@ -71,7 +71,7 @@ struct StudioSettingsView: View {
             if let settings = store.settings {
                 ForEach(settings.roles) { role in
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(role.title).font(.headline)
+                        Text(roleTitle(role)).font(.headline)
                         Text(role.description).font(.callout).foregroundStyle(.secondary)
                         Menu {
                             Button(L("Role default", "角色默认") + (role.defaultRoute.map { " · " + $0.name + ($0.verified ? L(" · verified", " · 已验证") : "") } ?? "")) {

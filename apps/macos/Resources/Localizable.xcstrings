@@ -177,6 +177,22 @@
         }
       }
     },
+    "Builder": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Builder"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "构建者"
+          }
+        }
+      }
+    },
     "Building": {
       "localizations": {
         "en": {
@@ -189,6 +205,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "构建中"
+          }
+        }
+      }
+    },
+    "Built": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Built"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已构建"
           }
         }
       }
@@ -253,6 +285,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "取消本次运行？"
+          }
+        }
+      }
+    },
+    "Candidate": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Candidate"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "候选版本"
           }
         }
       }
@@ -413,6 +461,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "完成登录后，请在 Orch Studio 刷新提供商。"
+          }
+        }
+      }
+    },
+    "Completed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Completed"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已完成"
           }
         }
       }
@@ -1009,6 +1073,54 @@
         }
       }
     },
+    "Environment": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Environment"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "环境"
+          }
+        }
+      }
+    },
+    "Environment issue": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Environment issue"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "环境问题"
+          }
+        }
+      }
+    },
+    "Error": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Error"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "出错"
+          }
+        }
+      }
+    },
     "Every task, in context.": {
       "localizations": {
         "en": {
@@ -1037,6 +1149,38 @@
           "stringUnit": {
             "state": "translated",
             "value": "体验演示"
+          }
+        }
+      }
+    },
+    "Failed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Failed"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "失败"
+          }
+        }
+      }
+    },
+    "File changes": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "File changes"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文件改动"
           }
         }
       }
@@ -1217,6 +1361,22 @@
         }
       }
     },
+    "In progress": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "In progress"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "进行中"
+          }
+        }
+      }
+    },
     "Include file or package paths and languages. Install dependencies first (npm ci / go mod download).": {
       "localizations": {
         "en": {
@@ -1261,6 +1421,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "检查器"
+          }
+        }
+      }
+    },
+    "Integration": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Integration"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "集成检查"
           }
         }
       }
@@ -1985,6 +2161,22 @@
         }
       }
     },
+    "Own checks failing": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Own checks failing"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自身测试失败"
+          }
+        }
+      }
+    },
     "Parked": {
       "localizations": {
         "en": {
@@ -2001,6 +2193,22 @@
         }
       }
     },
+    "Passed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Passed"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "通过"
+          }
+        }
+      }
+    },
     "Planned": {
       "localizations": {
         "en": {
@@ -2013,6 +2221,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "等待"
+          }
+        }
+      }
+    },
+    "Planner": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Planner"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "规划者"
           }
         }
       }
@@ -2081,6 +2305,22 @@
         }
       }
     },
+    "Provider": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Provider"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "提供商"
+          }
+        }
+      }
+    },
     "Providers": {
       "localizations": {
         "en": {
@@ -2093,6 +2333,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "提供商"
+          }
+        }
+      }
+    },
+    "Queued": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Queued"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "排队中"
           }
         }
       }
@@ -2481,6 +2737,22 @@
         }
       }
     },
+    "Reviewer": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reviewer"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "审查者"
+          }
+        }
+      }
+    },
     "Role default": {
       "localizations": {
         "en": {
@@ -2588,7 +2860,7 @@
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "生成中"
+            "value": "进行中"
           }
         }
       }
@@ -2929,6 +3201,22 @@
         }
       }
     },
+    "Stub": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stub"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "待实现"
+          }
+        }
+      }
+    },
     "Switch Model": {
       "localizations": {
         "en": {
@@ -2973,6 +3261,38 @@
           "stringUnit": {
             "state": "translated",
             "value": "始终遵循系统“减弱动态效果”设置。"
+          }
+        }
+      }
+    },
+    "Test designer": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Test designer"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "测试设计者"
+          }
+        }
+      }
+    },
+    "Test dispute": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Test dispute"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "测试有争议"
           }
         }
       }
@@ -3233,6 +3553,22 @@
         }
       }
     },
+    "Upstream implicated": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Upstream implicated"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上游可能有问题"
+          }
+        }
+      }
+    },
     "Verifying": {
       "localizations": {
         "en": {
@@ -3277,6 +3613,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "工作区"
+          }
+        }
+      }
+    },
+    "Waiting on upstream": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting on upstream"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "等待上游"
           }
         }
       }
