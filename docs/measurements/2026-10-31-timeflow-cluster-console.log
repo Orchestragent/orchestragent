@@ -1,0 +1,6 @@
+[plan] run r05a2ec23; usage: orch cost --run r05a2ec23
+[plan] asking dsh/deepseek-flash for boundaries only (attempt 1)
+[plan] asking dsh/deepseek-flash for boundaries only (attempt 2)
+[plan] asking dsh/deepseek-flash for boundaries only (attempt 3)
+PlanError: plan failed lint
+{"output":"/Users/user/Orchestragent/.data/bench/networkx-timeflow-cluster-20261031","status":"error","usage":{"cache_hit_rate":0.254312,"calls":4,"costs":{"cost_usd":{"known_sum":0,"reported_calls":0},"provider_estimate_usd":{"known_sum":0.238572,"reported_calls":1},"settled_cents":{"known_sum":24.0,"reported_calls":3}},"known_tokens":{"cache_read_tokens":12032,"cache_write_tokens":21708,"input_tokens":47312,"output_tokens":22415,"reasoning_tokens":0,"total_tokens":69727},"legacy_calls":0,"pending_calls":0,"reported_calls":{"cache_read_tokens":4,"cache_write_tokens":4,"input_tokens":4,"output_tokens":4,"reasoning_tokens":0,"total_tokens":4}},"wall_s":160.914556}

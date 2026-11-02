@@ -1,0 +1,19 @@
+test_bytes_blank_lines_and_partial_tail (_orch_bench_acceptance.test_acceptance.CheckpointReader.test_bytes_blank_lines_and_partial_tail) ... ok
+test_invalid_lines_and_offsets (_orch_bench_acceptance.test_acceptance.CheckpointReader.test_invalid_lines_and_offsets) ... ok
+test_atomic_json_preserves_original_on_encoding_failure (_orch_bench_acceptance.test_acceptance.DurableQueue.test_atomic_json_preserves_original_on_encoding_failure) ... ok
+test_bad_record_does_not_checkpoint_past_failure (_orch_bench_acceptance.test_acceptance.DurableQueue.test_bad_record_does_not_checkpoint_past_failure) ... ok
+test_inflight_recovery_order_and_completed_dedup (_orch_bench_acceptance.test_acceptance.DurableQueue.test_inflight_recovery_order_and_completed_dedup) ... ok
+test_ingest_save_resume_and_partial_tail (_orch_bench_acceptance.test_acceptance.DurableQueue.test_ingest_save_resume_and_partial_tail) ... ok
+test_invalid_input_is_nonmutating_and_state_version_is_checked (_orch_bench_acceptance.test_acceptance.DurableQueue.test_invalid_input_is_nonmutating_and_state_version_is_checked) ... ok
+test_backends_preserve_order_tombstones_and_custom_priority (_orch_bench_acceptance.test_acceptance.QueueBehavior.test_backends_preserve_order_tombstones_and_custom_priority) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.003s
+
+OK
+
+issuer=controller
+mode=sandbox-exec
+revision=27072d6522280e9907ae17e8f59991ec995b204d
+exit=0
+command=python -I -S -B -c <unittest bootstrap>

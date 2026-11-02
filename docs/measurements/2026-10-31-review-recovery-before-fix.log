@@ -1,0 +1,58 @@
+........................................................................ [  4%]
+........................................................................ [  8%]
+........................................................................ [ 12%]
+........................................................................ [ 17%]
+........................................................................ [ 21%]
+........................................................................ [ 25%]
+........................................................................ [ 30%]
+........................................................................ [ 34%]
+........................................................................ [ 38%]
+........................................................................ [ 43%]
+........................................................................ [ 47%]
+.....................................................................F.. [ 51%]
+........................................................................ [ 56%]
+........................................................................ [ 60%]
+........................................................................ [ 64%]
+........................................................................ [ 68%]
+........................................................................ [ 73%]
+........................................................................ [ 77%]
+........................................................................ [ 81%]
+........................................................................ [ 86%]
+..........................................................sssss......... [ 90%]
+........................................................................ [ 94%]
+........................................................................ [ 99%]
+...............                                                          [100%]
+=================================== FAILURES ===================================
+_______________ test_test_corrections_may_not_delete_assertions ________________
+
+orch_repo = PosixPath('/private/var/folders/ss/532t6jzx62vft7d6ff6s7qb80000gn/T/pytest-of-franz/pytest-252/test_test_corrections_may_not_0/project')
+math_plan = {'summary': 'math ops', 'requirements': [{'id': 'R1', 'text': 'add two integers'}, {'id': 'R2', 'text': 'double an int...files': ['adder.py'], ...}, {'id': 'T-002', 'goal': 'implement double', 'reqs': ['R2'], 'files': ['doubler.py'], ...}]}
+
+    def test_test_corrections_may_not_delete_assertions(
+        orch_repo: Path, math_plan: dict[str, object]
+    ) -> None:
+        files = cast(list[dict[str, str]], math_plan["files"])
+        files[2]["content"] = MATH_TESTS.replace("3), 5", "3), 6")
+        weaken = NativeResult("ok", {
+            "verdict": "tests_wrong", "explanation": "drop it",
+            "edits": [{"path": "test_mathops.py", "search": "        self.assertEqual(add(2, 3), 6)\n",
+                       "replace": "        pass\n"}],
+        })
+        dispute = edit_result("adder.py", "", "TEST_DISPUTE")
+        stop = NativeResult("quota_exhausted", {}, message="stop here")
+        orchestrator, _ = orchestrate(
+            orch_repo, math_plan, {"dsh:T-001": [dispute, stop], "claude:T-001": [weaken]}
+        )
+        run = orchestrator.execute(orchestrator.plan("spec").id)
+        failed = [e.data for e in orchestrator.state.events(run.id, "T-001") if e.kind == "task.failed"]
+        task = orchestrator.state.task(run.id, "T-001")
+>       assert (run.status, [f["category"] for f in failed]) == ("paused", ["dispute"])
+E       AssertionError: assert ('parked', ['...', 'dispute']) == ('paused', ['dispute'])
+E         
+E         At index 0 diff: 'parked' != 'paused'
+E         Use -v to get more diff
+
+tests/test_orch_index.py:564: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_orch_index.py::test_test_corrections_may_not_delete_assertions
+1 failed, 1665 passed, 5 skipped in 554.65s (0:09:14)

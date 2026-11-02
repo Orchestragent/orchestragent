@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>orch watch</title>
+<style>
+:root {
+  --bg: #0a0e16; --panel: #101622; --panel2: #141c2b; --line: #1e2838; --text: #d8e1ee;
+  --dim: #7d8aa0; --faint: #3a4659;
+  --idle: #3b4658; --planned: #56637a; --ready: #7d93c4; --running: #38bdf8; --verifying: #a78bfa;
+  --merging: #f59e0b; --done: #34d399; --failed: #f87171; --parked: #fb923c; --replanned: #94a3b8;
+  --claude: #e08a5f; --deepseek: #5b7cff; --guard: #22d3ee; --critical: #fde047;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 13px/1.35 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+body { display: grid; grid-template-rows: 48px 1fr auto; overflow: hidden; }
+header { display: flex; align-items: center; gap: 18px; padding: 0 18px; background: linear-gradient(180deg, #111a29, #0d1320);
+  border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; }
+.brand { font-weight: 700; letter-spacing: .3px; font-size: 15px; }
+.brand b { color: var(--running); }
+.pill { padding: 3px 10px; border-radius: 999px; background: #1a2436; color: var(--dim); font-size: 12px; }
+.pill.phase { color: #0a0e16; background: var(--running); font-weight: 600; }
+.stat { color: var(--dim); font-size: 12px; } .stat b { color: var(--text); font-weight: 600; font-size: 13px; }
+.grow { flex: 1; }
+.mode { font-weight: 700; font-size: 11px; letter-spacing: 1px; padding: 3px 9px; border-radius: 4px; border: 1px solid; }
+.mode.live { color: #f87171; border-color: #f8717155; animation: blink 1.6s infinite; }
+.mode.replay { color: var(--verifying); border-color: #a78bfa55; }
+@keyframes blink { 50% { opacity: .45; } }
+main { display: grid; grid-template-columns: 1fr 340px; min-height: 0; }
+#graphwrap { position: relative; min-height: 0; background:
+  radial-gradient(circle at 50% 40%, #121b2c 0, var(--bg) 70%); }
+#graph { width: 100%; height: 100%; display: block; }
+aside { border-left: 1px solid var(--line); background: var(--panel); display: grid;
+  grid-template-rows: auto 1fr; min-height: 0; }
+#detail { padding: 14px 16px; border-bottom: 1px solid var(--line); max-height: 52vh; overflow: auto; }
+#detail h2 { margin: 0 0 2px; font-size: 15px; }
+#detail .sub { color: var(--dim); margin-bottom: 10px; }
+#detail table { border-collapse: collapse; width: 100%; font-size: 12px; }
+#detail td { padding: 3px 0; vertical-align: top; } #detail td:first-child { color: var(--dim); width: 38%; padding-right: 8px; }
+#detail .calls div { padding: 4px 6px; margin: 3px 0; border-radius: 5px; background: var(--panel2); cursor: pointer; font-size: 12px; }
+#feed { overflow: auto; padding: 8px 0; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+#feed div { padding: 1px 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+#feed div:hover { background: var(--panel2); }
+#feed .at { color: var(--faint); } #feed .k { color: var(--running); }
+footer { border-top: 1px solid var(--line); background: var(--panel); }
+#controls { display: flex; align-items: center; gap: 10px; padding: 6px 14px; }
+button, select { background: #1a2436; color: var(--text); border: 1px solid #263248; border-radius: 6px;
+  padding: 4px 10px; font: inherit; cursor: pointer; }
+button:hover { border-color: var(--running); }
+#scrub { flex: 1; accent-color: var(--running); }
+#clock { font: 600 13px ui-monospace, Menlo, monospace; min-width: 70px; text-align: right; }
+#gantt { width: 100%; display: block; }
+#legend { position: absolute; left: 14px; bottom: 10px; display: flex; flex-wrap: wrap; gap: 4px 12px;
+  color: var(--dim); font-size: 11px; max-width: 70%; }
+#legend span { display: inline-flex; align-items: center; gap: 5px; }
+#legend i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+#empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--dim); font-size: 15px; }
+.edge { fill: none; stroke: #243045; stroke-width: 1.4; }
+.edge.dep { stroke: #34406a; stroke-dasharray: 4 5; }
+.edge.on { stroke-width: 2.2; stroke-dasharray: 7 7; animation: flow .7s linear infinite; }
+.edge.on.claude { stroke: var(--claude); } .edge.on.dsh { stroke: var(--deepseek); } .edge.on.other { stroke: var(--running); }
+@keyframes flow { to { stroke-dashoffset: -14; } }
+.node { cursor: pointer; }
+.node rect.box { fill: #111a29; stroke: var(--idle); stroke-width: 1.5; transition: stroke .3s, fill .3s; }
+.node text { fill: var(--text); pointer-events: none; }
+.node .title { font-weight: 650; font-size: 13.5px; }
+.node .sub { fill: var(--dim); font-size: 10.5px; }
+.node .state { font-size: 11.5px; font-weight: 600; }
+.node .nums { fill: #9fb0c8; font-size: 10.5px; font-family: ui-monospace, Menlo, monospace; }
+.node.sel rect.box { stroke-width: 3; }
+.node.crit rect.box { filter: drop-shadow(0 0 4px #fde04755); }
+.node .critmark { fill: var(--critical); font-size: 10px; font-weight: 700; }
+.dot { pointer-events: none; }
+.lane { fill: var(--dim); font-size: 11px; }
+.bar { cursor: pointer; } .bar.crit { stroke: var(--critical); stroke-width: 1.3; }
+.axis { fill: var(--faint); font-size: 10px; font-family: ui-monospace, Menlo, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><b>orch</b> watch</div>
+  <span class="pill" id="run">run ?</span>
+  <span class="pill phase" id="phase">waiting</span>
+  <span class="stat">elapsed <b id="elapsed">00:00</b></span>
+  <span class="stat">calls <b id="calls">0</b></span>
+  <span class="stat">in flight <b id="inflight">0</b></span>
+  <span class="stat">out tokens <b id="tokens">0</b></span>
+  <span class="stat">ledger <b id="cny">-</b></span>
+  <span class="stat">est. <b id="usd">-</b></span>
+  <span class="grow"></span>
+  <span class="mode" id="mode">LIVE</span>
+  <span class="stat" id="conn"></span>
+</header>
+<main>
+  <section id="graphwrap">
+    <svg id="graph" viewBox="0 0 1600 760" preserveAspectRatio="xMidYMid meet">
+      <defs><filter id="glow" x="-2" y="-2" width="5" height="5"><feGaussianBlur stdDeviation="3.2" result="b"/>
+        <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+      <g id="edges"></g><g id="nodes"></g><g id="dots"></g>
+    </svg>
+    <div id="legend"></div>
+    <div id="empty">waiting for an orchestration run ...</div>
+  </section>
+  <aside><div id="detail"><h2>Select a node</h2><div class="sub">Click any node, bar or feed line for details.</div></div>
+    <div id="feed"></div></aside>
+</main>
+<footer>
+  <div id="controls">
+    <button id="play">Pause</button>
+    <select id="speed"></select>
+    <button id="restart">Restart</button>
+    <button id="golive">Live</button>
+    <input id="scrub" type="range" min="0" max="1000" value="1000">
+    <span id="clock">00:00</span>
+  </div>
+  <svg id="gantt" viewBox="0 0 1600 120" preserveAspectRatio="none"></svg>
+</footer>
+<script type="application/json" id="boot">/*ORCH_BOOT*/null</script>
+<script>
+'use strict';
+const BOOT = JSON.parse(document.getElementById('boot').textContent) || {mode: 'live'};
+const NS = document.getElementById('graph').namespaceURI;
+const $ = (id) => document.getElementById(id);
+const W = 1600, H = 760;
+const STATE = ['idle', 'planned', 'ready', 'running', 'verifying', 'merging', 'done', 'failed', 'parked', 'replanned'];
+const MSG = {request: '#38bdf8', result: '#34d399', retry: '#f472b6', error: '#f87171', context: '#facc15',
+  verify: '#a78bfa', testfail: '#fb7185', merge: '#f59e0b', done: '#34d399', dispatch: '#60a5fa', plan: '#c084fc'};
+const MSG_NAME = {request: 'request', result: 'result', retry: 'retry', context: 'NEED_FILES', testfail: 'test failure',
+  error: 'error', verify: 'verify / gate', merge: 'merge', dispatch: 'dispatch'};
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue('--' + name).trim();
+
+function svg(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function html(tag, cls, text, parent) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = String(text);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+const clockText = (s) => { s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return (h ? h + ':' : '') + String(m).padStart(2, '0') + ':' + String(x).padStart(2, '0'); };
+const dur = (s) => s < 60 ? s.toFixed(1) + 's' : s < 3600 ? Math.floor(s / 60) + 'm' + String(Math.floor(s % 60)).padStart(2, '0') + 's' : (s / 3600).toFixed(1) + 'h';
+const amount = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
+const yuan = (c) => c ? '¥' + (c / 100).toFixed(2) : '';
+const usd = (d) => d ? '$' + d.toFixed(2) : '';
+
+let M = null, offset = 0, nodeIds = '', geo = {}, edgeEls = {}, dots = [], ganttRefs = [], cursorEl = null;
+const S = {mode: BOOT.mode === 'live' ? 'live' : 'replay', speed: BOOT.speed || 8, playing: true, follow: true,
+  t: 0, cursor: 0, selected: null, selectedCall: null, lastFrame: performance.now(), slow: 0, feedKey: ''};
+
+function stateAt(hist, t) {
+  let cur = ['idle', null, ''];
+  for (const h of hist) { if (h[0] > t) break; cur = [h[1], h[0], h[2]]; }
+  return cur;
+}
+function phaseAt(t) { let p = 'planning'; for (const [at, name] of M.phases) if (at <= t) p = name; return p; }
+function liveCall(c, t) { return c.start <= t && (c.end === null || c.end > t); }
+
+// ---- layout -----------------------------------------------------------------------
+function columns() {
+  const nodes = M.nodes, tasks = nodes.filter(n => n.group === 'task');
+  const depth = Math.max(-1, ...tasks.map(n => n.depth));
+  const cols = [['cli'], ['orch'], ['planner', ...nodes.filter(n => n.group === 'design').map(n => n.id)]];
+  for (let d = 0; d <= depth; d++) cols.push(tasks.filter(n => n.depth === d).map(n => n.id));
+  cols.push(['guard', 'sandbox', 'merge']);
+  cols.push(['claude', 'deepseek', ...nodes.filter(n => n.group === 'provider' && n.id !== 'claude' && n.id !== 'deepseek').map(n => n.id)]);
+  return cols.filter(c => c.length);
+}
+function layout() {
+  const cols = columns(), n = cols.length, pos = {};
+  const w = Math.min(190, (W - 40) / n - 30), h = 62, margin = w / 2 + 14;
+  const step = (W - 2 * margin) / Math.max(1, n - 1);
+  const stack = (ids, x, align) => {
+    const gap = Math.min(86, (H - 60) / ids.length), total = gap * (ids.length - 1);
+    const top = align === 'top' ? 60 : align === 'bottom' ? H - 50 - total : H / 2 - total / 2;
+    ids.forEach((id, k) => { pos[id] = {x, y: top + k * gap, w, h, col: cols.indexOf(cols.find(c => c.includes(id)))}; });
+  };
+  cols.forEach((col, i) => {
+    const x = margin + i * step;
+    if (col[0] === 'cli' || col[0] === 'orch') stack(col, x, 'center');
+    else if (col[0] === 'planner') stack(col, x, 'top');
+    else if (col[0] === 'guard') { pos.guard = {x, y: 170, w, h, col: i}; pos.sandbox = {x, y: H - 170, w, h, col: i}; pos.merge = {x, y: H - 60, w, h, col: i}; }
+    else if (i === n - 1) col.forEach((id, k) => { pos[id] = {x, y: 60 + k * 110, w, h, col: i}; });
+    else stack(col, x, 'bottom');
+  });
+  return pos;
+}
+function edgePath(a, b) {
+  if (a.col === b.col) {
+    const x = a.x + a.w / 2, k = 70;
+    return `M${x},${a.y} C${x + k},${a.y} ${x + k},${b.y} ${x},${b.y}`;
+  }
+  const [p, q] = a.x < b.x ? [a, b] : [b, a];
+  const x1 = p.x + p.w / 2, x2 = q.x - q.w / 2, k = Math.max(40, (x2 - x1) * .5);
+  const d = `M${x1},${p.y} C${x1 + k},${p.y} ${x2 - k},${q.y} ${x2},${q.y}`;
+  return d;
+}
+
+function build() {
+  geo = layout();
+  const E = $('edges'), N = $('nodes');
+  E.textContent = ''; N.textContent = ''; $('dots').textContent = ''; edgeEls = {}; dots = [];
+  for (const e of M.edges) {
+    const a = geo[e.from], b = geo[e.to];
+    if (!a || !b) continue;
+    const p = svg('path', {d: edgePath(a, b), class: 'edge' + (e.kind === 'dep' ? ' dep' : '')}, E);
+    const flipped = a.col !== b.col && a.x > b.x;
+    edgeEls[e.from + '>' + e.to] = {el: p, len: p.getTotalLength(), flipped};
+  }
+  for (const n of M.nodes) {
+    const g = geo[n.id];
+    if (!g) continue;
+    const grp = svg('g', {class: 'node', transform: `translate(${g.x - g.w / 2},${g.y - g.h / 2})`}, N);
+    grp.addEventListener('click', () => select(n.id));
+    svg('rect', {class: 'box', width: g.w, height: g.h, rx: 10}, grp);
+    const dot = svg('circle', {cx: 13, cy: 15, r: 4.5}, grp);
+    const title = svg('text', {class: 'title', x: 24, y: 19}, grp); title.textContent = n.label;
+    const sub = svg('text', {class: 'sub', x: 10, y: 34}, grp); sub.textContent = n.sub.length > 30 ? n.sub.slice(0, 29) + '…' : n.sub;
+    const st = svg('text', {class: 'state', x: 10, y: 51}, grp);
+    const nums = svg('text', {class: 'nums', x: g.w - 9, y: 51, 'text-anchor': 'end'}, grp);
+    if (n.critical) { const c = svg('text', {class: 'critmark', x: g.w - 9, y: 18, 'text-anchor': 'end'}, grp); c.textContent = 'CRIT'; }
+    g.refs = {grp, dot, st, nums, node: n};
+  }
+  const legend = $('legend'); legend.textContent = '';
+  for (const k of ['request', 'result', 'retry', 'context', 'testfail', 'verify', 'merge']) {
+    const s = html('span', '', null, legend); const i = html('i', '', null, s); i.style.background = MSG[k]; html('b', '', MSG_NAME[k], s).style.fontWeight = 400;
+  }
+  buildGantt();
+}
+
+// ---- per-frame updates -------------------------------------------------------------
+function stats(t) {
+  const out = {};
+  for (const n of M.nodes) out[n.id] = {calls: 0, live: 0, output: 0, input: 0, cny: 0, usd: 0};
+  for (const c of M.calls) {
+    if (c.start > t) continue;
+    const done = c.end !== null && c.end <= t;
+    for (const id of [c.node, ...c.via]) {
+      const r = out[id]; if (!r) continue;
+      r.calls++; if (!done) { r.live++; continue; }
+      r.output += c.tokens.output || 0; r.input += c.tokens.input || 0; r.cny += c.cny_cents || 0; r.usd += c.usd || 0;
+    }
+  }
+  return out;
+}
+function paintNodes(t) {
+  const st = stats(t);
+  const active = {};
+  for (const c of M.calls) if (liveCall(c, t)) {
+    const hops = [c.node, ...c.via];
+    for (let i = 0; i + 1 < hops.length; i++) active[hops[i] + '>' + hops[i + 1]] = active[hops[i + 1] + '>' + hops[i]] = c.provider;
+  }
+  for (const key in edgeEls) {
+    const p = active[key];
+    edgeEls[key].el.setAttribute('class', 'edge' + (p ? ' on ' + (p === 'claude' ? 'claude' : p === 'dsh' ? 'dsh' : 'other') : (edgeEls[key].el.classList.contains('dep') ? ' dep' : '')));
+  }
+  for (const n of M.nodes) {
+    const g = geo[n.id]; if (!g || !g.refs) continue;
+    const [state, since, info] = stateAt(n.history, t);
+    const colour = css(STATE.includes(state) ? state : 'idle');
+    const box = g.refs.grp.firstChild;
+    box.style.stroke = colour; box.style.fill = state === 'running' || state === 'verifying' || state === 'merging' ? '#14223a' : '#111a29';
+    g.refs.dot.setAttribute('fill', colour);
+    g.refs.grp.setAttribute('class', 'node' + (S.selected === n.id ? ' sel' : '') + (n.critical ? ' crit' : ''));
+    const busy = ['running', 'verifying', 'merging'].includes(state);
+    const r = st[n.id];
+    const infra = ['guard', 'provider', 'sandbox', 'merge'].includes(n.group);
+    let txt = state + (busy && since !== null && !infra ? ' ' + dur(t - since) : '') + (infra && r.live > 1 ? ' ×' + r.live : '') + (n.group === 'task' && busy && info ? ' ' + info : '');
+    g.refs.st.textContent = txt; g.refs.st.style.fill = colour;
+    g.refs.nums.textContent = [r.output ? amount(r.output) + ' out' : '', yuan(r.cny) || usd(r.usd)].filter(Boolean).join(' · ');
+  }
+}
+function spawn(prev, t) {
+  if (t < prev) { for (const d of dots) d.el.remove(); dots = []; return; }
+  if (t - prev > 120 && S.mode === 'live') return;
+  let n = 0;
+  for (const m of M.messages) {
+    if (m.at <= prev || m.at > t) continue;
+    if (++n > 30 || dots.length > 60) break;
+    const segs = [];
+    for (let i = 0; i + 1 < m.path.length; i++) {
+      const a = m.path[i], b = m.path[i + 1];
+      const f = edgeEls[a + '>' + b], r = edgeEls[b + '>' + a];
+      if (f) segs.push({e: f, rev: f.flipped}); else if (r) segs.push({e: r, rev: !r.flipped});
+    }
+    if (!segs.length) continue;
+    const total = segs.reduce((s, x) => s + x.e.len, 0);
+    const el = svg('circle', {r: 5.5, class: 'dot', fill: MSG[m.kind] || '#fff', filter: 'url(#glow)'}, $('dots'));
+    dots.push({el, segs, total, born: performance.now(), life: Math.min(1600, 500 + total * 1.1)});
+  }
+}
+function moveDots() {
+  const now = performance.now();
+  dots = dots.filter(d => {
+    const p = (now - d.born) / d.life;
+    if (p >= 1) { d.el.remove(); return false; }
+    let dist = (1 - Math.pow(1 - p, 2)) * d.total;
+    for (const s of d.segs) {
+      if (dist <= s.e.len) {
+        const pt = s.e.el.getPointAtLength(s.rev ? s.e.len - dist : dist);
+        d.el.setAttribute('cx', pt.x); d.el.setAttribute('cy', pt.y);
+        d.el.setAttribute('opacity', p > .85 ? (1 - p) / .15 : 1);
+        break;
+      }
+      dist -= s.e.len;
+    }
+    return true;
+  });
+}
+
+// ---- gantt -------------------------------------------------------------------------
+const ORDER = {planner: 0, design: 1, task: 2, orch: 3, sandbox: 4};
+function lanes() {
+  const owners = new Set([...M.calls.map(c => c.node), ...M.intervals.map(i => i.node)]);
+  return M.nodes.filter(n => owners.has(n.id)).sort((a, b) => ((ORDER[a.group] ?? 9) - (ORDER[b.group] ?? 9)) || a.order - b.order);
+}
+function span() { const end = S.mode === 'live' ? Math.max(M.t1, S.t) : M.t1; return [M.t0, Math.max(1, end - M.t0)]; }
+function buildGantt() {
+  const G = $('gantt'); G.textContent = ''; ganttRefs = [];
+  const L = lanes(), rowH = 17, top = 30, height = top + L.length * rowH + 20;
+  G.setAttribute('viewBox', `0 0 ${W} ${height}`); G.style.height = Math.min(height, 260) + 'px';
+  svg('path', {id: 'spark', fill: '#38bdf833', stroke: '#38bdf8', 'stroke-width': 1}, G);
+  const sl = svg('text', {class: 'lane', x: 10, y: 20}, G); sl.textContent = 'parallel';
+  L.forEach((n, k) => {
+    const y = top + k * rowH;
+    svg('rect', {x: 0, y, width: W, height: rowH, fill: k % 2 ? '#0f1520' : 'transparent'}, G);
+    const t = svg('text', {class: 'lane', x: 10, y: y + 12.5}, G); t.textContent = n.label; if (n.critical) t.style.fill = css('critical');
+    for (const iv of M.intervals.filter(i => i.node === n.id)) ganttRefs.push({kind: 'iv', item: iv, el: svg('rect', {y: y + 12, height: 3, fill: iv.kind === 'merge' ? css('merging') : css('verifying'), rx: 1}, G)});
+    for (const c of M.calls.filter(c => c.node === n.id)) {
+      const el = svg('rect', {y: y + 3, height: 9, rx: 2, class: 'bar' + (c.critical ? ' crit' : ''),
+        fill: c.outcome !== 'ok' && c.end !== null ? css('failed') : c.provider === 'claude' ? css('claude') : c.provider === 'dsh' ? css('deepseek') : css('running')}, G);
+      el.addEventListener('click', (ev) => { ev.stopPropagation(); selectCall(c.id); });
+      ganttRefs.push({kind: 'call', item: c, el});
+    }
+  });
+  G.ganttTop = top; G.ganttRows = L.length; G.axisY = top + L.length * rowH + 13;
+  G.axis = svg('g', {}, G);
+  cursorEl = svg('line', {y1: 0, y2: height, stroke: css('critical'), 'stroke-width': 1.5}, G);
+  G.onclick = (ev) => { const r = G.getBoundingClientRect(), x = (ev.clientX - r.left) / r.width * W; const [t0, s] = span();
+    if (x > 120) { S.t = t0 + (x - 120) / (W - 130) * s; S.follow = false; S.cursor = S.t; } };
+}
+function paintGantt(t) {
+  const G = $('gantt'), [t0, s] = span(), X = (at) => 120 + (Math.min(Math.max(at, t0), t0 + s) - t0) / s * (W - 130);
+  for (const r of ganttRefs) {
+    const a = r.item.start, b = r.item.end === null || r.item.end > t ? t : r.item.end;
+    const show = a <= t;
+    r.el.setAttribute('x', X(a)); r.el.setAttribute('width', show ? Math.max(1.5, X(b) - X(a)) : 0);
+    if (r.kind === 'call') r.el.setAttribute('opacity', r.item.end === null || r.item.end > t ? .55 : 1);
+  }
+  cursorEl.setAttribute('x1', X(t)); cursorEl.setAttribute('x2', X(t));
+  const bins = 200, counts = new Array(bins).fill(0);
+  for (const c of M.calls) { if (c.start > t) continue; const e = c.end === null || c.end > t ? t : c.end;
+    for (let i = Math.floor((c.start - t0) / s * bins); i <= Math.min(bins - 1, Math.floor((e - t0) / s * bins)); i++) if (i >= 0) counts[i]++; }
+  const peak = Math.max(1, ...counts);
+  let d = `M120,24`;
+  counts.forEach((c, i) => { d += ` L${120 + i / bins * (W - 130)},${24 - c / peak * 16} L${120 + (i + 1) / bins * (W - 130)},${24 - c / peak * 16}`; });
+  $('spark').setAttribute('d', d + ` L${W - 10},24 Z`);
+  G.axis.textContent = '';
+  for (let k = 0; k <= 6; k++) { const at = t0 + s * k / 6; const tx = svg('text', {class: 'axis', x: X(at) - (k === 6 ? 34 : 0), y: G.axisY}, G.axis); tx.textContent = '+' + clockText(at - t0); }
+}
+
+// ---- side panel ----------------------------------------------------------------------
+function rows(table, pairs) { for (const [k, v] of pairs) { if (v === '' || v === null || v === undefined) continue; const tr = html('tr', '', null, table); html('td', '', k, tr); html('td', '', Array.isArray(v) ? v.join(', ') : v, tr); } }
+function select(id) { S.selected = id; S.selectedCall = null; detail(); }
+function selectCall(id) { S.selectedCall = id; const c = M.calls.find(c => c.id === id); if (c) S.selected = c.node; detail(); }
+function detail() {
+  const D = $('detail'); D.textContent = '';
+  if (!M) return;
+  const t = S.t;
+  if (S.selectedCall) {
+    const c = M.calls.find(c => c.id === S.selectedCall); if (!c) return;
+    html('h2', '', c.purpose + ' a' + c.attempt, D); html('div', 'sub', c.provider + '/' + c.model, D);
+    const live = liveCall(c, t), took = (live ? t : (c.end ?? t)) - c.start;
+    const tb = html('table', '', null, D);
+    rows(tb, [['task', c.task], ['sample', c.sample], ['effort', c.effort], ['outcome', live ? 'in flight' : c.outcome], ['duration', dur(took)],
+      ['input tokens', c.tokens.input], ['output tokens', c.tokens.output], ['cache read', c.tokens.cache_read], ['cache write', c.tokens.cache_write],
+      ['tok/s', live ? '' : c.tps], ['CNY ledger', yuan(c.cny_cents)], ['USD estimate', usd(c.usd)], ['request bytes', c.request_bytes],
+      ['critical path', c.critical ? 'yes' : ''], ['call id', c.id]]);
+    return;
+  }
+  const n = M.nodes.find(n => n.id === S.selected);
+  if (!n) { html('h2', '', 'Select a node', D); html('div', 'sub', 'Click any node, bar or feed line for details.', D); return; }
+  const [state, since, info] = stateAt(n.history, t), r = stats(t)[n.id];
+  html('h2', '', n.label, D); html('div', 'sub', n.sub, D);
+  const tb = html('table', '', null, D);
+  const m = n.meta || {};
+  rows(tb, [['state', state + (info ? ' (' + info + ')' : '')], ['since', since === null ? '' : '+' + clockText(since - M.t0)],
+    ['calls', r.calls + (r.live ? ' (' + r.live + ' in flight)' : '')], ['tokens', r.output || r.input ? 'in ' + amount(r.input) + ' / out ' + amount(r.output) : ''],
+    ['cost', [yuan(r.cny), usd(r.usd)].filter(Boolean).join(' ')], ['goal', m.goal], ['files', m.files], ['requirements', m.reqs],
+    ['depends on', m.depends_on], ['attempts', m.attempts], ['level', m.level], ['reason', m.reason], ['commit', m.commit],
+    ['critical path', n.critical ? 'yes' : '']]);
+  const calls = M.calls.filter(c => c.start <= t && (c.node === n.id || c.via.includes(n.id))).slice(-14);
+  if (calls.length) {
+    const box = html('div', 'calls', null, D);
+    for (const c of calls) {
+      const live = liveCall(c, t);
+      const line = html('div', '', `${c.purpose} a${c.attempt} · ${live ? 'in flight ' + dur(t - c.start) : c.outcome + ' ' + dur(c.end - c.start)}` +
+        (c.tokens.output && !live ? ' · out ' + amount(c.tokens.output) + ' tok' : '') + (c.tps && !live ? ' · ' + c.tps + ' tok/s' : ''), box);
+      line.style.borderLeft = '3px solid ' + (c.provider === 'claude' ? css('claude') : css('deepseek'));
+      line.addEventListener('click', () => selectCall(c.id));
+    }
+  }
+}
+function feed(t) {
+  const items = M.log.filter(e => e.at <= t);
+  const key = items.length + ':' + (items.length ? items[items.length - 1].at : 0);
+  if (key === S.feedKey) return; S.feedKey = key;
+  const F = $('feed'); F.textContent = '';
+  for (const e of items.slice(-80).reverse()) {
+    const d = html('div', '', null, F);
+    html('span', 'at', '+' + clockText(e.at - M.t0) + ' ', d);
+    html('span', 'k', e.kind + ' ', d);
+    html('span', '', (e.task ? e.task + ' ' : '') + (e.summary || ''), d);
+    d.addEventListener('click', () => e.call ? selectCall(e.call) : select(e.node));
+  }
+}
+function header(t) {
+  const p = phaseAt(t);
+  let calls = 0, live = 0, tok = 0, cny = 0, us = 0;
+  for (const c of M.calls) { if (c.start > t) continue; calls++; if (liveCall(c, t)) { live++; continue; } tok += c.tokens.output || 0; cny += c.cny_cents || 0; us += c.usd || 0; }
+  $('run').textContent = 'run ' + (M.run.id || '?'); $('phase').textContent = p;
+  $('phase').style.background = css({planning: 'verifying', planned: 'ready', running: 'running', 'final gate': 'verifying', done: 'done', parked: 'parked', paused: 'parked'}[p] || 'running');
+  $('elapsed').textContent = clockText(t - M.t0); $('calls').textContent = calls; $('inflight').textContent = live;
+  $('tokens').textContent = amount(tok); $('cny').textContent = yuan(cny) || '-'; $('usd').textContent = usd(us) || '-';
+  $('clock').textContent = '+' + clockText(t - M.t0);
+  const [t0, s] = span(); if (document.activeElement !== $('scrub')) $('scrub').value = Math.round((t - t0) / s * 1000);
+  $('mode').textContent = S.mode === 'live' ? (S.follow ? 'LIVE' : 'LIVE (paused)') : (BOOT.mode === 'export' ? 'OFFLINE REPLAY ' : 'REPLAY ') + S.speed + 'x';
+  $('mode').className = 'mode ' + (S.mode === 'live' && S.follow ? 'live' : 'replay');
+  $('play').textContent = (S.mode === 'live' ? S.follow : S.playing) ? 'Pause' : 'Play';
+  $('golive').style.display = S.mode === 'live' ? '' : 'none';
+  $('restart').style.display = S.mode === 'live' ? 'none' : '';
+}
+
+// ---- clock and loop --------------------------------------------------------------------
+function setModel(m) {
+  const first = !M;
+  M = m; offset = m.now - Date.now() / 1000;
+  $('empty').style.display = 'none';
+  const ids = M.nodes.map(n => n.id).join(',') + '|' + M.edges.length;
+  if (ids !== nodeIds) { nodeIds = ids; build(); } else buildGantt();
+  if (first) {
+    S.t = S.mode === 'live' ? Math.min(Date.now() / 1000 + offset, M.live ? Infinity : M.t1) : M.t0;
+    S.cursor = S.t;
+    if (!S.selected) S.selected = 'orch';
+  }
+  S.feedKey = ''; detail();
+}
+function frame(now) {
+  const dt = Math.min(0.25, (now - S.lastFrame) / 1000); S.lastFrame = now;
+  if (M) {
+    if (S.mode === 'live' && S.follow) { S.t = Date.now() / 1000 + offset; if (!M.live) S.t = Math.min(S.t, M.t1); }
+    else if (S.mode === 'replay' && S.playing) S.t = Math.min(M.t1, S.t + dt * S.speed);
+    spawn(S.cursor, S.t); S.cursor = S.t;
+    paintNodes(S.t); moveDots(); paintGantt(S.t);
+    if ((S.slow += dt) > .25) { S.slow = 0; header(S.t); feed(S.t); if (S.selected) detail(); }
+  }
+  requestAnimationFrame(frame);
+}
+for (const v of [1, 2, 4, 8, 16, 32, 64, 128]) { const o = html('option', '', v + 'x', $('speed')); o.value = v; if (v === S.speed) o.selected = true; }
+if (![...$('speed').options].some(o => +o.value === S.speed)) { const o = html('option', '', S.speed + 'x', $('speed')); o.value = S.speed; o.selected = true; }
+$('speed').onchange = () => { S.speed = +$('speed').value; };
+$('play').onclick = () => { if (S.mode === 'live') S.follow = !S.follow; else { if (M && S.t >= M.t1) S.t = M.t0; S.playing = !S.playing; } };
+$('restart').onclick = () => { if (M) { S.t = S.cursor = M.t0; S.playing = true; } };
+$('golive').onclick = () => { S.follow = true; };
+$('scrub').oninput = () => { if (!M) return; const [t0, s] = span(); S.t = t0 + $('scrub').value / 1000 * s; S.cursor = S.t; if (S.mode === 'live') S.follow = false; };
+document.addEventListener('keydown', (e) => { if (e.key === ' ') { e.preventDefault(); $('play').click(); } });
+
+if (BOOT.mode === 'export') { $('conn').textContent = 'offline'; setModel(BOOT.model); }
+else {
+  const q = BOOT.run ? '?run=' + encodeURIComponent(BOOT.run) : '';
+  const es = new EventSource('api/events' + q);
+  es.addEventListener('model', (e) => { $('conn').textContent = 'connected'; setModel(JSON.parse(e.data)); });
+  es.addEventListener('waiting', () => { $('conn').textContent = 'waiting for a run'; });
+  es.onerror = () => { $('conn').textContent = 'reconnecting ...'; };
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

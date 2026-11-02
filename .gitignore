@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.data/
+.build/
+.DS_Store
+*.xcuserstate
+xcuserdata/
+.env
+*.sqlite*
+artifacts/
+
+.tools/
+.package

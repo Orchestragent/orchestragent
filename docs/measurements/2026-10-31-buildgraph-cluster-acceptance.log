@@ -1,0 +1,31 @@
+test_r1_stable_layers_and_whole_graph_validation (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r1_stable_layers_and_whole_graph_validation) ... ok
+test_r2_single_flight_parallel_keys_invalidation_and_failure (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r2_single_flight_parallel_keys_invalidation_and_failure) ... ok
+test_r3_graph_snapshots_fingerprints_and_local_impact (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r3_graph_snapshots_fingerprints_and_local_impact) ... ok
+test_r4_result_store_atomicity_isolation_and_reopen (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r4_result_store_atomicity_isolation_and_reopen) ... ok
+test_r5_parallel_execution_and_resource_release (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r5_parallel_execution_and_resource_release) ... ok
+test_r6_target_closure_and_defensive_results (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r6_target_closure_and_defensive_results) ... ERROR
+test_r7_retries_failures_and_blocked_components (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r7_retries_failures_and_blocked_components) ... ok
+test_r8_restart_reuses_success_and_version_change_is_local (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r8_restart_reuses_success_and_version_change_is_local) ... ok
+
+======================================================================
+ERROR: test_r6_target_closure_and_defensive_results (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r6_target_closure_and_defensive_results)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/boltons-buildgraph-cluster-20261031/project/.git/orch/rfa9671b1/work/acceptance-54748e/_orch_bench_acceptance/test_acceptance.py", line 208, in test_r6_target_closure_and_defensive_results
+    result = runner.run(["join", "join"])
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/boltons-buildgraph-cluster-20261031/project/.git/orch/rfa9671b1/work/acceptance-54748e/boltons/buildrunutils.py", line 201, in run
+    tid, {d: keys[d] for d in deps[tid]})
+             ~~~~^^^
+KeyError: 'a'
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.007s
+
+FAILED (errors=1)
+
+issuer=controller
+mode=sandbox-exec
+revision=8269aea2b88ed0e96c1fe55346e67bc21c7ac5eb
+exit=1
+command=python -I -S -B -c <unittest bootstrap>

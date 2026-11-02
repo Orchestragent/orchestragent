@@ -1,0 +1,755 @@
+diff --git a/boltons/fileutils.py b/boltons/fileutils.py
+index 3557ae2..e0e2fe2 100644
+--- a/boltons/fileutils.py
++++ b/boltons/fileutils.py
+@@ -40,11 +40,12 @@ import sys
+ import stat
+ import errno
+ import fnmatch
++import json
+ from shutil import copy2, copystat, Error
+ 
+ 
+-__all__ = ['mkdir_p', 'atomic_save', 'AtomicSaver', 'FilePerms',
+-           'iter_find_files', 'copytree']
++__all__ = ['mkdir_p', 'atomic_save', 'atomic_save_json', 'AtomicSaver',
++           'FilePerms', 'iter_find_files', 'copytree']
+ 
+ 
+ FULL_PERMS = 0o777
+@@ -262,6 +263,34 @@ def atomic_save(dest_path, **kwargs):
+     return AtomicSaver(dest_path, **kwargs)
+ 
+ 
++def atomic_save_json(dest_path, value):
++    """Atomically write *value* to *dest_path* as a single UTF-8 JSON
++    document, built on :func:`atomic_save`.
++
++    The document is serialized with sorted keys, compact separators,
++    retained Unicode characters, and no NaN/Infinity values, followed
++    by exactly one trailing newline. *dest_path* may be a :class:`str`
++    or :class:`os.PathLike` (e.g., :class:`pathlib.Path`).
++
++    Serialization errors (:exc:`TypeError`, :exc:`ValueError`) are
++    raised before any file is touched. On any failure, an existing
++    destination is left byte-for-byte unchanged and the temporary
++    part file is removed.
++
++    >>> atomic_save_json('out.json', {'b': 1, 'a': 2})
++    >>> open('out.json', 'rb').read()
++    b'{"a":2,"b":1}\\n'
++
++    Returns ``None``.
++    """
++    data = json.dumps(value, sort_keys=True, separators=(',', ':'),
++                      ensure_ascii=False, allow_nan=False)
++    data = (data + '\n').encode('utf-8')
++    with atomic_save(os.fspath(dest_path)) as f:
++        f.write(data)
++    return
++
++
+ def path_to_unicode(path):
+     if isinstance(path, str):
+         return path
+diff --git a/boltons/jsonutils.py b/boltons/jsonutils.py
+index f9f9157..98a2413 100644
+--- a/boltons/jsonutils.py
++++ b/boltons/jsonutils.py
+@@ -45,7 +45,7 @@ import json
+ DEFAULT_BLOCKSIZE = 4096
+ 
+ 
+-__all__ = ['JSONLIterator', 'reverse_iter_lines']
++__all__ = ['JSONLIterator', 'JSONLCheckpointIterator', 'reverse_iter_lines']
+ 
+ 
+ def reverse_iter_lines(file_obj, blocksize=DEFAULT_BLOCKSIZE, preseek=True, encoding=None):
+@@ -234,6 +234,90 @@ class JSONLIterator:
+     __next__ = next
+ 
+ 
++class JSONLCheckpointIterator:
++    """The ``JSONLCheckpointIterator`` iterates over JSON Lines records of a
++    seekable binary stream, starting at an absolute byte offset, while
++    tracking exactly how far it has consumed.
++
++    Unlike :class:`JSONLIterator`, this iterator keeps a public
++    :attr:`byte_offset` marking the position just past the last consumed
++    complete line. That position can be persisted and passed back as
++    ``offset`` to resume reading an append-only file later, after more
++    lines have been written to it.
++
++    Args:
++        file_obj (file): A seekable binary file object. It is never closed
++            by the iterator.
++        offset (int): The exact byte offset to start reading from. Must be
++            an ``int`` between 0 and the stream length, inclusive.
++        ignore_errors (bool): When true, lines that fail UTF-8 decoding or
++            JSON parsing are skipped (advancing ``byte_offset`` past them).
++            When false, such a line raises :exc:`ValueError` and
++            ``byte_offset`` is left at the start of the bad line.
++    """
++    def __init__(self, file_obj, offset=0, ignore_errors=False):
++        if type(offset) is not int:
++            raise ValueError('offset expected an int, not %r' % (offset,))
++        file_obj.seek(0, os.SEEK_END)
++        length = file_obj.tell()
++        if offset < 0 or offset > length:
++            raise ValueError('offset expected between 0 and stream length (%d),'
++                             ' not %r' % (length, offset))
++        self._file_obj = file_obj
++        self.ignore_errors = bool(ignore_errors)
++        self._byte_offset = offset
++        file_obj.seek(offset, os.SEEK_SET)
++
++    @property
++    def byte_offset(self):
++        "The byte position after the last consumed complete line."
++        return self._byte_offset
++
++    def __iter__(self):
++        return self
++
++    def next(self):
++        """Returns the next decoded JSON value, or raises
++        :exc:`StopIteration` at the end of (or an incomplete tail of) the
++        stream. Raises :exc:`ValueError` on a malformed line.
++        """
++        fo = self._file_obj
++        while 1:
++            start = self._byte_offset
++            fo.seek(start, os.SEEK_SET)
++            line = fo.readline()
++            if not line.endswith(b'\n'):
++                # EOF or incomplete trailing line; never consume it
++                raise StopIteration
++            new_offset = start + len(line)
++            if not line.strip():
++                self._byte_offset = new_offset
++                continue
++            if line.endswith(b'\r\n'):
++                payload = line[:-2]
++            else:
++                payload = line[:-1]
++            try:
++                text = payload.decode('utf-8')
++                value = json.loads(text)
++            except UnicodeDecodeError as ude:
++                if not self.ignore_errors:
++                    raise ValueError('invalid UTF-8 at byte %s: %s'
++                                     % (start, ude))
++                self._byte_offset = new_offset
++                continue
++            except ValueError as ve:
++                if not self.ignore_errors:
++                    raise ValueError('invalid JSON at byte %s: %s'
++                                     % (start, ve))
++                self._byte_offset = new_offset
++                continue
++            self._byte_offset = new_offset
++            return value
++
++    __next__ = next
++
++
+ if __name__ == '__main__':
+     def _main():
+         import sys
+diff --git a/boltons/queueutils.py b/boltons/queueutils.py
+index 5ccb3ed..7ecc2d9 100644
+--- a/boltons/queueutils.py
++++ b/boltons/queueutils.py
+@@ -63,7 +63,7 @@ application use cases.
+ """
+ 
+ 
+-from heapq import heappush, heappop
++from heapq import heappush, heappop, heapify
+ from bisect import insort
+ import itertools
+ 
+@@ -184,6 +184,38 @@ class BasePriorityQueue:
+             raise IndexError('pop on empty queue')
+         return task
+ 
++    def peek_many(self, count=None):
++        """Return up to *count* active tasks in the order repeated
++        :meth:`pop` calls would return them, without mutating the queue
++        and without calling *priority_key* again. *count* of ``None``
++        means all active tasks; otherwise an exact nonnegative
++        :class:`int` is required, else :exc:`ValueError` is raised.
++        """
++        if count is not None and (type(count) is not int or count < 0):
++            raise ValueError('count must be None or a nonnegative int, not %r'
++                             % (count,))
++        active = [e for e in self._pq if e[2] is not _REMOVED]
++        active.sort(key=lambda e: (e[0], e[1]))
++        if count is not None:
++            active = active[:count]
++        return [e[2] for e in active]
++
++    def compact(self):
++        """Remove tombstoned entries from the backing store, returning
++        the number removed. Active ordering and the backend type are
++        preserved, and calling on a compacted queue is a no-op.
++        """
++        active = [e for e in self._pq if e[2] is not _REMOVED]
++        removed = len(self._pq) - len(active)
++        if not removed:
++            return 0
++        self._rebuild(active)
++        return removed
++
++    def _rebuild(self, active):
++        "Rebuild ``self._pq`` from the remaining *entry* objects."
++        self._pq = list(active)
++
+     def __len__(self):
+         "Return the number of tasks in the queue."
+         return len(self._entry_map)
+@@ -203,6 +235,11 @@ class HeapPriorityQueue(BasePriorityQueue):
+     def _push_entry(backend, entry):
+         heappush(backend, entry)
+ 
++    def _rebuild(self, active):
++        backend = list(active)
++        heapify(backend)
++        self._pq = backend
++
+ 
+ class SortedPriorityQueue(BasePriorityQueue):
+     """A priority queue inherited from :class:`BasePriorityQueue`, based
+@@ -219,5 +256,10 @@ class SortedPriorityQueue(BasePriorityQueue):
+     def _push_entry(backend, entry):
+         insort(backend, entry)
+ 
++    def _rebuild(self, active):
++        backend = self._backend_type()
++        backend.extend(sorted(active))
++        self._pq = backend
++
+ 
+ PriorityQueue = SortedPriorityQueue
+diff --git a/boltons/taskqueueutils.py b/boltons/taskqueueutils.py
+new file mode 100644
+index 0000000..5cdf3d1
+--- /dev/null
++++ b/boltons/taskqueueutils.py
+@@ -0,0 +1,55 @@
++"""Resumable, deduplicating work queue fed from append-only JSONL inputs
++and persisted as an atomic JSON checkpoint.
++
++Built on :mod:`boltons.queueutils`, :mod:`boltons.jsonutils` and
++:mod:`boltons.fileutils`. Experimental.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Any, BinaryIO
++
++__all__ = ['CheckpointQueue']
++
++SCHEMA_VERSION = 1
++
++
++class CheckpointQueue:
++    """Durable priority work queue with pending, in-flight and completed
++    task IDs plus per-source JSONL byte offsets.
++
++    Nothing is written to disk until :meth:`save` is called.
++    """
++
++    def __init__(self, path: str | os.PathLike[str]) -> None:
++        """Create an empty queue if *path* does not exist, otherwise load
++        its checkpoint. Raises ValueError for malformed/unsupported state."""
++        raise NotImplementedError
++
++    def enqueue(self, task_id: str, payload: Any,
++                priority: int | float = 0) -> bool:
++        """Validate and add a pending task. Returns False for a known ID."""
++        raise NotImplementedError
++
++    def peek(self, count: int | None = None) -> list[str]:
++        """Return pending task IDs in delivery order without consuming."""
++        raise NotImplementedError
++
++    def pop(self) -> dict[str, Any]:
++        """Move the next pending task to in-flight and return
++        ``{'id': ..., 'payload': ..., 'priority': ...}``."""
++        raise NotImplementedError
++
++    def ack(self, task_id: str) -> None:
++        """Mark an in-flight task completed; KeyError otherwise."""
++        raise NotImplementedError
++
++    def save(self) -> None:
++        """Atomically persist the full queue state to the checkpoint path."""
++        raise NotImplementedError
++
++    def ingest(self, file_obj: BinaryIO, source_id: str) -> int:
++        """Enqueue JSONL records from *file_obj* starting at the saved
++        offset for *source_id*; return the number newly enqueued."""
++        raise NotImplementedError
+diff --git a/test_orch_t_001.py b/test_orch_t_001.py
+new file mode 100644
+index 0000000..1d90bc8
+--- /dev/null
++++ b/test_orch_t_001.py
+@@ -0,0 +1,120 @@
++import unittest
++
++from boltons.queueutils import (BasePriorityQueue, HeapPriorityQueue,
++                                SortedPriorityQueue)
++
++
++class TestPeekManyCompact(unittest.TestCase):
++    def setUp(self):
++        self.backends = [HeapPriorityQueue, SortedPriorityQueue]
++        self.calls = []
++
++    def _key(self, prio):
++        self.calls.append(prio)
++        return -prio
++
++    def test_r1_peek_many_order_and_no_mutation(self):
++        for backend in self.backends:
++            with self.subTest(backend=backend.__name__):
++                q = backend()
++                for prio, tid in [(1, 'a'), (3, 'b'), (3, 'c'), (2, 'd'), (3, 'e')]:
++                    q.add(tid, prio)
++                expected = ['b', 'c', 'e', 'd', 'a']
++                self.assertEqual(q.peek_many(), expected)
++                self.assertEqual(q.peek_many(3), ['b', 'c', 'e'])
++                self.assertEqual(q.peek_many(0), [])
++                self.assertEqual(len(q), 5)
++                self.assertEqual(q.peek(), 'b')
++                self.assertEqual(q.pop(), 'b')
++                self.assertEqual(q.peek_many(), ['c', 'e', 'd', 'a'])
++
++    def test_r1_peek_many_matches_pop_and_skips_tombstones(self):
++        for backend in self.backends:
++            with self.subTest(backend=backend.__name__):
++                q = backend()
++                for prio, tid in [(5, 'x'), (1, 'y'), (4, 'z'), (3, 'w')]:
++                    q.add(tid, prio)
++                q.remove('x')
++                q.remove('w')
++                q.add('y', 9)
++                self.assertEqual(q.peek_many(), ['y', 'z'])
++                self.assertEqual(q.pop(), 'y')
++                self.assertEqual(q.pop(), 'z')
++                self.assertEqual(len(q), 0)
++
++    def test_r1_peek_many_no_priority_key_recall(self):
++        for backend in self.backends:
++            with self.subTest(backend=backend.__name__):
++                self.calls = []
++                q = backend(priority_key=self._key)
++                for prio, tid in [(1, 'a'), (2, 'b'), (3, 'c')]:
++                    q.add(tid, prio)
++                self.calls = []
++                self.assertEqual(q.peek_many(), ['c', 'b', 'a'])
++                self.assertEqual(self.calls, [])
++
++    def test_r1_peek_many_invalid_count(self):
++        for backend in self.backends:
++            for bad in [True, False, -1, -5, 1.0, '1', [], None.__class__]:
++                with self.subTest(backend=backend.__name__, bad=bad):
++                    q = backend()
++                    q.add('a', 1)
++                    with self.assertRaises(ValueError):
++                        q.peek_many(bad)
++                    self.assertEqual(len(q), 1)
++
++    def test_r1_compact_removes_tombstones_and_is_idempotent(self):
++        for backend in self.backends:
++            with self.subTest(backend=backend.__name__):
++                q = backend()
++                for prio, tid in [(2, 'a'), (1, 'b'), (3, 'c'), (2, 'd')]:
++                    q.add(tid, prio)
++                q.remove('a')
++                with self.assertRaises(KeyError):
++                    q.remove('nothere')
++                q.add('b', 4)
++                self.assertEqual(q.compact(), 2)
++                self.assertEqual(type(q), backend)
++                self.assertEqual(q.peek_many(), ['b', 'c', 'd'])
++                self.assertEqual(q.compact(), 0)
++                self.assertEqual(q.peek_many(), ['b', 'c', 'd'])
++                self.assertEqual(len(q), 3)
++                self.assertEqual([q.pop(), q.pop(), q.pop()], ['b', 'c', 'd'])
++
++    def test_r1_compact_preserves_add_after(self):
++        for backend in self.backends:
++            with self.subTest(backend=backend.__name__):
++                q = backend()
++                q.add('t1', 1)
++                q.add('t2', 2)
++                q.remove('t1')
++                q.compact()
++                q.add('t3', 1)
++                self.assertEqual(q.peek_many(), ['t2', 't3'])
++                self.assertEqual(q.pop(), 't2')
++                self.assertEqual(q.pop(), 't3')
++                self.assertEqual(len(q), 0)
++
++    def test_r1_compact_empty_and_legacy_semantics(self):
++        for backend in self.backends:
++            with self.subTest(backend=backend.__name__):
++                q = backend()
++                self.assertEqual(q.peek_many(), [])
++                self.assertEqual(q.compact(), 0)
++                q.add('a', 1)
++                q.add('b', 1)
++                self.assertEqual(q.peek(), 'a')
++                self.assertEqual(q.peek(), 'a')
++                self.assertEqual(q.pop(), 'a')
++                self.assertIsNone(q.remove('b'))
++                with self.assertRaises(KeyError):
++                    q.remove('b')
++                self.assertEqual(len(q), 0)
++
++    def test_r1_base_is_abstract(self):
++        q = BasePriorityQueue()
++        self.assertEqual(q.peek_many(), [])
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/test_orch_t_002.py b/test_orch_t_002.py
+new file mode 100644
+index 0000000..948b018
+--- /dev/null
++++ b/test_orch_t_002.py
+@@ -0,0 +1,108 @@
++import io
++import json
++import unittest
++
++from boltons.jsonutils import JSONLCheckpointIterator
++
++
++class TestJSONLCheckpointIterator(unittest.TestCase):
++    def setUp(self):
++        self.stream = io.BytesIO(
++            b'{"a": 1}\r\n\n  \n{"b": 2}\nnot json\n{"c": 3}\n{"partial": 4}'
++        )
++
++    def _collect(self, stream, offset=0, **kwargs):
++        it = JSONLCheckpointIterator(stream, offset=offset, **kwargs)
++        vals = []
++        for val in it:
++            vals.append(val)
++        return it, vals
++
++    def test_r2_yields_complete_records(self):
++        it = JSONLCheckpointIterator(self.stream)
++        vals = []
++        with self.assertRaises(ValueError):
++            for val in it:
++                vals.append(val)
++        self.assertEqual(vals, [{"a": 1}, {"b": 2}])
++        expected_offset = len(b'{"a": 1}\r\n\n  \n{"b": 2}\n')
++        self.assertEqual(it.byte_offset, expected_offset)
++
++    def test_r2_byte_offset_counts_blank_lines(self):
++        stream = io.BytesIO(b'\n\n  \n{"x": 0}\n')
++        it = JSONLCheckpointIterator(stream)
++        self.assertEqual(next(it), {"x": 0})
++        self.assertEqual(it.byte_offset, len(b'\n\n  \n{"x": 0}\n'))
++        self.assertIs(it.__iter__(), it)
++
++    def test_r2_incomplete_tail_not_consumed(self):
++        cases = [(b'{"a": 1}', None), (b'{"a": 1}\r', None)]
++        for data, _ in cases:
++            with self.subTest(data=data):
++                stream = io.BytesIO(data)
++                it, vals = self._collect(stream)
++                self.assertEqual(vals, [])
++                self.assertEqual(it.byte_offset, 0)
++            with self.subTest(data=data, appended=True):
++                stream = io.BytesIO(b'{"a": 1}\n{"b": 2}\n')
++                it = JSONLCheckpointIterator(stream)
++                self.assertEqual(next(it), {"a": 1})
++                self.assertEqual(it.byte_offset, 9)
++                it2 = JSONLCheckpointIterator(stream, offset=it.byte_offset)
++                self.assertEqual(next(it2), {"b": 2})
++
++    def test_r2_incomplete_tail_resumes(self):
++        stream = io.BytesIO(b'{"a": 1}\n{"b":')
++        it = JSONLCheckpointIterator(stream)
++        self.assertEqual(next(it), {"a": 1})
++        start = it.byte_offset
++        self.assertEqual(start, 9)
++        self.assertRaises(StopIteration, next, it)
++        self.assertEqual(it.byte_offset, start)
++        stream.seek(0, io.SEEK_END)
++        stream.write(b' 2}\n')
++        it2 = JSONLCheckpointIterator(stream, offset=start)
++        self.assertEqual(next(it2), {"b": 2})
++
++    def test_r2_malformed_raises_without_advancing(self):
++        bad_lines = [b'not json\n', b'{"a": 1,\n', b'\xff\xfe\n', b'"unterminated\n']
++        for bad in bad_lines:
++            with self.subTest(bad=bad):
++                stream = io.BytesIO(b'{"ok": 1}\n' + bad + b'{"z": 1}\n')
++                it = JSONLCheckpointIterator(stream)
++                self.assertEqual(next(it), {"ok": 1})
++                pos = it.byte_offset
++                self.assertEqual(pos, len(b'{"ok": 1}\n'))
++                self.assertRaises(ValueError, next, it)
++                self.assertEqual(it.byte_offset, pos)
++
++    def test_r2_ignore_errors_skips_and_advances(self):
++        stream = io.BytesIO(b'{"ok": 1}\nbogus\n\xff\n{"z": 2}\n')
++        it, vals = self._collect(stream, ignore_errors=True)
++        self.assertEqual(vals, [{"ok": 1}, {"z": 2}])
++        self.assertEqual(it.byte_offset, len(stream.getvalue()))
++
++    def test_r2_offset_validation(self):
++        stream = io.BytesIO(b'{"a": 1}\n')
++        length = len(stream.getvalue())
++        for bad in (-1, length + 1, 1.0, True, False, "0", None):
++            with self.subTest(offset=bad):
++                self.assertRaises(ValueError, JSONLCheckpointIterator, stream, bad)
++        it = JSONLCheckpointIterator(stream, length)
++        self.assertEqual(it.byte_offset, length)
++        self.assertEqual(list(it), [])
++
++    def test_r2_construction_seeks_exactly(self):
++        stream = io.BytesIO(b'{"a": 1}\n{"b": 2}\n')
++        it = JSONLCheckpointIterator(stream, offset=9)
++        self.assertEqual(it.byte_offset, 9)
++        self.assertEqual(next(it), {"b": 2})
++        self.assertFalse(stream.closed)
++
++    def test_r2_stream_remains_open(self):
++        stream = io.BytesIO(b'{"a": 1}\n')
++        it = JSONLCheckpointIterator(stream)
++        self.assertEqual(next(it), {"a": 1})
++        self.assertRaises(StopIteration, next, it)
++        self.assertFalse(stream.closed)
++        self.assertEqual(json.loads(stream.getvalue().decode("utf-8")), {"a": 1})
+diff --git a/test_orch_t_003.py b/test_orch_t_003.py
+new file mode 100644
+index 0000000..3d3548e
+--- /dev/null
++++ b/test_orch_t_003.py
+@@ -0,0 +1,90 @@
++import json
++import os
++import pathlib
++import tempfile
++import unittest
++from unittest import mock
++
++from boltons import fileutils
++
++
++class AtomicSaveJsonTest(unittest.TestCase):
++    def setUp(self):
++        self._td = tempfile.TemporaryDirectory()
++        self.dir = self._td.name
++        self.dest = os.path.join(self.dir, 'out.json')
++
++    def tearDown(self):
++        self._td.cleanup()
++
++    def part_files(self):
++        return sorted(n for n in os.listdir(self.dir) if n.endswith('.part'))
++
++    def write_existing(self):
++        with open(self.dest, 'wb') as f:
++            f.write(b'ORIGINAL-PAYLOAD')
++
++    def test_r3_formats_and_returns_none(self):
++        cases = [
++            ({'b': 1, 'a': [2, 3]}, b'{"a":[2,3],"b":1}\n'),
++            ({'u': 'caf\u00e9', 'z': None}, '{"u":"caf\u00e9","z":null}\n'.encode('utf-8')),
++            ({"k": "\u2603"}, '{"k":"\u2603"}\n'.encode('utf-8')),
++            ({'n': 1.5, 'i': 7, 't': True}, b'{"i":7,"n":1.5,"t":true}\n'),
++            ([], b'[]\n'),
++            ({}, b'{}\n'),
++        ]
++        for value, expected in cases:
++            with self.subTest(value=value):
++                if os.path.exists(self.dest):
++                    os.remove(self.dest)
++                self.assertIsNone(fileutils.atomic_save_json(self.dest, value))
++                with open(self.dest, 'rb') as f:
++                    self.assertEqual(f.read(), expected)
++                self.assertEqual(self.part_files(), [])
++                with open(self.dest, 'rb') as f:
++                    self.assertEqual(json.loads(f.read().decode('utf-8')), value)
++
++    def test_r3_overwrites_existing_str_and_path(self):
++        for dest_factory in (lambda p: p, pathlib.Path):
++            with self.subTest(dest=dest_factory):
++                self.write_existing()
++                dest = dest_factory(self.dest)
++                self.assertIsNone(fileutils.atomic_save_json(dest, {'x': 1}))
++                with open(self.dest, 'rb') as f:
++                    self.assertEqual(f.read(), b'{"x":1}\n')
++                self.assertEqual(self.part_files(), [])
++
++    def test_r3_serialization_failures_leave_destination(self):
++        cases = [
++            ({'bad': float('nan')}, ValueError),
++            ({'bad': float('inf')}, ValueError),
++            ({'bad': object()}, TypeError),
++            ({'bad': {1, 2}}, TypeError),
++            (b'bytes', TypeError),
++            ({'bad': {'nested': float('-inf')}}, ValueError),
++        ]
++        for value, exc_type in cases:
++            with self.subTest(value_type=type(value).__name__, exc=exc_type):
++                self.write_existing()
++                with self.assertRaises(exc_type):
++                    fileutils.atomic_save_json(self.dest, value)
++                with open(self.dest, 'rb') as f:
++                    self.assertEqual(f.read(), b'ORIGINAL-PAYLOAD')
++                self.assertEqual(self.part_files(), [])
++
++    def test_r3_nonserializable_no_destination_created(self):
++        value = {'bad': object()}
++        with self.assertRaises(TypeError):
++            fileutils.atomic_save_json(self.dest, value)
++        self.assertFalse(os.path.exists(self.dest))
++        self.assertEqual(self.part_files(), [])
++
++    def test_r3_write_failure_protects_destination(self):
++        self.write_existing()
++        with mock.patch.object(fileutils.AtomicSaver, '_open_part_file',
++                               side_effect=OSError('boom')):
++            with self.assertRaises(OSError):
++                fileutils.atomic_save_json(self.dest, {'a': 1})
++        with open(self.dest, 'rb') as f:
++            self.assertEqual(f.read(), b'ORIGINAL-PAYLOAD')
++        self.assertEqual(self.part_files(), [])
+diff --git a/test_orch_t_004.py b/test_orch_t_004.py
+new file mode 100644
+index 0000000..850e81a
+--- /dev/null
++++ b/test_orch_t_004.py
+@@ -0,0 +1,119 @@
++import io
++import json
++import os
++import tempfile
++import unittest
++
++from boltons.taskqueueutils import CheckpointQueue
++
++
++class TestCheckpointQueue(unittest.TestCase):
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self._tmp.cleanup)
++        self.path = os.path.join(self._tmp.name, 'checkpoint.json')
++
++    def test_r4_construction_and_validation(self):
++        q = CheckpointQueue(self.path)
++        self.assertFalse(os.path.exists(self.path))
++        self.assertEqual(q.peek(), [])
++        with self.assertRaises(IndexError):
++            q.pop()
++        bad = [
++            ('', {}, 0), (None, {}, 0), (5, {}, 0),
++            ('a', {1, 2}, 0), ('a', float('nan'), 0),
++            ('a', {}, True), ('a', {}, '1'), ('a', {}, None),
++            ('a', {}, float('inf')),
++        ]
++        for tid, payload, prio in bad:
++            with self.subTest(tid=tid, prio=prio):
++                with self.assertRaises(ValueError):
++                    q.enqueue(tid, payload, prio)
++        self.assertFalse(os.path.exists(self.path))
++
++    def test_r4_enqueue_peek_pop_ack(self):
++        q = CheckpointQueue(self.path)
++        self.assertIs(q.enqueue('a', {'x': 1}), True)
++        self.assertIs(q.enqueue('b', [1], 0), True)
++        self.assertIs(q.enqueue('c', 'p', 5), True)
++        self.assertIs(q.enqueue('a', {'x': 2}, 9), False)
++        self.assertEqual(q.peek(), ['c', 'a', 'b'])
++        self.assertEqual(q.peek(1), ['c'])
++        self.assertEqual(q.peek(0), [])
++        for bad in (-1, True, 1.0, '1'):
++            with self.subTest(count=bad):
++                with self.assertRaises(ValueError):
++                    q.peek(bad)
++        self.assertEqual(q.peek(), ['c', 'a', 'b'])
++        task = q.pop()
++        self.assertEqual(task, {'id': 'c', 'payload': 'p', 'priority': 5})
++        self.assertEqual(set(task), {'id', 'payload', 'priority'})
++        with self.assertRaises(KeyError):
++            q.ack('a')
++        with self.assertRaises(KeyError):
++            q.ack('nope')
++        q.ack('c')
++        self.assertEqual(q.peek(), ['a', 'b'])
++
++    def test_r4_save_restart_recovers_inflight(self):
++        q = CheckpointQueue(self.path)
++        for tid, prio in (('1', 2), ('2', 2), ('3', 2), ('4', 7)):
++            q.enqueue(tid, {'n': tid}, prio)
++        self.assertFalse(os.path.exists(self.path))
++        q.pop()  # '4' in flight
++        q.pop()  # '1' in flight
++        q.ack('1')
++        q.save()
++        self.assertTrue(os.path.exists(self.path))
++        with open(self.path, 'rb') as f:
++            state = json.loads(f.read().decode('utf-8'))
++        self.assertEqual(state['schema_version'], 1)
++        q2 = CheckpointQueue(self.path)
++        # inflight '4' (seq 3) recovers before pending '2','3' on tie
++        self.assertEqual(q2.peek(), ['4', '2', '3'])
++        self.assertFalse(q2.enqueue('1', {}))
++        self.assertFalse(q2.enqueue('2', {}))
++        self.assertTrue(q2.enqueue('1x', {}))
++
++    def test_r4_bad_state_raises_valueerror(self):
++        cases = [b'not json', b'[]', b'{"schema_version":2}', b'{"schema_version":true}']
++        for blob in cases:
++            with self.subTest(blob=blob):
++                with open(self.path, 'wb') as f:
++                    f.write(blob)
++                with self.assertRaises(ValueError):
++                    CheckpointQueue(self.path)
++                with open(self.path, 'rb') as f:
++                    self.assertEqual(f.read(), blob)
++
++    def test_r4_ingest_offsets_and_retry(self):
++        q = CheckpointQueue(self.path)
++        data = (b'{"id":"x","payload":1,"priority":0}\n'
++                b'\n'
++                b'{"id":"x","payload":2,"priority":0}\n'
++                b'{"id":"y","payload":3,"priority":1}\n')
++        stream = io.BytesIO(data)
++        self.assertEqual(q.ingest(stream, 'src'), 2)
++        self.assertFalse(stream.closed)
++        self.assertEqual(q.peek(), ['y', 'x'])
++        self.assertEqual(q.ingest(stream, 'src'), 0)
++        other = io.BytesIO(data.replace(b'"x"', b'"p"').replace(b'"y"', b'"q"'))
++        self.assertEqual(q.ingest(other, 'other'), 2)
++        for bad_src in ('', None, 3):
++            with self.subTest(src=bad_src):
++                with self.assertRaises(ValueError):
++                    q.ingest(stream, bad_src)
++        q.save()
++        q2 = CheckpointQueue(self.path)
++        self.assertEqual(q2.ingest(stream, 'src'), 0)
++        more = b'{"id":"ok","payload":4,"priority":0}\n'
++        more += b'{"id":"bad","payload":4}\n'
++        stream2 = io.BytesIO(data + more)
++        with self.assertRaises(ValueError):
++            q2.ingest(stream2, 'src')
++        self.assertIn('ok', q2.peek())
++        self.assertNotIn('bad', q2.peek())
++
++
++if __name__ == '__main__':
++    unittest.main()

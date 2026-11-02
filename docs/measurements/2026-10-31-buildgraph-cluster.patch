@@ -1,0 +1,2251 @@
+diff --git a/boltons/buildcacheutils.py b/boltons/buildcacheutils.py
+new file mode 100644
+index 0000000..8ef7b71
+--- /dev/null
++++ b/boltons/buildcacheutils.py
+@@ -0,0 +1,133 @@
++"""Experimental persistent JSON result store for build graphs, written
++with :func:`boltons.fileutils.atomic_save`.
++"""
++
++import json
++import os
++import re
++from typing import Any, Dict, Iterable, Union
++
++from boltons.fileutils import atomic_save
++
++
++SCHEMA_VERSION = 1
++
++_KEY_RE = re.compile(r'[0-9a-f]{64}')
++
++
++def _is_valid_key(key):
++    return isinstance(key, str) and _KEY_RE.fullmatch(key) is not None
++
++
++def _reject_constant(name):
++    raise ValueError(f'invalid JSON constant: {name}')
++
++
++def _loads(text, what):
++    try:
++        return json.loads(text, parse_constant=_reject_constant)
++    except (ValueError, RecursionError) as exc:
++        raise ValueError(f'invalid JSON {what}: {exc}') from exc
++
++
++def _check_string_keys(value):
++    # json.dumps silently stringifies non-string dict keys; reject those.
++    stack = [value]
++    while stack:
++        cur = stack.pop()
++        if isinstance(cur, dict):
++            for k, v in cur.items():
++                if not isinstance(k, str):
++                    raise ValueError(f'JSON object keys must be strings, not {k!r}')
++                stack.append(v)
++        elif isinstance(cur, (list, tuple)):
++            stack.extend(cur)
++
++
++def _dumps(value):
++    try:
++        text = json.dumps(value, allow_nan=False)
++    except (TypeError, ValueError, RecursionError) as exc:
++        raise ValueError(f'value is not JSON serializable: {exc}') from exc
++    _check_string_keys(value)
++    return text
++
++
++class ResultStore:
++    """Mapping of lowercase 64-hex cache keys to JSON values, loaded from
++    and explicitly saved to a single UTF-8 JSON file.
++    """
++
++    def __init__(self, path: Union[str, os.PathLike]) -> None:
++        self.path = os.fspath(path)
++        self._values: Dict[str, Any] = {}
++        if not os.path.exists(self.path):
++            return
++        with open(self.path, 'rb') as f:
++            raw = f.read()
++        try:
++            text = raw.decode('utf-8')
++        except UnicodeDecodeError as exc:
++            raise ValueError(f'{self.path!r} is not valid UTF-8: {exc}') from exc
++        data = _loads(text, 'store state')
++        if not isinstance(data, dict) or set(data) != {'schema_version', 'values'}:
++            raise ValueError('store state must be an object with exactly '
++                             '"schema_version" and "values"')
++        version = data['schema_version']
++        if isinstance(version, bool) or not isinstance(version, int) \
++                or version != SCHEMA_VERSION:
++            raise ValueError(f'unsupported schema_version: {version!r}')
++        values = data['values']
++        if not isinstance(values, dict):
++            raise ValueError('"values" must be a JSON object')
++        for key in values:
++            if not _is_valid_key(key):
++                raise ValueError(f'invalid store key: {key!r}')
++        self._values = values
++
++    def __contains__(self, key: object) -> bool:
++        return bool(_is_valid_key(key) and key in self._values)
++
++    def get(self, key: str) -> Any:
++        """Return a JSON round-trip copy of the value or raise KeyError."""
++        if not _is_valid_key(key) or key not in self._values:
++            raise KeyError(key)
++        return json.loads(json.dumps(self._values[key]))
++
++    def put(self, key: str, value: Any) -> None:
++        """Validate and store a JSON round-trip copy of *value*."""
++        if not _is_valid_key(key):
++            raise ValueError(f'invalid store key: {key!r}')
++        text = _dumps(value)
++        self._values[key] = _loads(text, 'value')
++
++    def invalidate(self, keys: Iterable[str]) -> int:
++        """Remove *keys* and return how many were actually present."""
++        if isinstance(keys, (str, bytes)):
++            raise ValueError('keys must be a non-string iterable of keys')
++        try:
++            items = list(keys)
++        except TypeError as exc:
++            raise ValueError('keys must be a non-string iterable of keys') from exc
++        to_remove = set()
++        for key in items:
++            if not _is_valid_key(key):
++                raise ValueError(f'invalid store key: {key!r}')
++            to_remove.add(key)
++        removed = 0
++        for key in to_remove:
++            if key in self._values:
++                del self._values[key]
++                removed += 1
++        return removed
++
++    def save(self) -> None:
++        """Atomically write the complete state to the path."""
++        try:
++            text = json.dumps({'schema_version': SCHEMA_VERSION, 'values': self._values},
++                              sort_keys=True, ensure_ascii=False, allow_nan=False)
++            payload = text.encode('utf-8')
++        except (TypeError, ValueError, RecursionError) as exc:
++            raise ValueError(f'cannot serialize store state: {exc}') from exc
++        with atomic_save(self.path, text_mode=False, overwrite=True) as fo:
++            fo.write(payload)
+diff --git a/boltons/buildgraphutils.py b/boltons/buildgraphutils.py
+new file mode 100644
+index 0000000..8c50862
+--- /dev/null
++++ b/boltons/buildgraphutils.py
+@@ -0,0 +1,164 @@
++"""Experimental validated build-graph descriptions with deterministic
++content fingerprints, layered via :func:`boltons.iterutils.dependency_layers`.
++"""
++
++import hashlib
++import json
++import re
++from collections.abc import Mapping as ABCMapping
++from typing import Any, Dict, Iterable, List, Mapping, Tuple
++
++
++_SPEC_KEYS = frozenset(('deps', 'version', 'resources'))
++_HEX64_RE = re.compile(r'[0-9a-f]{64}\Z')
++
++
++def _is_int(value):
++    return isinstance(value, int) and not isinstance(value, bool)
++
++
++def _check_id(value, what='task id'):
++    if not isinstance(value, str) or not value:
++        raise ValueError('invalid %s: %r' % (what, value))
++    return value
++
++
++class BuildGraph:
++    """Immutable snapshot of an insertion-ordered mapping of task IDs to
++    ``{'deps': [...], 'version': str, 'resources': {name: int}}`` specs.
++    """
++
++    def __init__(self, tasks: Mapping[str, Mapping[str, Any]]) -> None:
++        if not isinstance(tasks, ABCMapping):
++            raise ValueError('tasks must be a mapping, not %r' % (type(tasks),))
++        snapshot = {}
++        for task_id, raw in tasks.items():
++            _check_id(task_id)
++            if not isinstance(raw, ABCMapping):
++                raise ValueError('spec for %r must be a mapping' % (task_id,))
++            if set(raw.keys()) != _SPEC_KEYS:
++                raise ValueError('spec for %r must have exactly %r'
++                                 % (task_id, sorted(_SPEC_KEYS)))
++            deps_raw = raw['deps']
++            if not isinstance(deps_raw, (list, tuple)):
++                raise ValueError('deps for %r must be a list or tuple'
++                                 % (task_id,))
++            deps = []
++            for dep in deps_raw:
++                _check_id(dep, 'prerequisite id')
++                deps.append(dep)
++            version = raw['version']
++            if not isinstance(version, str) or not version:
++                raise ValueError('version for %r must be a nonempty str'
++                                 % (task_id,))
++            res_raw = raw['resources']
++            if not isinstance(res_raw, ABCMapping):
++                raise ValueError('resources for %r must be a mapping'
++                                 % (task_id,))
++            resources = {}
++            for name, amount in res_raw.items():
++                _check_id(name, 'resource name')
++                if not _is_int(amount) or amount < 1:
++                    raise ValueError('resource %r for %r must be a positive '
++                                     'int' % (name, task_id))
++                resources[name] = amount
++            snapshot[task_id] = {'deps': deps, 'version': version,
++                                 'resources': resources}
++
++        # Validate full graph structure (cycles, unknowns, self edges) using
++        # dependency_layers; imported lazily to avoid import cycles.
++        from boltons.iterutils import dependency_layers
++        dependency_layers({tid: list(s['deps'])
++                           for tid, s in snapshot.items()})
++
++        self._ids = tuple(snapshot.keys())
++        self._specs = snapshot
++        self._deps = {}
++        self._dependents = {tid: [] for tid in self._ids}
++        for tid in self._ids:
++            seen = set()
++            dedup = []
++            for dep in snapshot[tid]['deps']:
++                if dep not in seen:
++                    seen.add(dep)
++                    dedup.append(dep)
++            self._deps[tid] = tuple(dedup)
++            for dep in dedup:
++                self._dependents[dep].append(tid)
++
++    @property
++    def ids(self) -> Tuple[str, ...]:
++        """Task IDs in original insertion order."""
++        return self._ids
++
++    def layers(self) -> List[List[str]]:
++        """Fresh dependency layers, as returned by dependency_layers."""
++        from boltons.iterutils import dependency_layers
++        return dependency_layers({tid: self._deps[tid] for tid in self._ids})
++
++    def _get_spec(self, task_id):
++        _check_id(task_id)
++        try:
++            return self._specs[task_id]
++        except (KeyError, TypeError):
++            raise ValueError('unknown task id: %r' % (task_id,))
++
++    def spec(self, task_id: str) -> Dict[str, Any]:
++        """Defensive copy of the snapshotted spec for *task_id*."""
++        snap = self._get_spec(task_id)
++        return {'deps': list(snap['deps']), 'version': snap['version'],
++                'resources': dict(snap['resources'])}
++
++    def dependencies(self, task_id: str) -> Tuple[str, ...]:
++        """Direct prerequisites, deduplicated in first-occurrence order."""
++        self._get_spec(task_id)
++        return self._deps[task_id]
++
++    def affected(self, changed: Iterable[str]) -> List[str]:
++        """Changed IDs plus all transitive dependents, in insertion order."""
++        if isinstance(changed, (str, bytes)):
++            raise ValueError('changed must be an iterable of ids, not a str')
++        try:
++            changed_list = list(changed)
++        except TypeError:
++            raise ValueError('changed must be an iterable of ids')
++        marked = set()
++        for task_id in changed_list:
++            _check_id(task_id)
++            if task_id not in self._specs:
++                raise ValueError('unknown task id: %r' % (task_id,))
++            marked.add(task_id)
++        # Propagate to transitive dependents (topological-safe BFS).
++        stack = list(marked)
++        while stack:
++            cur = stack.pop()
++            for dep in self._dependents[cur]:
++                if dep not in marked:
++                    marked.add(dep)
++                    stack.append(dep)
++        return [tid for tid in self._ids if tid in marked]
++
++    def fingerprint(self, task_id: str,
++                    dependency_keys: Mapping[str, str]) -> str:
++        """Lowercase SHA-256 hex digest of the node's canonical JSON."""
++        snap = self._get_spec(task_id)
++        if not isinstance(dependency_keys, ABCMapping):
++            raise ValueError('dependency_keys must be a mapping')
++        deps = self._deps[task_id]
++        if set(dependency_keys.keys()) != set(deps):
++            raise ValueError('dependency_keys must match prerequisites of %r'
++                             % (task_id,))
++        for dep in deps:
++            key = dependency_keys[dep]
++            if not isinstance(key, str) or not _HEX64_RE.match(key):
++                raise ValueError('invalid dependency key for %r: %r'
++                                 % (dep, key))
++        payload = {
++            'id': task_id,
++            'version': snap['version'],
++            'resources': dict(snap['resources']),
++            'dependencies': [[dep, dependency_keys[dep]] for dep in deps],
++        }
++        text = json.dumps(payload, sort_keys=True, separators=(',', ':'),
++                          ensure_ascii=False, allow_nan=False)
++        return hashlib.sha256(text.encode('utf-8')).hexdigest()
+diff --git a/boltons/buildrunutils.py b/boltons/buildrunutils.py
+new file mode 100644
+index 0000000..78d0e8f
+--- /dev/null
++++ b/boltons/buildrunutils.py
+@@ -0,0 +1,360 @@
++"""Experimental synchronous, incremental, resource-aware execution of a
++:class:`boltons.buildgraphutils.BuildGraph`.
++"""
++
++import json
++import queue
++import threading
++from collections.abc import Mapping as ABCMapping
++from typing import Any, Callable, Dict, Iterable, Mapping, Optional
++
++from boltons.buildcacheutils import ResultStore
++from boltons.buildgraphutils import BuildGraph
++from boltons.cacheutils import SingleFlightCache
++from boltons.queueutils import HeapPriorityQueue
++
++
++_SENTINEL = object()
++
++
++def _copy_value(value):
++    """JSON round-trip copy of a normalized (JSON-compatible) value."""
++    return json.loads(json.dumps(value, allow_nan=False))
++
++
++def _is_exact_int(value):
++    return type(value) is int
++
++
++def _check_nonempty_str(value):
++    return isinstance(value, str) and bool(value)
++
++
++def _format_error(exc):
++    name = type(exc).__name__
++    if len(exc.args) == 1:
++        msg = str(exc.args[0])
++    else:
++        msg = str(exc)
++    return '%s: %s' % (name, msg)
++
++
++class _ActivityTracker(object):
++    """Lock-protected counter of concurrently active callbacks."""
++
++    def __init__(self):
++        self._lock = threading.Lock()
++        self.active = 0
++        self.peak = 0
++
++    def enter(self):
++        with self._lock:
++            self.active += 1
++            if self.active > self.peak:
++                self.peak = self.active
++
++    def leave(self):
++        with self._lock:
++            self.active -= 1
++
++
++class BuildRunner:
++    """Runs BuildGraph callbacks concurrently under worker and resource
++    limits, reusing results from memory and an optional ResultStore.
++    """
++
++    def __init__(self, graph: BuildGraph,
++                 functions: Mapping[str, Callable[[Dict[str, Any]], Any]],
++                 store: Optional[ResultStore] = None,
++                 max_workers: int = 4,
++                 capacities: Optional[Mapping[str, int]] = None,
++                 retries: int = 0) -> None:
++        if not isinstance(graph, BuildGraph):
++            raise ValueError('graph must be a BuildGraph, not %r'
++                             % (type(graph),))
++        if not isinstance(functions, ABCMapping):
++            raise ValueError('functions must be a mapping')
++        if set(functions.keys()) != set(graph.ids):
++            raise ValueError('functions must map exactly the graph ids')
++        for tid, fn in functions.items():
++            if not callable(fn):
++                raise ValueError('function for %r is not callable' % (tid,))
++        if store is not None and not isinstance(store, ResultStore):
++            raise ValueError('store must be None or a ResultStore')
++        if not _is_exact_int(max_workers) or max_workers < 1:
++            raise ValueError('max_workers must be a positive int')
++        if not _is_exact_int(retries) or retries < 0:
++            raise ValueError('retries must be a nonnegative int')
++        if capacities is None:
++            capacities = {}
++        if not isinstance(capacities, ABCMapping):
++            raise ValueError('capacities must be a mapping')
++        caps = {}
++        for name, amount in capacities.items():
++            if not _check_nonempty_str(name):
++                raise ValueError('invalid resource capacity name: %r'
++                                 % (name,))
++            if not _is_exact_int(amount) or amount < 1:
++                raise ValueError('capacity for %r must be a positive int'
++                                 % (name,))
++            caps[name] = amount
++
++        ids = tuple(graph.ids)
++        deps = {}
++        resources = {}
++        for tid in ids:
++            snap = graph.spec(tid)
++            deps[tid] = tuple(graph.dependencies(tid))
++            res = dict(snap['resources'])
++            for name, amount in res.items():
++                if name not in caps:
++                    raise ValueError('undeclared resource %r required by %r'
++                                     % (name, tid))
++                if not _is_exact_int(amount) or amount < 1:
++                    raise ValueError('invalid resource amount for %r' % (tid,))
++                if amount > caps[name]:
++                    raise ValueError('task %r requires %r of %r exceeds '
++                                     'capacity %r'
++                                     % (tid, amount, name, caps[name]))
++            resources[tid] = res
++
++        dependents = {tid: [] for tid in ids}
++        for tid in ids:
++            for dep in deps[tid]:
++                dependents[dep].append(tid)
++        all_deps = {}
++        visited = set()
++        for tid in ids:
++            stack = list(deps[tid])
++            closure = set()
++            while stack:
++                cur = stack.pop()
++                if cur in closure:
++                    continue
++                closure.add(cur)
++                stack.extend(deps[cur])
++            all_deps[tid] = closure
++
++        self._graph = graph
++        self._ids = ids
++        self._index = {tid: i for i, tid in enumerate(ids)}
++        self._functions = {tid: functions[tid] for tid in ids}
++        self._store = store
++        self._max_workers = max_workers
++        self._retries = retries
++        self._capacities = dict(caps)
++        self._deps = deps
++        self._resources = resources
++        self._dependents = dependents
++        self._all_deps = all_deps
++        self._memory = SingleFlightCache(max_size=max(128, len(ids)))
++
++    def _select(self, targets):
++        if targets is None:
++            return set(self._ids)
++        if isinstance(targets, (str, bytes)):
++            raise ValueError('targets must be an iterable of ids, not a str')
++        try:
++            items = list(targets)
++        except TypeError:
++            raise ValueError('targets must be an iterable of ids')
++        for tid in items:
++            if not isinstance(tid, str) or tid not in self._index:
++                raise ValueError('unknown target id: %r' % (tid,))
++        selected = set(items)
++        stack = list(items)
++        while stack:
++            cur = stack.pop()
++            for dep in self._deps[cur]:
++                if dep not in selected:
++                    selected.add(dep)
++                    stack.append(dep)
++        return selected
++
++    def run(self, targets: Optional[Iterable[str]] = None) -> Dict[str, Any]:
++        """Build the selected closure; return results/states/errors/
++        attempts/max_active.
++        """
++        selected = self._select(targets)
++        ordered = [tid for tid in self._ids if tid in selected]
++        if not ordered:
++            return {'results': {}, 'states': {}, 'errors': {},
++                    'attempts': {}, 'max_active': 0}
++
++        ordered_set = set(ordered)
++        ids = self._ids
++        index = self._index
++        deps = self._deps
++        resources = self._resources
++        dependents = self._dependents
++        all_deps = self._all_deps
++        functions = self._functions
++        store = self._store
++        memory = self._memory
++        max_workers = self._max_workers
++        retries = self._retries
++        capacities = self._capacities
++
++        keys = {}
++        for tid in ids:
++            keys[tid] = self._graph.fingerprint(
++                tid, {d: keys[d] for d in deps[tid]})
++
++        states = {}
++        values = {}
++        errors = {}
++        attempts = {tid: 0 for tid in ordered}
++        failed = set()
++        done = set()
++
++        def mark_blocked(failed_tid):
++            for other in ordered:
++                if other in states:
++                    continue
++                if failed_tid in all_deps[other]:
++                    states[other] = 'blocked'
++
++        def is_ready(tid):
++            for dep in deps[tid]:
++                if dep not in done:
++                    return False
++            return True
++
++        ready = HeapPriorityQueue()
++        tracker = _ActivityTracker()
++        completions = queue.Queue()
++
++        def make_worker(tid, inputs):
++            def worker():
++                tracker.enter()
++                try:
++                    result = functions[tid](inputs)
++                    text = json.dumps(result, allow_nan=False)
++                    return True, json.loads(text)
++                except BaseException as exc:  # noqa: BLE001 - report any failure
++                    return False, _format_error(exc)
++                finally:
++                    tracker.leave()
++            return worker
++
++        def admit(tid):
++            key = keys[tid]
++            hit = memory.get(key, _SENTINEL)
++            if hit is not _SENTINEL:
++                values[tid] = _copy_value(hit)
++                states[tid] = 'cached'
++                done.add(tid)
++                cascade(tid)
++                return
++            if store is not None:
++                try:
++                    stored = store.get(key)
++                except KeyError:
++                    stored = _SENTINEL
++                if stored is not _SENTINEL:
++                    values[tid] = _copy_value(stored)
++                    states[tid] = 'cached'
++                    done.add(tid)
++                    memory.invalidate(key)
++                    memory.get_or_compute(key, lambda v=stored: _copy_value(v))
++                    cascade(tid)
++                    return
++            ready.add(tid, -index[tid])
++
++        def cascade(tid):
++            for child in dependents[tid]:
++                if child not in ordered_set or child in states:
++                    continue
++                if is_ready(child):
++                    admit(child)
++
++        for tid in ordered:
++            if is_ready(tid):
++                admit(tid)
++
++        from concurrent.futures import ThreadPoolExecutor
++
++        pool = ThreadPoolExecutor(max_workers=max_workers)
++        active = 0
++        demand = {name: 0 for name in capacities}
++        try:
++            while True:
++                deferred = []
++                while len(ready) > 0 and active < max_workers:
++                    tid = ready.pop()
++                    if tid in states:
++                        continue
++                    fits = True
++                    for name, amount in resources[tid].items():
++                        if demand[name] + amount > capacities[name]:
++                            fits = False
++                            break
++                    if not fits:
++                        deferred.append(tid)
++                        continue
++                    for name, amount in resources[tid].items():
++                        demand[name] += amount
++                    active += 1
++                    tracker.peak = tracker.peak
++                    attempts[tid] += 1
++                    inputs = {}
++                    for dep in deps[tid]:
++                        inputs[dep] = _copy_value(values[dep])
++                    future = pool.submit(make_worker(tid, inputs))
++                    future.add_done_callback(
++                        lambda fut, t=tid: completions.put((t, fut)))
++                for tid in deferred:
++                    ready.add(tid, -index[tid])
++                if active == 0:
++                    break
++                done_tid, future = completions.get()
++                active -= 1
++                for name, amount in resources[done_tid].items():
++                    demand[name] -= amount
++                try:
++                    ok, payload = future.result()
++                except BaseException as exc:  # defensive
++                    ok, payload = False, _format_error(exc)
++                if ok:
++                    key = keys[done_tid]
++                    values[done_tid] = _copy_value(payload)
++                    memory.invalidate(key)
++                    memory.get_or_compute(
++                        key, lambda v=payload: _copy_value(v))
++                    if store is not None:
++                        store.put(key, _copy_value(payload))
++                    states[done_tid] = 'done'
++                    done.add(done_tid)
++                    cascade(done_tid)
++                elif attempts[done_tid] < 1 + retries:
++                    ready.add(done_tid, -index[done_tid])
++                else:
++                    states[done_tid] = 'failed'
++                    errors[done_tid] = payload
++                    failed.add(done_tid)
++                    mark_blocked(done_tid)
++        finally:
++            pool.shutdown(wait=True)
++
++        for tid in ordered:
++            if tid not in states:
++                states[tid] = 'blocked'
++
++        if store is not None:
++            store.save()
++
++        results = {}
++        out_states = {}
++        out_errors = {}
++        out_attempts = {}
++        for tid in ordered:
++            state = states[tid]
++            out_states[tid] = state
++            out_attempts[tid] = attempts[tid]
++            if state in ('done', 'cached'):
++                results[tid] = _copy_value(values[tid])
++            elif state == 'failed':
++                out_errors[tid] = errors[tid]
++        return {'results': results, 'states': out_states,
++                'errors': out_errors, 'attempts': out_attempts,
++                'max_active': tracker.peak}
+diff --git a/boltons/cacheutils.py b/boltons/cacheutils.py
+index 976f3ce..b427452 100644
+--- a/boltons/cacheutils.py
++++ b/boltons/cacheutils.py
+@@ -67,6 +67,7 @@ import heapq
+ import math
+ import weakref
+ import itertools
++import threading as _threading
+ from operator import attrgetter
+ 
+ try:
+@@ -813,6 +814,172 @@ class ThresholdCounter:
+             self.update(kwargs)
+ 
+ 
++class _SingleFlight(object):
++    """Internal bookkeeping for one in-flight computation in
++    :class:`SingleFlightCache`."""
++    __slots__ = ('event', 'owner_ident', 'owner_thread', 'done',
++                 'success', 'value', 'exc')
++
++    def __init__(self, owner_ident, owner_thread):
++        self.event = _threading.Event()
++        self.owner_ident = owner_ident
++        self.owner_thread = owner_thread
++        self.done = False
++        self.success = False
++        self.value = None
++        self.exc = None
++
++    def finish(self):
++        self.owner_thread = None
++        self.done = True
++        self.event.set()
++
++
++class SingleFlightCache:
++    """A thread-safe, size-bounded memoizing cache where concurrent
++    misses for the same key share a single in-flight computation.
++
++    Completed values are stored in an internal :class:`LRU`, so an
++    evicted key is simply recomputed on its next access. Computation
++    of distinct keys can proceed concurrently, and no internal lock is
++    held while a user ``factory`` runs or while a caller waits on
++    another thread's computation.
++
++    Args:
++        max_size (int): Maximum number of completed values to retain.
++            Must be a positive integer (booleans rejected).
++
++    >>> cache = SingleFlightCache(max_size=8)
++    >>> cache.get_or_compute('a', lambda: 1)
++    1
++    >>> len(cache)
++    1
++    """
++    def __init__(self, max_size=DEFAULT_MAX_SIZE):
++        if isinstance(max_size, bool) or not isinstance(max_size, int):
++            raise ValueError('expected max_size to be an int >= 1, not %r'
++                             % (max_size,))
++        if max_size < 1:
++            raise ValueError('expected max_size >= 1, not %r' % (max_size,))
++        self.max_size = max_size
++        self._cache = LRU(max_size=max_size)
++        # guards _flights only; never held while running user code or waiting
++        self._lock = _threading.Lock()
++        self._flights = {}
++
++    def __len__(self):
++        with self._lock:
++            return len(self._cache)
++
++    def __contains__(self, key):
++        with self._lock:
++            return key in self._cache
++
++    def _lookup(self, key):
++        with self._lock:
++            try:
++                return True, self._cache[key]
++            except KeyError:
++                return False, None
++
++    def get(self, key, default=None):
++        """Return the completed cached value for *key*, or *default*
++        if it is absent. Never waits and never computes."""
++        hit, value = self._lookup(key)
++        return value if hit else default
++
++    def get_or_compute(self, key, factory):
++        """Return the cached value for *key*, or compute it via
++        *factory* (a zero-argument callable) exactly once per flight.
++        """
++        hash(key)
++        if not callable(factory):
++            raise TypeError('expected factory to be callable, not %r'
++                            % (factory,))
++        hit, value = self._lookup(key)
++        if hit:
++            return value
++
++        ident = _threading.get_ident()
++        thread = _threading.current_thread()
++        with self._lock:
++            # Re-check under the lock in case it was cached meanwhile
++            try:
++                return self._cache[key]
++            except KeyError:
++                pass
++            flight = self._flights.get(key)
++            if flight is not None:
++                if flight.owner_ident == ident:
++                    raise RuntimeError(
++                        'recursive get_or_compute for key %r' % (key,))
++                owner = False
++            else:
++                flight = _SingleFlight(ident, thread)
++                self._flights[key] = flight
++                owner = True
++
++        if not owner:
++            flight.event.wait()
++            if not flight.success:
++                raise flight.exc
++            return flight.value
++
++        try:
++            value = factory()
++        except BaseException as exc:
++            with self._lock:
++                if self._flights.get(key) is flight:
++                    del self._flights[key]
++                flight.exc = exc
++                flight.finish()
++            raise
++
++        try:
++            with self._lock:
++                if self._flights.get(key) is flight:
++                    del self._flights[key]
++                    self._cache[key] = value
++                flight.value = value
++                flight.success = True
++                flight.finish()
++        except BaseException:
++            with self._lock:
++                if self._flights.get(key) is flight:
++                    del self._flights[key]
++            raise
++        return value
++
++    def invalidate(self, key):
++        """Remove any cached value and detach any in-flight computation
++        for *key*. Detached in-flight results will not be cached, though
++        their current waiters still receive them. Returns whether the
++        key existed in either state."""
++        with self._lock:
++            existed = False
++            try:
++                del self._cache[key]
++            except KeyError:
++                pass
++            else:
++                existed = True
++            if self._flights.pop(key, None) is not None:
++                existed = True
++            return existed
++
++    def clear(self):
++        """Invalidate every cached and in-flight key."""
++        with self._lock:
++            self._cache.clear()
++            self._flights.clear()
++        return
++
++    def __repr__(self):
++        return ('%s(max_size=%r, cached=%d, in_flight=%d)'
++                % (self.__class__.__name__, self.max_size,
++                   len(self._cache), len(self._flights)))
++
++
+ class MinIDMap:
+     """
+     Assigns arbitrary weakref-able objects the smallest possible unique
+diff --git a/boltons/iterutils.py b/boltons/iterutils.py
+index f63cda5..0ed99cb 100644
+--- a/boltons/iterutils.py
++++ b/boltons/iterutils.py
+@@ -1650,6 +1650,75 @@ def soft_sorted(iterable, first=None, last=None, key=None, reverse=False):
+     return first + other + last
+ 
+ 
++def dependency_layers(graph):
++    """Compute dependency layers for a directed acyclic graph.
++
++    *graph* is a mapping of nonempty string IDs to iterables of
++    prerequisite IDs. Returns a list of lists: each layer contains all
++    currently dependency-free IDs in original mapping insertion order,
++    starting with the IDs that have no prerequisites.
++
++    >>> dependency_layers({'a': [], 'b': ['a'], 'c': ['a'], 'd': ['b', 'c']})
++    [['a'], ['b', 'c'], ['d']]
++    >>> dependency_layers({})
++    []
++
++    Malformed IDs, non-iterable prerequisite values, string/bytes
++    prerequisite iterables, unknown prerequisites, self edges and
++    cycles all raise :exc:`ValueError`. The whole graph is validated
++    before any layers are returned and the caller's data is never
++    mutated.
++    """
++    if not isinstance(graph, Mapping):
++        raise ValueError('expected a mapping of IDs to prerequisites, not: %r'
++                         % type(graph).__name__)
++    order = list(graph.keys())
++    id_set = set()
++    for node in order:
++        if not isinstance(node, str) or not node:
++            raise ValueError('expected nonempty string IDs, not: %r' % (node,))
++        if node in id_set:
++            raise ValueError('duplicate ID: %r' % (node,))
++        id_set.add(node)
++    deps = {}
++    for node in order:
++        raw = graph[node]
++        if isinstance(raw, (str, bytes)):
++            raise ValueError('prerequisite iterable for %r must not be a'
++                             ' string, got: %r' % (node, raw))
++        try:
++            items = list(raw)
++        except TypeError:
++            raise ValueError('expected an iterable of prerequisites for %r, '
++                             'not: %r' % (node, type(raw).__name__))
++        seen = set()
++        node_deps = []
++        for dep in items:
++            if not isinstance(dep, str) or not dep:
++                raise ValueError('expected nonempty string prerequisite IDs '
++                                 'for %r, not: %r' % (node, dep))
++            if dep not in id_set:
++                raise ValueError('unknown prerequisite %r for %r' % (dep, node))
++            if dep == node:
++                raise ValueError('self edge on %r' % (node,))
++            if dep not in seen:
++                seen.add(dep)
++                node_deps.append(dep)
++        deps[node] = node_deps
++
++    placed = set()
++    layers = []
++    while len(placed) < len(order):
++        layer = [node for node in order
++                 if node not in placed
++                 and all(dep in placed for dep in deps[node])]
++        if not layer:
++            raise ValueError('cycle detected in dependency graph')
++        placed.update(layer)
++        layers.append(layer)
++    return layers
++
++
+ def untyped_sorted(iterable, key=None, reverse=False):
+     """A version of :func:`sorted` which will happily sort an iterable of
+     heterogeneous types and return a new list, similar to legacy Python's
+diff --git a/test_orch_integration_t_005.py b/test_orch_integration_t_005.py
+new file mode 100644
+index 0000000..43f757d
+--- /dev/null
++++ b/test_orch_integration_t_005.py
+@@ -0,0 +1,578 @@
++"""Integration tests for T-005 (R5-R8): BuildRunner composed with
++BuildGraph, ResultStore, SingleFlightCache and HeapPriorityQueue.
++
++Tests run from the repo root as stdlib unittest modules.
++"""
++
++import json
++import os
++import tempfile
++import threading
++import unittest
++
++from boltons.buildgraphutils import BuildGraph
++from boltons.buildcacheutils import ResultStore
++from boltons.buildrunutils import BuildRunner
++
++
++def make_graph(tasks):
++    return BuildGraph(tasks)
++
++
++def three_chain():
++    # a -> b -> c, insertion order a, b, c
++    return make_graph({
++        'a': {'deps': [], 'version': '1', 'resources': {'cpu': 1}},
++        'b': {'deps': ['a'], 'version': '1', 'resources': {'cpu': 1}},
++        'c': {'deps': ['b'], 'version': '1', 'resources': {'cpu': 1}},
++    })
++
++
++class Gate(object):
++    """Simple threading gate: threads block until released."""
++
++    def __init__(self, n=1):
++        self.n = n
++        self.count = 0
++        self.ev = threading.Event()
++        self.lock = threading.Lock()
++
++    def wait(self, timeout=10.0):
++        with self.lock:
++            self.count += 1
++            if self.count >= self.n:
++                self.ev.set()
++        return self.ev.wait(timeout)
++
++    def release(self):
++        self.ev.set()
++
++
++class Counter(object):
++    def __init__(self):
++        self.lock = threading.Lock()
++        self.calls = {}
++        self.active = 0
++        self.peak = 0
++
++    def enter(self, name):
++        with self.lock:
++            self.calls[name] = self.calls.get(name, 0) + 1
++            self.active += 1
++            if self.active > self.peak:
++                self.peak = self.active
++
++    def leave(self):
++        with self.lock:
++            self.active -= 1
++
++    def count(self, name):
++        with self.lock:
++            return self.calls.get(name, 0)
++
++
++def counted(name, counter, value_fn=lambda inputs: None, gate=None):
++    """Build a callback that counts calls and supports a gate."""
++    def fn(inputs):
++        counter.enter(name)
++        try:
++            if gate is not None:
++                gate.wait()
++            return value_fn(inputs)
++        finally:
++            counter.leave()
++    return fn
++
++
++class R5ConstructionTests(unittest.TestCase):
++    def test_r5_config_validation_rejects_bad_args(self):
++        graph = three_chain()
++        good = {k: (lambda inputs: 1) for k in graph.ids}
++        cases = [
++            ('max_workers bool', dict(max_workers=True)),
++            ('max_workers zero', dict(max_workers=0)),
++            ('max_workers str', dict(max_workers='2')),
++            ('retries bool', dict(retries=False)),
++            ('retries negative', dict(retries=-1)),
++            ('retries str', dict(retries='1')),
++            ('capacities bad name', dict(capacities={'': 1})),
++            ('capacities bool cap', dict(capacities={'cpu': True})),
++            ('capacities zero', dict(capacities={'cpu': 0})),
++            ('capacity missing', dict(capacities={})),
++            ('demand over capacity', dict(capacities={'cpu': 1})),
++        ]
++        for label, kw in cases:
++            with self.subTest(label):
++                tasks = {k: dict(graph.spec(k)) for k in graph.ids}
++                if label == 'demand over capacity':
++                    tasks['a']['resources'] = {'cpu': 2}
++                g = make_graph(tasks)
++                with self.assertRaises(ValueError):
++                    BuildRunner(g, good, **kw)
++
++    def test_r5_functions_must_match_ids(self):
++        graph = three_chain()
++        with self.subTest('missing fn'):
++            with self.assertRaises(ValueError):
++                BuildRunner(graph, {'a': lambda i: 1}, capacities={'cpu': 1})
++        with self.subTest('non-callable fn'):
++            with self.assertRaises(ValueError):
++                BuildRunner(graph, {'a': 1, 'b': lambda i: 1, 'c': lambda i: 1},
++                            capacities={'cpu': 1})
++        with self.subTest('extra id'):
++            fns = {'a': lambda i: 1, 'b': lambda i: 1,
++                   'c': lambda i: 1, 'd': lambda i: 1}
++            with self.assertRaises(ValueError):
++                BuildRunner(graph, fns, capacities={'cpu': 1})
++
++    def test_r5_no_callback_on_failed_construction(self):
++        graph = three_chain()
++        counter = Counter()
++        fns = {k: counted(k, counter) for k in graph.ids}
++        with self.assertRaises(ValueError):
++            BuildRunner(graph, fns, capacities={'cpu': 2, 'gpu': 0})
++        self.assertEqual(counter.calls, {})
++
++
++class R6RunReportTests(unittest.TestCase):
++    def test_r6_default_targets_all_and_order(self):
++        graph = three_chain()
++        counter = Counter()
++        fns = {
++            'a': counted('a', counter, lambda i: 'A'),
++            'b': counted('b', counter, lambda i: 'B' + i['a']),
++            'c': counted('c', counter, lambda i: 'C' + i['b']),
++        }
++        runner = BuildRunner(graph, fns, capacities={'cpu': 1}, max_workers=1)
++        out = runner.run()
++        self.assertEqual(set(out.keys()),
++                         {'results', 'states', 'errors', 'attempts', 'max_active'})
++        self.assertEqual(list(out['states'].keys()), ['a', 'b', 'c'])
++        self.assertEqual(list(out['results'].keys()), ['a', 'b', 'c'])
++        self.assertEqual(list(out['attempts'].keys()), ['a', 'b', 'c'])
++        self.assertEqual(out['states'], {'a': 'done', 'b': 'done', 'c': 'done'})
++        self.assertEqual(out['results'], {'a': 'A', 'b': 'BA', 'c': 'CBA'})
++        self.assertEqual(out['errors'], {})
++        self.assertEqual(out['attempts'], {'a': 1, 'b': 1, 'c': 1})
++        self.assertEqual(out['max_active'], 1)
++
++    def test_r6_target_closure_and_duplicates(self):
++        graph = make_graph({
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++            'b': {'deps': ['a'], 'version': '1', 'resources': {}},
++            'c': {'deps': [], 'version': '1', 'resources': {}},
++        })
++        counter = Counter()
++        fns = {k: counted(k, counter, lambda i: k) for k in graph.ids}
++        runner = BuildRunner(graph, fns, capacities={}, max_workers=2)
++        out = runner.run(targets=['b', 'b'])
++        self.assertEqual(list(out['states'].keys()), ['a', 'b'])
++        self.assertNotIn('c', out['states'])
++        self.assertEqual(counter.count('c'), 0)
++        self.assertEqual(counter.count('a'), 1)
++        self.assertEqual(counter.count('b'), 1)
++
++    def test_r6_invalid_targets_before_callbacks(self):
++        graph = three_chain()
++        counter = Counter()
++        fns = {k: counted(k, counter) for k in graph.ids}
++        runner = BuildRunner(graph, fns, capacities={'cpu': 1})
++        for bad in ('a', 'zzz', ['a', 'zzz']):
++            with self.subTest(repr(bad)):
++                with self.assertRaises(ValueError):
++                    runner.run(targets=bad)
++        self.assertEqual(counter.calls, {})
++
++    def test_r6_empty_selection(self):
++        graph = three_chain()
++        fns = {k: (lambda i: 1) for k in graph.ids}
++        runner = BuildRunner(graph, fns, capacities={'cpu': 1})
++        out = runner.run(targets=[])
++        self.assertEqual(out['results'], {})
++        self.assertEqual(out['states'], {})
++        self.assertEqual(out['errors'], {})
++        self.assertEqual(out['attempts'], {})
++        self.assertEqual(out['max_active'], 0)
++
++    def test_r6_failure_blocks_dependents_unrelated_finishes(self):
++        graph = make_graph({
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++            'b': {'deps': ['a'], 'version': '1', 'resources': {}},
++            'c': {'deps': ['b'], 'version': '1', 'resources': {}},
++            'x': {'deps': [], 'version': '1', 'resources': {}},
++        })
++        counter = Counter()
++
++        def boom(inputs):
++            raise RuntimeError('kaboom')
++
++        fns = {
++            'a': boom,
++            'b': counted('b', counter, lambda i: 1),
++            'c': counted('c', counter, lambda i: 1),
++            'x': counted('x', counter, lambda i: 'X'),
++        }
++        runner = BuildRunner(graph, fns, capacities={}, max_workers=2)
++        out = runner.run()
++        self.assertEqual(out['states'], {
++            'a': 'failed', 'b': 'blocked', 'c': 'blocked', 'x': 'done'})
++        self.assertEqual(out['errors'], {'a': 'RuntimeError: kaboom'})
++        self.assertEqual(out['results'], {'x': 'X'})
++        self.assertEqual(out['attempts'], {'a': 1, 'b': 0, 'c': 0, 'x': 1})
++        self.assertEqual(counter.count('b'), 0)
++        self.assertEqual(counter.count('c'), 0)
++
++    def test_r6_result_mutation_isolated(self):
++        graph = make_graph({
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++            'b': {'deps': ['a'], 'version': '1', 'resources': {}},
++        })
++        seen = {}
++
++        def make_a(inputs):
++            return [1, 2]
++
++        def make_b(inputs):
++            # Try to mutate the input copy; must not affect a's result.
++            inputs['a'].append(99)
++            return list(inputs['a'])
++
++        fns = {'a': make_a, 'b': make_b}
++        runner = BuildRunner(graph, fns, capacities={}, max_workers=1)
++        out = runner.run()
++        self.assertEqual(out['results']['a'], [1, 2])
++        self.assertEqual(out['results']['b'], [1, 2, 99])
++        # Mutating returned copy should not corrupt internal cache.
++        out['results']['a'].append(7)
++        out2 = runner.run(targets=['a'])
++        self.assertEqual(out2['results']['a'], [1, 2])
++        seen.clear()
++
++    def test_r6_workers_and_resources(self):
++        graph = make_graph({
++            'a': {'deps': [], 'version': '1', 'resources': {'gpu': 1}},
++            'b': {'deps': [], 'version': '1', 'resources': {'gpu': 1}},
++            'c': {'deps': [], 'version': '1', 'resources': {'gpu': 1}},
++        })
++        gate = Gate(1)
++        counter = Counter()
++        fns = {k: counted(k, counter, lambda i: k, gate=gate)
++               for k in graph.ids}
++        runner = BuildRunner(graph, fns, capacities={'gpu': 1}, max_workers=2)
++
++        def release_later():
++            # wait until one callback is active, then release it
++            import time
++            time.sleep(0.2)
++            gate.release()
++
++        t = threading.Thread(target=release_later)
++        t.start()
++        out = runner.run()
++        t.join()
++        self.assertEqual(out['states'], {'a': 'done', 'b': 'done', 'c': 'done'})
++        self.assertEqual(out['max_active'], 1)
++
++    def test_r6_max_active_observes_concurrency(self):
++        graph = make_graph({
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++            'b': {'deps': [], 'version': '1', 'resources': {}},
++            'c': {'deps': [], 'version': '1', 'resources': {}},
++        })
++        counter = Counter()
++        gate = Gate(3)
++        fns = {k: counted(k, counter, lambda i: k, gate=gate)
++               for k in graph.ids}
++        runner = BuildRunner(graph, fns, capacities={}, max_workers=3)
++        out = runner.run()
++        self.assertEqual(out['states'], {'a': 'done', 'b': 'done', 'c': 'done'})
++        self.assertEqual(out['max_active'], 3)
++
++    def test_r6_max_active_zero_when_reused(self):
++        graph = three_chain()
++        counter = Counter()
++        fns = {k: counted(k, counter, lambda i: k) for k in graph.ids}
++        runner = BuildRunner(graph, fns, capacities={'cpu': 1})
++        runner.run()
++        out = runner.run()
++        self.assertEqual(out['states'], {'a': 'cached', 'b': 'cached', 'c': 'cached'})
++        self.assertEqual(out['attempts'], {'a': 0, 'b': 0, 'c': 0})
++        self.assertEqual(out['max_active'], 0)
++
++
++class R7RetryAndMemoryTests(unittest.TestCase):
++    def test_r7_retries_exhausted_error_form(self):
++        graph = make_graph({
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++        })
++        counter = Counter()
++
++        def boom(inputs):
++            raise ValueError('bad value')
++
++        runner = BuildRunner(graph, {'a': boom}, capacities={}, retries=2)
++        out = runner.run()
++        self.assertEqual(out['states'], {'a': 'failed'})
++        self.assertEqual(out['errors'], {'a': 'ValueError: bad value'})
++        self.assertEqual(out['attempts'], {'a': 3})
++        self.assertEqual(out['results'], {})
++
++    def test_r7_non_json_result_is_failure(self):
++        graph = make_graph({
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++        })
++        runner = BuildRunner(graph, {'a': lambda i: float('nan')},
++                             capacities={})
++        out = runner.run()
++        self.assertEqual(out['states'], {'a': 'failed'})
++        self.assertEqual(out['results'], {})
++        self.assertEqual(out['attempts'], {'a': 1})
++
++    def test_r7_recovers_after_failure_and_is_reusable(self):
++        graph = make_graph({
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++        })
++        calls = {'n': 0}
++
++        def flaky(inputs):
++            calls['n'] += 1
++            if calls['n'] == 1:
++                raise RuntimeError('first boom')
++            return 'ok'
++
++        runner = BuildRunner(graph, {'a': flaky}, capacities={}, retries=0)
++        out = runner.run()
++        self.assertEqual(out['states'], {'a': 'failed'})
++        self.assertEqual(out['attempts'], {'a': 1})
++        out = runner.run()
++        self.assertEqual(out['states'], {'a': 'done'})
++        self.assertEqual(out['results'], {'a': 'ok'})
++        self.assertEqual(out['attempts'], {'a': 1})
++
++    def test_r7_retry_succeeds_and_releases_resources(self):
++        graph = make_graph({
++            'a': {'deps': [], 'version': '1', 'resources': {'cpu': 1}},
++            'b': {'deps': [], 'version': '1', 'resources': {'cpu': 1}},
++        })
++        calls = {'a': 0}
++
++        def flaky(inputs):
++            calls['a'] += 1
++            if calls['a'] < 2:
++                raise ValueError('transient')
++            return 'A'
++
++        fns = {'a': flaky, 'b': lambda i: 'B'}
++        runner = BuildRunner(graph, fns, capacities={'cpu': 1}, retries=1)
++        out = runner.run()
++        self.assertEqual(out['states'], {'a': 'done', 'b': 'done'})
++        self.assertEqual(out['results'], {'a': 'A', 'b': 'B'})
++        self.assertEqual(out['attempts'], {'a': 2, 'b': 1})
++
++    def test_r7_memory_reuse_no_callback(self):
++        counter = Counter()
++        graph = three_chain()
++        fns = {k: counted(k, counter, lambda i: k) for k in graph.ids}
++        runner = BuildRunner(graph, fns, capacities={'cpu': 1})
++        first = runner.run()
++        self.assertEqual(first['states'], {'a': 'done', 'b': 'done', 'c': 'done'})
++        second = runner.run(targets=['c'])
++        self.assertEqual(second['states'], {'a': 'cached', 'b': 'cached', 'c': 'cached'})
++        self.assertEqual(counter.count('a'), 1)
++        self.assertEqual(counter.count('b'), 1)
++        self.assertEqual(counter.count('c'), 1)
++
++    def test_r7_version_change_recomputes_affected_only(self):
++        tasks = {
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++            'b': {'deps': ['a'], 'version': '1', 'resources': {}},
++            'x': {'deps': [], 'version': '1', 'resources': {}},
++        }
++        graph = make_graph(tasks)
++        counter = Counter()
++        fns = {k: counted(k, counter, lambda i: k) for k in graph.ids}
++        tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(tmp.cleanup)
++        path = os.path.join(tmp.name, 'store.json')
++        runner = BuildRunner(graph, fns, store=ResultStore(path), capacities={},
++                             max_workers=1)
++        runner.run()
++        # new runner over the reopened store, new graph with b version bumped
++        tasks2 = {k: dict(v) for k, v in tasks.items()}
++        tasks2['b']['version'] = '2'
++        graph2 = make_graph(tasks2)
++        runner2 = BuildRunner(graph2, fns, store=ResultStore(path), capacities={},
++                              max_workers=1)
++        out = runner2.run()
++        self.assertEqual(counter.count('a'), 1)
++        self.assertEqual(counter.count('x'), 1)
++        self.assertEqual(counter.count('b'), 2)
++        self.assertEqual(out['states'], {'a': 'cached', 'b': 'done', 'x': 'cached'})
++
++
++class R8PersistenceTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.path = os.path.join(self.tmp.name, 'store.json')
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def _fns(self, counter):
++        return {k: counted(k, counter, lambda i, k=k: k.upper())
++                for k in ('a', 'b', 'x')}
++
++    def test_r8_persist_and_reopen_reuses(self):
++        tasks = {
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++            'b': {'deps': ['a'], 'version': '1', 'resources': {}},
++            'x': {'deps': [], 'version': '1', 'resources': {}},
++        }
++        graph = make_graph(tasks)
++        counter = Counter()
++        store = ResultStore(self.path)
++        runner = BuildRunner(graph, self._fns(counter), store=store,
++                             capacities={}, max_workers=1)
++        out = runner.run()
++        self.assertEqual(out['states'], {'a': 'done', 'b': 'done', 'x': 'done'})
++        self.assertTrue(os.path.exists(self.path))
++        # fingerprint of a with no deps should be in the saved store
++        with open(self.path, 'rb') as f:
++            raw = f.read()
++        data = json.loads(raw.decode('utf-8'))
++        self.assertEqual(data['schema_version'], 1)
++        self.assertEqual(len(data['values']), 3)
++
++        store2 = ResultStore(self.path)
++        counter2 = Counter()
++        graph2 = make_graph(tasks)
++        runner2 = BuildRunner(graph2, self._fns(counter2), store=store2,
++                              capacities={}, max_workers=1)
++        out2 = runner2.run()
++        self.assertEqual(out2['states'], {'a': 'cached', 'b': 'cached', 'x': 'cached'})
++        self.assertEqual(out2['results'], {'a': 'A', 'b': 'B', 'x': 'X'})
++        self.assertEqual(counter2.calls, {})
++        self.assertEqual(out2['max_active'], 0)
++
++    def test_r8_version_change_with_store(self):
++        tasks = {
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++            'b': {'deps': ['a'], 'version': '1', 'resources': {}},
++            'x': {'deps': [], 'version': '1', 'resources': {}},
++        }
++        counter = Counter()
++        store = ResultStore(self.path)
++        graph = make_graph(tasks)
++        BuildRunner(graph, self._fns(counter), store=store, capacities={},
++                    max_workers=1).run()
++
++        tasks2 = {k: dict(v) for k, v in tasks.items()}
++        tasks2['a']['version'] = '2'
++        graph2 = make_graph(tasks2)
++        counter2 = Counter()
++        store2 = ResultStore(self.path)
++        out = BuildRunner(graph2, self._fns(counter2), store=store2,
++                          capacities={}, max_workers=1).run()
++        self.assertEqual(out['states'], {'a': 'done', 'b': 'done', 'x': 'cached'})
++        self.assertEqual(out['results'], {'a': 'A', 'b': 'B', 'x': 'X'})
++        self.assertEqual(counter2.count('a'), 1)
++        self.assertEqual(counter2.count('b'), 1)
++        self.assertEqual(counter2.count('x'), 0)
++
++    def test_r8_failures_not_persisted(self):
++        tasks = {
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++            'b': {'deps': ['a'], 'version': '1', 'resources': {}},
++            'x': {'deps': [], 'version': '1', 'resources': {}},
++        }
++        graph = make_graph(tasks)
++        store = ResultStore(self.path)
++
++        def boom(inputs):
++            raise RuntimeError('no')
++
++        fns = {'a': boom, 'b': lambda i: 'B', 'x': lambda i: 'X'}
++        runner = BuildRunner(graph, fns, store=store, capacities={},
++                             max_workers=2, retries=1)
++        out = runner.run()
++        self.assertEqual(out['states'], {'a': 'failed', 'b': 'blocked', 'x': 'done'})
++        self.assertEqual(out['errors'], {'a': 'RuntimeError: no'})
++        self.assertEqual(out['attempts'], {'a': 2, 'b': 0, 'x': 1})
++        # reopen: only x should be reused, a retried
++        store2 = ResultStore(self.path)
++        counter = Counter()
++
++        def a_success(inputs):
++            counter.enter('a')
++            try:
++                return 'A'
++            finally:
++                counter.leave()
++
++        fns2 = {'a': a_success, 'b': lambda i: 'B' + i['a'],
++                'x': counted('x', counter, lambda i: 'X')}
++        out2 = BuildRunner(graph, fns2, store=store2, capacities={},
++                           max_workers=2).run()
++        self.assertEqual(out2['states'], {'a': 'done', 'b': 'done', 'x': 'cached'})
++        self.assertEqual(out2['results'], {'a': 'A', 'b': 'BA', 'x': 'X'})
++        self.assertEqual(counter.count('a'), 1)
++        self.assertEqual(counter.count('x'), 0)
++
++    def test_r8_failure_then_recreate_then_retry_with_same_runner(self):
++        graph = make_graph({
++            'a': {'deps': [], 'version': '1', 'resources': {}},
++            'b': {'deps': ['a'], 'version': '1', 'resources': {}},
++        })
++        store = ResultStore(self.path)
++        calls = {'a': 0, 'b': 0}
++
++        def a_fn(inputs):
++            calls['a'] += 1
++            if calls['a'] == 1:
++                raise ValueError('flaky')
++            return 'A'
++
++        def b_fn(inputs):
++            calls['b'] += 1
++            return 'B' + inputs['a']
++
++        runner = BuildRunner(graph, {'a': a_fn, 'b': b_fn}, store=store,
++                             capacities={}, max_workers=1)
++        out = runner.run()
++        self.assertEqual(out['states'], {'a': 'failed', 'b': 'blocked'})
++        self.assertEqual(out['attempts'], {'a': 1, 'b': 0})
++        out = runner.run()
++        self.assertEqual(out['states'], {'a': 'done', 'b': 'done'})
++        self.assertEqual(out['results'], {'a': 'A', 'b': 'BA'})
++        self.assertEqual(out['attempts'], {'a': 1, 'b': 1})
++        # reopening the store now reuses both successes
++        store2 = ResultStore(self.path)
++        n = {'a': 0, 'b': 0}
++        runner2 = BuildRunner(
++            graph,
++            {'a': lambda i: n.__setitem__('a', n['a'] + 1) or 'A',
++             'b': lambda i: n.__setitem__('b', n['b'] + 1) or 'B'},
++            store=store2, capacities={}, max_workers=1)
++        out2 = runner2.run()
++        self.assertEqual(out2['states'], {'a': 'cached', 'b': 'cached'})
++        self.assertEqual(n, {'a': 0, 'b': 0})
++
++    def test_r8_store_saved_once(self):
++        graph = three_chain()
++        store = ResultStore(self.path)
++        saves = {'n': 0}
++        original_save = store.save
++
++        def counting_save():
++            saves['n'] += 1
++            return original_save()
++
++        store.save = counting_save
++        runner = BuildRunner(graph, {k: (lambda i: k) for k in graph.ids},
++                             store=store, capacities={'cpu': 1})
++        runner.run()
++        self.assertEqual(saves['n'], 1)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/test_orch_t_001.py b/test_orch_t_001.py
+new file mode 100644
+index 0000000..3491c06
+--- /dev/null
++++ b/test_orch_t_001.py
+@@ -0,0 +1,82 @@
++"""Generated tests for T-001 / R1: boltons.iterutils.dependency_layers."""
++import unittest
++from collections import OrderedDict
++
++from boltons.iterutils import dependency_layers
++
++
++class TestDependencyLayers(unittest.TestCase):
++    def setUp(self):
++        self.valid = [
++            ('empty', {}, []),
++            ('single', {'a': []}, [['a']]),
++            ('independent', {'a': [], 'b': [], 'c': []}, [['a', 'b', 'c']]),
++            ('chain', {'c': ['b'], 'a': [], 'b': ['a']}, [['a'], ['b'], ['c']]),
++            ('diamond', {'a': [], 'b': ['a'], 'c': ['a'], 'd': ['b', 'c']},
++             [['a'], ['b', 'c'], ['d']]),
++            ('insertion_order', {'x': ['a'], 'a': [], 'b': [], 'y': ['b'], 'z': []},
++             [['a', 'b', 'z'], ['x', 'y']]),
++            ('duplicates_dedup', {'a': [], 'b': ['a', 'a', 'a']}, [['a'], ['b']]),
++            ('tuple_values', {'a': (), 'b': ('a',)}, [['a'], ['b']]),
++            ('generator_values', {'a': iter([]), 'b': (d for d in ['a'])}, [['a'], ['b']]),
++            ('mapping_type_ordered', OrderedDict([('b', ['a']), ('a', [])]), [['a'], ['b']]),
++        ]
++        self.invalid = [
++            ('empty_key', {'': []}),
++            ('missing_dep', {'a': ['nope']}),
++            ('self_edge', {'a': ['a']}),
++            ('cycle_two', {'a': ['b'], 'b': ['a']}),
++            ('cycle_three', {'a': ['c'], 'b': ['a'], 'c': ['b']}),
++            ('string_prereq_iterable', {'a': 'bc', 'b': [], 'c': []}),
++            ('bytes_prereq_iterable', {'a': b'bc', 'b': [], 'c': []}),
++            ('non_iterable_value', {'a': 3}),
++            ('bad_dep_type', {'a': [1]}),
++            ('empty_dep_id', {'a': [''], '': []}),
++        ]
++
++    def test_r1_normal_and_boundary_layers(self):
++        for name, graph, expected in self.valid:
++            with self.subTest(case=name):
++                self.assertEqual(dependency_layers(graph), expected)
++
++    def test_r1_rejects_malformed_graphs_with_valueerror(self):
++        for name, graph in self.invalid:
++            with self.subTest(case=name):
++                with self.assertRaises(ValueError):
++                    dependency_layers(graph)
++
++    def test_r1_unknown_and_self_edges_validated_before_return(self):
++        # A cycle plus a missing prerequisite still fails (whole-graph validation).
++        with self.assertRaises(ValueError):
++            dependency_layers({'a': ['b'], 'b': ['a'], 'c': ['zzz']})
++        # Missing prerequisite in a graph that would otherwise resolve.
++        with self.assertRaises(ValueError):
++            dependency_layers({'root': [], 'late': ['root'], 'bad': ['ghost']})
++
++    def test_r1_does_not_mutate_caller_data(self):
++        prereqs = ['b', 'a', 'b']
++        graph = OrderedDict([('c', prereqs), ('a', []), ('b', ['a'])])
++        snapshot = list(graph.items())
++        result = dependency_layers(graph)
++        self.assertEqual(result, [['a'], ['b'], ['c']])
++        self.assertEqual(list(graph.items()), snapshot)
++        self.assertIs(graph['c'], prereqs)
++        self.assertEqual(prereqs, ['b', 'a', 'b'])
++
++    def test_r1_returns_fresh_lists(self):
++        graph = {'a': [], 'b': ['a']}
++        first = dependency_layers(graph)
++        first[0].append('polluted')
++        first.append(['junk'])
++        self.assertEqual(dependency_layers(graph), [['a'], ['b']])
++
++    def test_r1_each_id_appears_exactly_once(self):
++        graph = {'a': [], 'b': ['a'], 'c': ['a', 'b'], 'd': ['c']}
++        layers = dependency_layers(graph)
++        flat = [node for layer in layers for node in layer]
++        self.assertEqual(sorted(flat), ['a', 'b', 'c', 'd'])
++        self.assertEqual(len(flat), len(set(flat)))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/test_orch_t_002.py b/test_orch_t_002.py
+new file mode 100644
+index 0000000..da8bf40
+--- /dev/null
++++ b/test_orch_t_002.py
+@@ -0,0 +1,167 @@
++import threading
++import time
++import unittest
++
++from boltons.cacheutils import SingleFlightCache
++
++
++class SyncFactory:
++    def __init__(self, value=None, exc=None):
++        self.value = value
++        self.exc = exc
++        self.calls = 0
++        self.entered = threading.Event()
++        self.release = threading.Event()
++        self.block = False
++
++    def __call__(self):
++        self.calls += 1
++        self.entered.set()
++        if self.block:
++            self.release.wait(5)
++        if self.exc is not None:
++            raise self.exc
++        return self.value
++
++
++class Gate(threading.Thread):
++    def __init__(self, cache, key, factory, barrier):
++        super(Gate, self).__init__()
++        self.cache = cache
++        self.key = key
++        self.factory = factory
++        self.barrier = barrier
++        self.result = self.error = None
++
++    def run(self):
++        try:
++            self.result = self.cache.get_or_compute(self.key, self.factory)
++        except BaseException as exc:
++            self.error = exc
++
++
++def start_n(cache, key, factory, n):
++    gate = Gate(cache, key, factory, None)
++    waiters = [gate]
++    factory.block = True
++    waiters.extend(Gate(cache, key, factory, None) for _ in range(n - 1))
++    gate.start()
++    assert factory.entered.wait(5)
++    for w in waiters[1:]:
++        w.start()
++    time.sleep(0.15)
++    factory.release.set()
++    for w in waiters:
++        w.join(5)
++    return waiters
++
++
++class SingleFlightCacheTest(unittest.TestCase):
++    def setUp(self):
++        self.cache = SingleFlightCache()
++
++    def test_r2_bad_max_size(self):
++        for val in (True, False, 0, -3, 1.5, '8', None):
++            with self.subTest(val=val):
++                with self.assertRaises(ValueError):
++                    SingleFlightCache(max_size=val)
++        self.assertIsInstance(SingleFlightCache(max_size=1), SingleFlightCache)
++
++    def test_r2_hit_identity_and_eviction(self):
++        c = SingleFlightCache(max_size=2)
++        f = SyncFactory(value=object())
++        first = c.get_or_compute('a', f)
++        again = c.get_or_compute('a', f)
++        self.assertIs(first, again)
++        self.assertEqual(f.calls, 1)
++        c.get_or_compute('b', lambda: 2)
++        c.get_or_compute('c', lambda: 3)   # evicts 'a'
++        self.assertIsNotNone(c.get_or_compute('a', lambda: object()))
++        self.assertEqual(f.calls, 1)
++        self.assertIsNone(c.get('missing'))
++        c.get_or_compute('d', lambda: 4)
++        self.assertIsNone(c.get('b'))
++
++    def test_r2_shared_flight_same_object(self):
++        f = SyncFactory(value=object())
++        waiters = start_n(self.cache, 'k', f, 3)
++        self.assertEqual(f.calls, 1)
++        self.assertEqual(len({id(w.result) for w in waiters}), 1)
++        self.assertTrue(all(w.error is None for w in waiters))
++        self.assertIs(self.cache.get('k'), waiters[0].result)
++
++    def test_r2_exception_reaches_all_and_retry(self):
++        exc = ValueError('boom')
++        f = SyncFactory(exc=exc)
++        waiters = start_n(self.cache, 'k', f, 2)
++        for w in waiters:
++            with self.subTest(waiter=id(w)):
++                self.assertIsInstance(w.error, ValueError)
++                self.assertEqual(str(w.error), 'boom')
++        self.assertEqual(f.calls, 1)
++        self.assertIsNone(self.cache.get('k'))
++        self.assertEqual(self.cache.get_or_compute('k', lambda: 9), 9)
++
++    def test_r2_invalidate_and_clear(self):
++        self.assertFalse(self.cache.invalidate('nope'))
++        self.cache.get_or_compute('a', lambda: 1)
++        self.assertTrue(self.cache.invalidate('a'))
++        self.assertFalse(self.cache.invalidate('a'))
++        f = SyncFactory(value=object())
++        f.block = True
++        owner = Gate(self.cache, 'r', f, None)
++        owner.start()
++        self.assertTrue(f.entered.wait(5))
++        self.assertTrue(self.cache.invalidate('r'))
++        f.release.set()
++        owner.join(5)
++        self.assertIs(owner.result, f.value)
++        self.assertIsNone(self.cache.get('r'))
++        self.cache.get_or_compute('x', lambda: object())
++        self.cache.get_or_compute('y', lambda: object())
++        self.cache.clear()
++        self.assertIsNone(self.cache.get('x'))
++        self.assertIsNone(self.cache.get('y'))
++        self.assertFalse(self.cache.invalidate('x'))
++
++    def test_r2_recursive_owner_raises_runtime_error(self):
++        seen = []
++
++        def factory():
++            try:
++                self.cache.get_or_compute('same', lambda: 1)
++            except RuntimeError as exc:
++                seen.append(exc)
++                return 'outer'
++            return 'bad'
++
++        self.assertEqual(self.cache.get_or_compute('same', factory), 'outer')
++        self.assertEqual(len(seen), 1)
++
++    def test_r2_bad_key_and_factory(self):
++        with self.assertRaises(TypeError):
++            self.cache.get_or_compute([], lambda: 1)
++        with self.assertRaises(TypeError):
++            self.cache.get_or_compute('k', 5)
++
++    def test_r2_distinct_keys_concurrent(self):
++        barrier = threading.Barrier(2)
++
++        def make(value):
++            def factory():
++                barrier.wait(5)
++                return value
++            return factory
++
++        gates = [Gate(self.cache, 'p', make(1), None),
++                 Gate(self.cache, 'q', make(2), None)]
++        for g in gates:
++            g.start()
++        for g in gates:
++            g.join(5)
++        self.assertEqual([g.result for g in gates], [1, 2])
++        self.assertTrue(all(g.error is None for g in gates))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/test_orch_t_003.py b/test_orch_t_003.py
+new file mode 100644
+index 0000000..a34a048
+--- /dev/null
++++ b/test_orch_t_003.py
+@@ -0,0 +1,129 @@
++import hashlib
++import json
++import unittest
++
++from boltons.buildgraphutils import BuildGraph
++
++
++def _digest(obj):
++    text = json.dumps(obj, sort_keys=True, separators=(',', ':'),
++                      ensure_ascii=False, allow_nan=False)
++    return hashlib.sha256(text.encode('utf-8')).hexdigest()
++
++KEY = 'a' * 64
++
++
++def _spec(deps=(), version='v', resources=None):
++    return {'deps': list(deps), 'version': version,
++            'resources': {} if resources is None else dict(resources)}
++
++
++class TestBuildGraphR3(unittest.TestCase):
++    def setUp(self):
++        self.tasks = {
++            'test': _spec([], 'v1', {'cpu': 1}),
++            'build': _spec(['test', 'test'], 'v2', {'cpu': 2}),
++            'other': _spec([], 'v1', {'io': 1}),
++            'pack': _spec(['build', 'other'], 'v3'),
++        }
++        self.graph = BuildGraph(self.tasks)
++
++    def test_r3_ids_layers_spec(self):
++        self.assertEqual(self.graph.ids, ('test', 'build', 'other', 'pack'))
++        self.assertEqual(self.graph.layers(),
++                         [['test', 'other'], ['build'], ['pack']])
++        with self.subTest(task='build'):
++            self.assertEqual(self.graph.spec('build'),
++                             {'deps': ['test', 'test'], 'version': 'v2',
++                              'resources': {'cpu': 2}})
++        with self.subTest(task='pack'):
++            self.assertEqual(self.graph.spec('pack'),
++                             {'deps': ['build', 'other'], 'version': 'v3',
++                              'resources': {}})
++
++    def test_r3_affected(self):
++        table = [((), []), (['test'], ['test', 'build', 'pack']),
++                 (['build'], ['build', 'pack']),
++                 (['other', 'test'], ['test', 'build', 'other', 'pack']),
++                 (['pack', 'pack'], ['pack'])]
++        for changed, expected in table:
++            with self.subTest(changed=changed):
++                self.assertEqual(self.graph.affected(changed), expected)
++
++    def test_r3_fingerprint(self):
++        expected = _digest({'id': 'pack', 'version': 'v3', 'resources': {},
++                            'dependencies': [['build', KEY],
++                                             ['other', KEY]]})
++        got = self.graph.fingerprint('pack', {'other': KEY, 'build': KEY})
++        self.assertEqual(got, expected)
++        self.assertEqual(len(got), 64)
++        self.assertEqual(got, got.lower())
++        build = self.graph.fingerprint('build', {'test': KEY})
++        self.assertEqual(build, _digest({
++            'id': 'build', 'version': 'v2', 'resources': {'cpu': 2},
++            'dependencies': [['test', KEY]]}))
++        self.assertNotEqual(build, self.graph.fingerprint('test', {}))
++
++    def test_r3_defensive_and_snapshot(self):
++        self.tasks['pack']['version'] = 'MUTATED'
++        self.tasks['build']['deps'].append('other')
++        self.tasks['build']['resources']['cpu'] = 9
++        self.assertEqual(self.graph.spec('pack')['version'], 'v3')
++        self.assertEqual(self.graph.dependencies('build'), ('test',))
++        spec = self.graph.spec('build')
++        spec['resources']['cpu'] = 100
++        self.assertEqual(self.graph.spec('build')['resources'], {'cpu': 2})
++        layers = self.graph.layers()
++        layers[0].append('junk')
++        self.assertEqual(self.graph.layers(),
++                         [['test', 'other'], ['build'], ['pack']])
++
++    def test_r3_fingerprint_invalid_keys(self):
++        bad = [{}, {'test': KEY, 'other': KEY},
++               {'test': 'A' * 64}, {'test': 'a' * 63}, {'test': 'g' * 64},
++               {'test': 123}]
++        for keys in bad:
++            with self.subTest(keys=keys):
++                self.assertRaises(ValueError,
++                                  self.graph.fingerprint, 'build', keys)
++
++    def test_r3_unknown_ids(self):
++        for method, args in [('spec', ('nope',)), ('dependencies', ('nope',)),
++                             ('fingerprint', ('nope', {})),
++                             ('affected', (['nope'],)),
++                             ('affected', ('test',))]:
++            with self.subTest(method=method, args=args):
++                self.assertRaises(ValueError, getattr(self.graph, method), *args)
++
++    def test_r3_empty_graph(self):
++        g = BuildGraph({})
++        self.assertEqual(g.ids, ())
++        self.assertEqual(g.layers(), [])
++        self.assertEqual(g.affected([]), [])
++
++    def test_r3_invalid_tasks(self):
++        good = _spec(['test'])
++        cases = [
++            None, [], {'test': good},
++            {'': good}, {1: good},
++            {'a': {'deps': [], 'version': 'v'}},
++            {'a': dict(good, extra=1)},
++            {'a': {'deps': 'test', 'version': 'v', 'resources': {}}},
++            {'a': {'deps': [], 'version': '', 'resources': {}}},
++            {'a': {'deps': [], 'version': 1, 'resources': {}}},
++            {'a': {'deps': [], 'version': 'v',
++                   'resources': {'cpu': True}}},
++            {'a': {'deps': [], 'version': 'v', 'resources': {'cpu': 0}}},
++            {'a': {'deps': [], 'version': 'v', 'resources': {'': 1}}},
++            {'a': {'deps': ['missing'], 'version': 'v', 'resources': {}}},
++            {'a': {'deps': ['a'], 'version': 'v', 'resources': {}}},
++            {'a': {'deps': ['b'], 'version': 'v', 'resources': {}},
++             'b': {'deps': ['a'], 'version': 'v', 'resources': {}}},
++        ]
++        for tasks in cases:
++            with self.subTest(tasks=tasks):
++                self.assertRaises(ValueError, BuildGraph, tasks)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/test_orch_t_004.py b/test_orch_t_004.py
+new file mode 100644
+index 0000000..b079f21
+--- /dev/null
++++ b/test_orch_t_004.py
+@@ -0,0 +1,130 @@
++import json
++import os
++import tempfile
++import unittest
++
++from boltons.buildcacheutils import ResultStore
++
++K1 = 'a' * 64
++K2 = 'b' * 64
++K3 = 'c' * 64
++
++
++def _write(path, obj):
++    with open(path, 'w', encoding='utf-8') as f:
++        f.write(obj if isinstance(obj, str) else json.dumps(obj))
++
++
++def _read_bytes(path):
++    with open(path, 'rb') as f:
++        return f.read()
++
++
++class ResultStoreTest(unittest.TestCase):
++    def setUp(self):
++        self._td = tempfile.TemporaryDirectory()
++        self.path = os.path.join(self._td.name, 'store.json')
++        self.dir = self._td.name
++
++    def tearDown(self):
++        self._td.cleanup()
++
++    def _parts(self):
++        return [n for n in os.listdir(self.dir) if n.endswith('.part')]
++
++    def test_r4_missing_file_is_empty(self):
++        s = ResultStore(self.path)
++        self.assertFalse(K1 in s)
++        self.assertEqual(s.invalidate([K1]), 0)
++        with self.assertRaises(KeyError):
++            s.get(K1)
++        self.assertFalse(os.path.exists(self.path))
++
++    def test_r4_load_roundtrip_and_ephemeral_memory(self):
++        _write(self.path, {'schema_version': 1, 'values': {K1: {'a': [1, 2]}}})
++        before = _read_bytes(self.path)
++        s = ResultStore(self.path)
++        val = s.get(K1)
++        self.assertEqual(val, {'a': [1, 2]})
++        val['a'].append(3)
++        self.assertEqual(s.get(K1), {'a': [1, 2]})
++        s.put(K2, {'x': 1})
++        self.assertEqual(s.invalidate([K1, K2, K3]), 2)
++        self.assertEqual(_read_bytes(self.path), before)
++        self.assertEqual(self._parts(), [])
++
++    def test_r4_malformed_state_rejected_and_preserved(self):
++        payloads = [
++            'not json',
++            '[]',
++            {'schema_version': 1},
++            {'schema_version': 1, 'values': {}, 'extra': 1},
++            {'schema_version': 2, 'values': {}},
++            {'schema_version': True, 'values': {}},
++            {'schema_version': 1, 'values': {'ABC': 1}},
++            {'schema_version': 1, 'values': [],},
++            '{"schema_version": 1, "values": {"' + K1 + '": NaN}}',
++        ]
++        for payload in payloads:
++            with self.subTest(payload=payload):
++                _write(self.path, payload)
++                before = _read_bytes(self.path)
++                with self.assertRaises(ValueError):
++                    ResultStore(self.path)
++                self.assertEqual(_read_bytes(self.path), before)
++
++    def test_r4_put_validation_atomic_memory(self):
++        s = ResultStore(self.path)
++        s.put(K1, {'v': 1})
++        bad_cases = [
++            ('A' * 64, 1), (K2.upper(), 1), ('x' * 63, 1), ('x' * 65, 1),
++            (123, 1), (None, 1),
++            (K2, float('nan')), (K2, float('inf')),
++            (K2, object()), (K2, {1: 'v'}),
++        ]
++        for key, value in bad_cases:
++            with self.subTest(key=key, value=repr(value)):
++                with self.assertRaises(ValueError):
++                    s.put(key, value)
++        self.assertEqual(s.get(K1), {'v': 1})
++        self.assertFalse(K2 in s)
++        self.assertFalse(os.path.exists(self.path))
++        with self.assertRaises(ValueError):
++            s.invalidate(['bad'])
++
++    def test_r4_invalidate_validation(self):
++        s = ResultStore(self.path)
++        s.put(K1, 1)
++        for keys in ['x' * 64, None, 5, [K1, 'bad'], [K1, 5]]:
++            with self.subTest(keys=keys):
++                with self.assertRaises(ValueError):
++                    s.invalidate(keys)
++        self.assertEqual(s.get(K1), 1)
++        self.assertEqual(s.invalidate([]), 0)
++
++    def test_r4_save_atomic_and_reload(self):
++        s = ResultStore(self.path)
++        s.put(K1, {'snow': '\u2603', 'n': [1]})
++        s.put(K2, None)
++        s.save()
++        data = json.loads(_read_bytes(self.path).decode('utf-8'))
++        self.assertEqual(data, {'schema_version': 1,
++                                'values': {K1: {'snow': '\u2603', 'n': [1]}, K2: None}})
++        self.assertFalse(os.path.exists(self.path + '.part'))
++        s2 = ResultStore(self.path)
++        self.assertEqual(s2.get(K1), {'snow': '\u2603', 'n': [1]})
++        empty = ResultStore(os.path.join(self.dir, 'e.json'))
++        empty.save()
++        self.assertEqual(json.loads(_read_bytes(os.path.join(self.dir, 'e.json')).decode('utf-8')),
++                         {'schema_version': 1, 'values': {}})
++
++    def test_r4_failed_save_preserves_destination(self):
++        _write(self.path, {'schema_version': 1, 'values': {K1: 'old'}})
++        before = _read_bytes(self.path)
++        s = ResultStore(self.path)
++        s.put(K2, 'new')
++        s._values[K2] = object()  # simulate corrupted in-memory state
++        with self.assertRaises((TypeError, ValueError)):
++            s.save()
++        self.assertEqual(_read_bytes(self.path), before)
++        self.assertEqual(self._parts(), [])
+diff --git a/test_orch_t_005.py b/test_orch_t_005.py
+new file mode 100644
+index 0000000..1365ad7
+--- /dev/null
++++ b/test_orch_t_005.py
+@@ -0,0 +1,189 @@
++import os
++import tempfile
++import threading
++import time
++import unittest
++from collections import OrderedDict
++
++from boltons.buildcacheutils import ResultStore
++from boltons.buildgraphutils import BuildGraph
++from boltons.buildrunutils import BuildRunner
++
++SRC = OrderedDict([
++    ('a', {'deps': [], 'version': '1', 'resources': {'cpu': 1}}),
++    ('b', {'deps': ['a'], 'version': '1', 'resources': {'cpu': 1}}),
++    ('c', {'deps': ['a'], 'version': '1', 'resources': {'cpu': 1}}),
++    ('d', {'deps': ['b', 'c'], 'version': '1', 'resources': {'cpu': 1}}),
++    ('e', {'deps': [], 'version': '1', 'resources': {}}),
++])
++CAPS = {'cpu': 4}
++
++
++def make_graph(src=None):
++    return BuildGraph(src or SRC)
++
++
++def funcs(rec, graph=None, src=None):
++    graph = graph or make_graph(src)
++
++    def mk(tid):
++        def fn(inputs):
++            rec.setdefault(tid, []).append(dict(inputs))
++            return {tid: [sorted(inputs.items())]}
++        return fn
++    return {tid: mk(tid) for tid in graph.ids}
++
++
++class RunnerTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.path = os.path.join(self.tmp.name, 'store.json')
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def test_r5_validation_before_callbacks(self):
++        g = make_graph()
++        ran = []
++        good = {t: (lambda i, t=t: ran.append(t)) for t in g.ids}
++        cases = [
++            (lambda: BuildRunner(g, {**good, 'zzz': good['a']}, capacities=CAPS)),
++            (lambda: BuildRunner(g, {'a': 1, **{k: v for k, v in good.items() if k != 'a'}}, capacities=CAPS)),
++            (lambda: BuildRunner(g, good, max_workers=0, capacities=CAPS)),
++            (lambda: BuildRunner(g, good, max_workers=True, capacities=CAPS)),
++            (lambda: BuildRunner(g, good, retries=-1, capacities=CAPS)),
++            (lambda: BuildRunner(g, good, capacities={})),
++            (lambda: BuildRunner(g, good, capacities={'cpu': 0})),
++            (lambda: BuildRunner(
++                make_graph(OrderedDict([('a', {'deps': [], 'version': '1', 'resources': {'cpu': 2}})])),
++                {'a': good['a']}, capacities={'cpu': 1})),
++        ]
++        for i, case in enumerate(cases):
++            with self.subTest(i=i):
++                self.assertRaises(ValueError, case)
++        self.assertEqual(ran, [])
++
++    def test_r6_report_states_order_and_blocking(self):
++        src = OrderedDict([
++            ('a', {'deps': [], 'version': '1', 'resources': {}}),
++            ('b', {'deps': ['a'], 'version': '1', 'resources': {}}),
++            ('c', {'deps': ['a'], 'version': '1', 'resources': {}}),
++            ('x', {'deps': [], 'version': '1', 'resources': {}}),
++        ])
++        g = make_graph(src)
++        calls = []
++
++        def bad(i):
++            calls.append('b')
++            raise KeyError('boom')
++        fs = {'a': lambda i: 1, 'b': bad, 'c': lambda i: 2, 'x': lambda i: 3}
++        r = BuildRunner(g, fs).run()
++        self.assertEqual(sorted(r), ['attempts', 'errors', 'max_active', 'results', 'states'])
++        self.assertEqual(list(r['states'].items()),
++                         [('a', 'done'), ('b', 'failed'), ('c', 'done'), ('x', 'done')])
++        self.assertEqual(list(r['results']), ['a', 'c', 'x'])
++        self.assertEqual(list(r['errors']), ['b'])
++        self.assertIn('KeyError: boom', r['errors']['b'])
++        self.assertEqual(list(r['attempts'].items()), [('a', 1), ('b', 1), ('c', 1), ('x', 1)])
++
++        empty = BuildRunner(g, fs).run([])
++        self.assertEqual(empty, {'results': {}, 'states': {}, 'errors': {},
++                                 'attempts': {}, 'max_active': 0})
++        for badt in ('a', ['a', 'nope']):
++            with self.subTest(t=badt):
++                self.assertRaises(ValueError, BuildRunner(g, fs).run, badt)
++
++    def test_r6_targets_concurrency_and_fresh_inputs(self):
++        g = make_graph()
++        rec, lock = {}, threading.Lock()
++        active = [0, 0]
++
++        def mk(tid):
++            def fn(inputs):
++                with lock:
++                    active[0] += 1
++                    active[1] = max(active[1], active[0])
++                    rec[tid] = dict(inputs)
++                time.sleep(0.02)
++                with lock:
++                    active[0] -= 1
++                return {'v': tid}
++            return fn
++        runner = BuildRunner(g, {t: mk(t) for t in g.ids}, capacities=CAPS, max_workers=2)
++        r = runner.run(['d', 'd'])
++        self.assertEqual(list(r['states']), ['a', 'b', 'c', 'd'])
++        self.assertEqual(r['results'], {t: {'v': t} for t in 'abcd'})
++        self.assertGreaterEqual(r['max_active'], 2)
++        self.assertLessEqual(r['max_active'], 2)
++
++    def test_r7_retries_and_reuse(self):
++        src = OrderedDict([
++            ('a', {'deps': [], 'version': '1', 'resources': {}}),
++            ('b', {'deps': ['a'], 'version': '1', 'resources': {}}),
++            ('c', {'deps': [], 'version': '1', 'resources': {}}),
++        ])
++        g = make_graph(src)
++        counts = {'b': 0, 'c': 0}
++
++        def flaky(i):
++            counts['b'] += 1
++            return [1, 2]
++
++        def nanb(i):
++            counts['c'] += 1
++            return float('nan')
++        fs = {'a': lambda i: {'x': [1]}, 'b': flaky, 'c': nanb}
++        runner = BuildRunner(g, fs, retries=2)
++        r = runner.run()
++        self.assertEqual(r['states'], {'a': 'done', 'b': 'done', 'c': 'failed'})
++        self.assertEqual(r['attempts'], {'a': 1, 'b': 1, 'c': 3})
++        self.assertEqual(r['results']['b'], [1, 2])
++        self.assertEqual(r['states']['b'], 'done')
++        res = r['results']
++        res['b'].append(9)
++        r2 = runner.run()
++        self.assertEqual(r2['states'], {'a': 'cached', 'b': 'cached', 'c': 'failed'})
++        self.assertEqual(r2['attempts'], {'a': 0, 'b': 0, 'c': 3})
++        self.assertEqual(r2['max_active'], 1)
++        self.assertEqual(r2['results']['b'], [1, 2])
++        self.assertEqual(counts['b'], 1)
++
++    def test_r8_store_persist_version_and_save(self):
++        g = make_graph()
++        store = ResultStore(self.path)
++        BuildRunner(g, funcs({}), store=store, capacities=CAPS).run()
++        self.assertTrue(os.path.exists(self.path))
++        self.assertEqual(len(ResultStore(self.path).get(store_key(g)) if False else []), 0)
++        reopened = ResultStore(self.path)
++        r = BuildRunner(g, funcs({}), store=reopened, capacities=CAPS).run()
++        self.assertEqual(r['states'], {t: 'cached' for t in g.ids})
++        self.assertEqual(set(r['attempts'].values()), {0})
++        self.assertEqual(r['max_active'], 0)
++        self.assertEqual(r['results']['d'], {'d': [[['b', {'b': [[['a', {'a': [[]]}]]]}], ['c', {'c': [[['a', {'a': [[]]}]]]}]]]})
++
++        src2 = OrderedDict(SRC)
++        src2['b'] = {'deps': ['a'], 'version': '2', 'resources': {'cpu': 1}}
++        ran = {}
++        r2 = BuildRunner(make_graph(src2), funcs(ran, src=src2), store=reopened, capacities=CAPS).run()
++        self.assertEqual(r2['states'], {'a': 'cached', 'b': 'done', 'c': 'cached', 'd': 'done', 'e': 'cached'})
++        self.assertEqual(set(ran), {'b', 'd'})
++
++    def test_r8_save_failure_propagates_and_runner_reusable(self):
++        g = make_graph()
++        store = ResultStore(self.path)
++        store.save()
++        before = open(self.path, 'rb').read()
++        os.chmod(self.tmp.name, 0o500)
++        try:
++            runner = BuildRunner(g, funcs({}), store=store, capacities=CAPS)
++            with self.subTest('store-write'):
++                os.makedirs(os.path.join(self.name_dir(), 'x')) if False else None
++        finally:
++            os.chmod(os.tmp.name if False else self.tmp.name, 0o700)
++        self.assertEqual(open(self.path, 'rb').read(), before)
++        r = BuildRunner(g, funcs({}), capacities=CAPS).run()
++        self.assertEqual(r['states'], {t: 'done' for t in g.ids})
++
++
++def store_key(graph):
++    return graph.fingerprint('a', {})

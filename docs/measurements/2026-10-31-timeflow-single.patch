@@ -1,0 +1,2082 @@
+diff --git a/networkx/algorithms/flow/lowerbound.py b/networkx/algorithms/flow/lowerbound.py
+new file mode 100644
+index 0000000..ef46829
+--- /dev/null
++++ b/networkx/algorithms/flow/lowerbound.py
+@@ -0,0 +1,179 @@
++"""
++Minimum cost flow with lower bounds on edge flows.
++
++The problem is reduced to an ordinary minimum cost flow problem by shifting
++every mandatory lower bound into the node demands, and is then solved with
++:func:`~networkx.algorithms.flow.network_simplex`.
++"""
++
++import networkx as nx
++
++__all__ = ["solve_bounded_flow"]
++
++
++def _check_name(name, what):
++    """Raise ValueError unless `name` is a nonempty string."""
++    if not isinstance(name, str) or not name:
++        raise ValueError(f"{what} attribute name must be a nonempty string")
++    return name
++
++
++def _exact_int(value, what):
++    """Raise ValueError unless `value` is an exact (non-bool) int."""
++    if type(value) is not int:
++        raise ValueError(f"{what} must be an exact int, got {value!r}")
++    return value
++
++
++def _check_digraph(G):
++    """Raise ValueError unless `G` is a DiGraph or MultiDiGraph."""
++    if not isinstance(G, nx.Graph) or not G.is_directed():
++        raise ValueError("G must be a DiGraph or MultiDiGraph")
++
++
++def _edge_bounds(data, capacity, weight, lower, what):
++    """Validate one edge record and return ``(lower, capacity, weight)``.
++
++    `capacity` is required and must be a nonnegative exact int; `weight`
++    defaults to 0 and `lower` defaults to 0 and must lie in ``[0, capacity]``.
++    """
++    if capacity not in data:
++        raise ValueError(f"{what} has no {capacity!r} attribute")
++    cap = _exact_int(data[capacity], f"capacity of {what}")
++    if cap < 0:
++        raise ValueError(f"capacity of {what} is negative")
++    w = _exact_int(data.get(weight, 0), f"weight of {what}")
++    lo = _exact_int(data.get(lower, 0), f"lower bound of {what}")
++    if not 0 <= lo <= cap:
++        raise ValueError(f"lower bound of {what} is not between 0 and capacity")
++    return lo, cap, w
++
++
++def _edges(G):
++    """Yield ``(u, v, key, data)`` for every edge; DiGraph keys are None."""
++    if G.is_multigraph():
++        yield from G.edges(keys=True, data=True)
++    else:
++        for u, v, data in G.edges(data=True):
++            yield u, v, None, data
++
++
++def _graph_edges(G, capacity, weight, lower):
++    """Return validated ``(u, v, key, lower, capacity, weight)`` edge tuples."""
++    edges = []
++    for u, v, key, data in _edges(G):
++        what = f"edge {(u, v) if key is None else (u, v, key)!r}"
++        edges.append((u, v, key) + _edge_bounds(data, capacity, weight, lower, what))
++    return edges
++
++
++def _check_names(demand, capacity, weight, lower):
++    _check_name(demand, "demand")
++    _check_name(capacity, "capacity")
++    _check_name(weight, "weight")
++    _check_name(lower, "lower")
++
++
++def _solve_indexed(demands, arcs):
++    """Solve a bounded min cost flow problem over integer-indexed nodes.
++
++    `demands` lists the demand of nodes ``0 .. n-1`` and `arcs` lists
++    ``(u, v, lower, capacity, weight)`` tuples. Returns the flow of every arc.
++    Raises NetworkXUnfeasible if no flow satisfies demands and bounds.
++    """
++    if sum(demands) != 0:
++        raise nx.NetworkXUnfeasible("total node demand is not zero")
++    if not demands:
++        return []
++    reduced = list(demands)
++    for u, v, lo, _, _ in arcs:
++        reduced[v] -= lo
++        reduced[u] += lo
++    H = nx.MultiDiGraph()
++    H.add_nodes_from((i, {"demand": d}) for i, d in enumerate(reduced))
++    for i, (u, v, lo, cap, w) in enumerate(arcs):
++        H.add_edge(u, v, key=i, capacity=cap - lo, weight=w)
++    flow_dict = nx.network_simplex(H)[1]
++    return [lo + flow_dict[u][v][i] for i, (u, v, lo, _, _) in enumerate(arcs)]
++
++
++def _index_arcs(G, edges):
++    """Return node index map and indexed arcs for validated `edges` of G."""
++    index = {u: i for i, u in enumerate(G)}
++    arcs = [(index[u], index[v], lo, cap, w) for u, v, _, lo, cap, w in edges]
++    return index, arcs
++
++
++def _flow_dict(G, edges, flows):
++    """Build the usual NetworkX flow dict for `edges` carrying `flows`."""
++    flow_dict = {u: {} for u in G}
++    if G.is_multigraph():
++        for (u, v, key, *_), f in zip(edges, flows):
++            flow_dict[u].setdefault(v, {})[key] = f
++    else:
++        for (u, v, *_), f in zip(edges, flows):
++            flow_dict[u][v] = f
++    return flow_dict
++
++
++def solve_bounded_flow(
++    G, demand="demand", capacity="capacity", weight="weight", lower="lower"
++):
++    """Returns a minimum cost flow satisfying demands and edge lower bounds.
++
++    Parameters
++    ----------
++    G : DiGraph or MultiDiGraph
++        Self-loops, reverse and parallel edges are allowed.
++
++    demand : string
++        Node attribute holding the exact int demand (inflow minus outflow).
++        Missing demands are 0.
++
++    capacity : string
++        Required edge attribute holding the exact nonnegative int capacity.
++
++    weight : string
++        Edge attribute holding the exact int cost per unit of flow
++        (default 0). Negative weights are allowed.
++
++    lower : string
++        Edge attribute holding the exact int lower bound on the flow,
++        between 0 and the capacity (default 0).
++
++    Returns
++    -------
++    (cost, flow_dict) : tuple
++        The minimum cost and a flow dict keyed like ``flow_dict[u][v]``, or
++        ``flow_dict[u][v][key]`` for multigraphs, containing every edge.
++
++    Raises
++    ------
++    ValueError
++        If the graph, attribute names or attribute values are malformed.
++
++    NetworkXUnfeasible
++        If no flow satisfies all demands and edge bounds.
++
++    Examples
++    --------
++    >>> from networkx.algorithms.flow.lowerbound import solve_bounded_flow
++    >>> G = nx.DiGraph()
++    >>> G.add_node("a", demand=-3)
++    >>> G.add_node("b", demand=3)
++    >>> G.add_edge("a", "b", capacity=5, weight=1)
++    >>> G.add_edge("b", "a", capacity=2, weight=1, lower=1)
++    >>> solve_bounded_flow(G)
++    (5, {'a': {'b': 4}, 'b': {'a': 1}})
++    """
++    _check_digraph(G)
++    _check_names(demand, capacity, weight, lower)
++    demands = [
++        _exact_int(d.get(demand, 0), f"demand of node {u!r}")
++        for u, d in G.nodes(data=True)
++    ]
++    edges = _graph_edges(G, capacity, weight, lower)
++    _, arcs = _index_arcs(G, edges)
++    flows = _solve_indexed(demands, arcs)
++    cost = sum(f * e[-1] for e, f in zip(edges, flows))
++    return cost, _flow_dict(G, edges, flows)
+diff --git a/networkx/algorithms/flow/lowerbound_max.py b/networkx/algorithms/flow/lowerbound_max.py
+new file mode 100644
+index 0000000..3d4f86b
+--- /dev/null
++++ b/networkx/algorithms/flow/lowerbound_max.py
+@@ -0,0 +1,96 @@
++"""
++Maximum (s, t)-flow of minimum cost with lower bounds on edge flows.
++"""
++
++import networkx as nx
++from networkx.algorithms.flow.lowerbound import (
++    _check_digraph,
++    _check_names,
++    _exact_int,
++    _flow_dict,
++    _graph_edges,
++    _index_arcs,
++    _solve_indexed,
++)
++
++__all__ = ["max_flow"]
++
++
++def _check_terminal(G, node, what):
++    try:
++        present = node in G
++    except TypeError:
++        present = False
++    if not present:
++        raise ValueError(f"{what} {node!r} is not a node of G")
++
++
++def max_flow(G, s, t, capacity="capacity", weight="weight", lower="lower"):
++    """Returns a maximum (s, t)-flow of minimum cost respecting lower bounds.
++
++    The flow maximizes the nonnegative net outflow of `s`, conserving flow
++    at every other node except `t`, and minimizes the total cost among all
++    such maximum flows. Edge attributes follow the rules of
++    :func:`~networkx.algorithms.flow.lowerbound.solve_bounded_flow`.
++
++    The problem is solved by two polynomial reductions to bounded minimum
++    cost flow, with an auxiliary return arc ``t -> s``: the first maximizes
++    the return arc flow, the second fixes it and minimizes the cost.
++
++    Parameters
++    ----------
++    G : DiGraph or MultiDiGraph
++        Node ``"demand"`` attributes, if present, must be the exact int 0.
++
++    s, t : nodes
++        Distinct source and sink nodes of `G`.
++
++    capacity, weight, lower : string
++        Edge attribute names as in `solve_bounded_flow`.
++
++    Returns
++    -------
++    flow_dict : dict
++        Flow dict containing every edge of `G`, keyed by edge key for
++        multigraphs.
++
++    Raises
++    ------
++    ValueError
++        If the input is malformed.
++
++    NetworkXUnfeasible
++        If no flow with nonnegative net source outflow respects all bounds.
++
++    Examples
++    --------
++    >>> from networkx.algorithms.flow.lowerbound_max import max_flow
++    >>> G = nx.DiGraph()
++    >>> G.add_edge("s", "a", capacity=4, weight=1)
++    >>> G.add_edge("a", "t", capacity=3, weight=1)
++    >>> G.add_edge("a", "s", capacity=2, lower=1)
++    >>> max_flow(G, "s", "t")
++    {'s': {'a': 4}, 'a': {'t': 3, 's': 1}, 't': {}}
++    """
++    _check_digraph(G)
++    _check_names("demand", capacity, weight, lower)
++    _check_terminal(G, s, "source")
++    _check_terminal(G, t, "sink")
++    if s == t:
++        raise ValueError("source and sink must be distinct")
++    for u, d in G.nodes(data=True):
++        if _exact_int(d.get("demand", 0), f"demand of node {u!r}") != 0:
++            raise ValueError(f"demand of node {u!r} must be 0")
++    edges = _graph_edges(G, capacity, weight, lower)
++    index, arcs = _index_arcs(G, edges)
++    si, ti = index[s], index[t]
++    demands = [0] * len(index)
++    # The net outflow of s is bounded by the total capacity leaving s.
++    bound = sum(cap for u, v, _, _, cap, _ in edges if u == s and v != s)
++    # Phase 1: maximize the flow returning from t to s, ignoring costs.
++    phase1 = [(u, v, lo, cap, 0) for u, v, lo, cap, _ in arcs]
++    phase1.append((ti, si, 0, bound, -1))
++    value = _solve_indexed(demands, phase1)[-1]
++    # Phase 2: fix the flow value and minimize the cost.
++    flows = _solve_indexed(demands, arcs + [(ti, si, value, value, 0)])
++    return _flow_dict(G, edges, flows[:-1])
+diff --git a/networkx/algorithms/flow/mincost.py b/networkx/algorithms/flow/mincost.py
+index 2f9390d..e921891 100644
+--- a/networkx/algorithms/flow/mincost.py
++++ b/networkx/algorithms/flow/mincost.py
+@@ -5,12 +5,17 @@ Minimum cost flow algorithms on directed connected graphs.
+ __all__ = ["min_cost_flow_cost", "min_cost_flow", "cost_of_flow", "max_flow_min_cost"]
+ 
+ import networkx as nx
++from networkx.algorithms.flow.lowerbound import solve_bounded_flow
++from networkx.algorithms.flow.lowerbound_max import max_flow as bounded_max_flow
+ 
+ 
+ @nx._dispatchable(
+-    node_attrs="demand", edge_attrs={"capacity": float("inf"), "weight": 0}
++    node_attrs="demand",
++    edge_attrs={"capacity": float("inf"), "weight": 0, "lower": 0},
+ )
+-def min_cost_flow_cost(G, demand="demand", capacity="capacity", weight="weight"):
++def min_cost_flow_cost(
++    G, demand="demand", capacity="capacity", weight="weight", *, lower=None
++):
+     r"""Find the cost of a minimum cost flow satisfying all demands in digraph G.
+ 
+     G is a digraph with edge costs and capacities and in which nodes
+@@ -46,6 +51,13 @@ def min_cost_flow_cost(G, demand="demand", capacity="capacity", weight="weight")
+         that edge. If not present, the weight is considered to be 0.
+         Default value: 'weight'.
+ 
++    lower : string or None, keyword-only
++        If None (default), edges have no lower bounds. Otherwise the name
++        of an edge attribute holding a lower bound on the edge flow, and
++        the problem is solved by
++        :func:`~networkx.algorithms.flow.lowerbound.solve_bounded_flow`,
++        which requires exact integer data and capacities on every edge.
++
+     Returns
+     -------
+     flowCost : integer, float
+@@ -57,6 +69,10 @@ def min_cost_flow_cost(G, demand="demand", capacity="capacity", weight="weight")
+         This exception is raised if the input graph is not directed or
+         not connected.
+ 
++    ValueError
++        This exception is raised if `lower` is given and the input is
++        malformed.
++
+     NetworkXUnfeasible
+         This exception is raised in the following situations:
+ 
+@@ -96,13 +112,18 @@ def min_cost_flow_cost(G, demand="demand", capacity="capacity", weight="weight")
+     >>> flowCost
+     24
+     """
++    if lower is not None:
++        return solve_bounded_flow(G, demand, capacity, weight, lower)[0]
+     return nx.network_simplex(G, demand=demand, capacity=capacity, weight=weight)[0]
+ 
+ 
+ @nx._dispatchable(
+-    node_attrs="demand", edge_attrs={"capacity": float("inf"), "weight": 0}
++    node_attrs="demand",
++    edge_attrs={"capacity": float("inf"), "weight": 0, "lower": 0},
+ )
+-def min_cost_flow(G, demand="demand", capacity="capacity", weight="weight"):
++def min_cost_flow(
++    G, demand="demand", capacity="capacity", weight="weight", *, lower=None
++):
+     r"""Returns a minimum cost flow satisfying all demands in digraph G.
+ 
+     G is a digraph with edge costs and capacities and in which nodes
+@@ -138,6 +159,13 @@ def min_cost_flow(G, demand="demand", capacity="capacity", weight="weight"):
+         that edge. If not present, the weight is considered to be 0.
+         Default value: 'weight'.
+ 
++    lower : string or None, keyword-only
++        If None (default), edges have no lower bounds. Otherwise the name
++        of an edge attribute holding a lower bound on the edge flow, and
++        the problem is solved by
++        :func:`~networkx.algorithms.flow.lowerbound.solve_bounded_flow`,
++        which requires exact integer data and capacities on every edge.
++
+     Returns
+     -------
+     flowDict : dictionary
+@@ -150,6 +178,10 @@ def min_cost_flow(G, demand="demand", capacity="capacity", weight="weight"):
+         This exception is raised if the input graph is not directed or
+         not connected.
+ 
++    ValueError
++        This exception is raised if `lower` is given and the input is
++        malformed.
++
+     NetworkXUnfeasible
+         This exception is raised in the following situations:
+ 
+@@ -189,6 +221,8 @@ def min_cost_flow(G, demand="demand", capacity="capacity", weight="weight"):
+     >>> flowDict
+     {'a': {'b': 4, 'c': 1}, 'd': {}, 'b': {'d': 4}, 'c': {'d': 1}}
+     """
++    if lower is not None:
++        return solve_bounded_flow(G, demand, capacity, weight, lower)[1]
+     return nx.network_simplex(G, demand=demand, capacity=capacity, weight=weight)[1]
+ 
+ 
+@@ -214,7 +248,8 @@ def cost_of_flow(G, flowDict, weight="weight"):
+ 
+     flowDict : dictionary
+         Dictionary of dictionaries keyed by nodes such that
+-        flowDict[u][v] is the flow edge (u, v).
++        flowDict[u][v] is the flow edge (u, v). For a MultiDiGraph,
++        flowDict[u][v][key] is the flow on the edge (u, v, key).
+ 
+     Returns
+     -------
+@@ -249,11 +284,16 @@ def cost_of_flow(G, flowDict, weight="weight"):
+     >>> nx.cost_of_flow(G, flowDict)
+     24
+     """
++    if G.is_multigraph():
++        return sum(
++            flowDict[u][v][k] * d.get(weight, 0)
++            for u, v, k, d in G.edges(keys=True, data=True)
++        )
+     return sum((flowDict[u][v] * d.get(weight, 0) for u, v, d in G.edges(data=True)))
+ 
+ 
+-@nx._dispatchable(edge_attrs={"capacity": float("inf"), "weight": 0})
+-def max_flow_min_cost(G, s, t, capacity="capacity", weight="weight"):
++@nx._dispatchable(edge_attrs={"capacity": float("inf"), "weight": 0, "lower": 0})
++def max_flow_min_cost(G, s, t, capacity="capacity", weight="weight", *, lower=None):
+     """Returns a maximum (s, t)-flow of minimum cost.
+ 
+     G is a digraph with edge costs and capacities. There is a source
+@@ -284,6 +324,14 @@ def max_flow_min_cost(G, s, t, capacity="capacity", weight="weight"):
+         that edge. If not present, the weight is considered to be 0.
+         Default value: 'weight'.
+ 
++    lower: string or None, keyword-only
++        If None (default), edges have no lower bounds. Otherwise the name
++        of an edge attribute holding a lower bound on the edge flow, and
++        the problem is solved by
++        :func:`~networkx.algorithms.flow.lowerbound_max.max_flow`, which
++        maximizes the nonnegative net outflow of s and requires exact
++        integer data and capacities on every edge.
++
+     Returns
+     -------
+     flowDict: dictionary
+@@ -296,6 +344,14 @@ def max_flow_min_cost(G, s, t, capacity="capacity", weight="weight"):
+         This exception is raised if the input graph is not directed or
+         not connected.
+ 
++    ValueError
++        This exception is raised if `lower` is given and the input is
++        malformed.
++
++    NetworkXUnfeasible
++        This exception is raised if `lower` is given and no flow with
++        nonnegative net outflow of s respects all edge bounds.
++
+     NetworkXUnbounded
+         This exception is raised if there is an infinite capacity path
+         from s to t in G. In this case there is no maximum flow. This
+@@ -349,6 +405,8 @@ def max_flow_min_cost(G, s, t, capacity="capacity", weight="weight"):
+     True
+ 
+     """
++    if lower is not None:
++        return bounded_max_flow(G, s, t, capacity, weight, lower)
+     maxFlow = nx.maximum_flow_value(G, s, t, capacity=capacity)
+     H = nx.DiGraph(G)
+     H.add_node(s, demand=-maxFlow)
+diff --git a/networkx/algorithms/flow/timeaudit.py b/networkx/algorithms/flow/timeaudit.py
+new file mode 100644
+index 0000000..251d924
+--- /dev/null
++++ b/networkx/algorithms/flow/timeaudit.py
+@@ -0,0 +1,98 @@
++"""
++Edge outage analysis for temporal transshipment problems.
++"""
++
++import networkx as nx
++from networkx.algorithms.flow.timeflow import _check_label, _validate
++from networkx.algorithms.flow.timeschedule import solve
++
++__all__ = ["analyze"]
++
++
++def _outages(G, scenarios):
++    """Validate `scenarios` and return ``{name: set of (u, v, key)}``."""
++    if not isinstance(scenarios, dict):
++        raise ValueError("scenarios must be a dict")
++    multigraph = G.is_multigraph()
++    result = {}
++    for name, triples in scenarios.items():
++        _check_label(name, "scenario name")
++        if not isinstance(triples, list | tuple):
++            raise ValueError(f"scenario {name!r} must be a list of edges")
++        edges = set()
++        for triple in triples:
++            if not isinstance(triple, tuple | list) or len(triple) != 3:
++                raise ValueError(f"scenario {name!r} edge {triple!r} is not a triple")
++            u, v, key = triple
++            if not (isinstance(u, str) and isinstance(v, str)):
++                raise ValueError(f"scenario {name!r} edge {triple!r} is not in G")
++            if multigraph:
++                valid = isinstance(key, str) and G.has_edge(u, v, key)
++            else:
++                valid = key is None and G.has_edge(u, v)
++            if not valid:
++                raise ValueError(f"scenario {name!r} edge {triple!r} is not in G")
++            edges.add((u, v, key))
++        result[name] = edges
++    return result
++
++
++def analyze(G, horizon, balances, scenarios, storage=None):
++    """Returns the cost impact of independent physical edge outages.
++
++    Parameters
++    ----------
++    G, horizon, balances, storage
++        As in :func:`~networkx.algorithms.flow.timeflow.expand`.
++
++    scenarios : dict
++        Maps nonempty string names to lists of ``(u, v, key)`` physical
++        edges (tuples or lists) removed together; `key` is None for a
++        DiGraph. Each scenario is evaluated independently.
++
++    Returns
++    -------
++    report : dict
++        ``{"baseline_cost": cost, "scenarios": {name: result}}`` with names
++        sorted, where `result` is ``{"feasible": bool, "cost": c,
++        "delta": c - cost}`` and `c` and the delta are None if the
++        scenario is infeasible.
++
++    Raises
++    ------
++    ValueError
++        If any input is malformed.
++
++    NetworkXUnfeasible
++        If the baseline problem is infeasible.
++
++    Examples
++    --------
++    >>> from networkx.algorithms.flow.timeaudit import analyze
++    >>> G = nx.DiGraph()
++    >>> G.add_edge("a", "b", capacity=2, weight=1)
++    >>> G.add_edge("a", "c", capacity=2, weight=1)
++    >>> G.add_edge("c", "b", capacity=2, weight=1)
++    >>> balances = {("a", 0): -1, ("b", 2): 1}
++    >>> storage = {"b": {"capacity": 1}}
++    >>> scenarios = {"cut": [("a", "b", None)], "none": []}
++    >>> analyze(G, 2, balances, scenarios, storage)
++    {'baseline_cost': 1, 'scenarios': {'cut': {'feasible': True, 'cost': 2, 'delta': 1}, 'none': {'feasible': True, 'cost': 1, 'delta': 0}}}
++    """
++    _validate(G, horizon, balances, storage)
++    outages = _outages(G, scenarios)
++    baseline = solve(G, horizon, balances, storage)["cost"]
++    results = {}
++    for name in sorted(outages):
++        H = G.copy()
++        H.remove_edges_from(
++            outages[name] if H.is_multigraph() else (e[:2] for e in outages[name])
++        )
++        try:
++            cost = solve(H, horizon, balances, storage)["cost"]
++        except nx.NetworkXUnfeasible:
++            results[name] = {"feasible": False, "cost": None, "delta": None}
++        else:
++            delta = cost - baseline
++            results[name] = {"feasible": True, "cost": cost, "delta": delta}
++    return {"baseline_cost": baseline, "scenarios": results}
+diff --git a/networkx/algorithms/flow/timecli.py b/networkx/algorithms/flow/timecli.py
+new file mode 100644
+index 0000000..0b04883
+--- /dev/null
++++ b/networkx/algorithms/flow/timecli.py
+@@ -0,0 +1,178 @@
++"""
++Command line interface for temporal transshipment problems.
++
++Usage::
++
++    python -m networkx.algorithms.flow.timecli solve INPUT --output PATH
++    python -m networkx.algorithms.flow.timecli audit INPUT --output PATH
++
++The input JSON object has ``nodes``, ``edges``, ``horizon`` and ``balances``
++and optionally ``storage`` and ``scenarios``. ``solve`` writes
++``{"schedule": ..., "shipments": ...}`` and ``audit`` writes the outage
++report of :func:`~networkx.algorithms.flow.timeaudit.analyze`.
++"""
++
++import argparse
++import json
++import math
++import sys
++
++import networkx as nx
++from networkx.algorithms.flow.timeaudit import analyze
++from networkx.algorithms.flow.timedecompose import paths
++from networkx.algorithms.flow.timeio import save_json
++from networkx.algorithms.flow.timeschedule import solve
++
++__all__ = ["main"]
++
++_REQUIRED = frozenset({"nodes", "edges", "horizon", "balances"})
++_OPTIONAL = frozenset({"storage", "scenarios"})
++_EDGE_REQUIRED = frozenset({"source", "target", "key", "capacity"})
++_EDGE_OPTIONAL = frozenset({"weight", "lower", "transit"})
++_BALANCE_FIELDS = frozenset({"node", "time", "demand"})
++
++
++def _reject_constant(name):
++    raise ValueError(f"nonfinite number {name} in input")
++
++
++def _finite_float(text):
++    value = float(text)
++    if not math.isfinite(value):
++        raise ValueError(f"nonfinite number {text} in input")
++    return value
++
++
++def _unique_object(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError(f"duplicate key {key!r} in input")
++        result[key] = value
++    return result
++
++
++def _load(text):
++    """Parse strict JSON input text."""
++    return json.loads(
++        text,
++        parse_constant=_reject_constant,
++        parse_float=_finite_float,
++        object_pairs_hook=_unique_object,
++    )
++
++
++def _check_fields(record, required, optional, what):
++    if not isinstance(record, dict):
++        raise ValueError(f"{what} must be an object")
++    missing = required - set(record)
++    if missing:
++        raise ValueError(f"{what} lacks fields {sorted(missing)}")
++    extra = set(record) - required - optional
++    if extra:
++        raise ValueError(f"{what} has unknown fields {sorted(extra)}")
++
++
++def _nonempty_str(value, what):
++    if not isinstance(value, str) or not value:
++        raise ValueError(f"{what} must be a nonempty string, got {value!r}")
++
++
++def _graph(nodes, edges):
++    """Build the physical MultiDiGraph from input node and edge lists."""
++    if not isinstance(nodes, list):
++        raise ValueError("nodes must be a list")
++    for node in nodes:
++        _nonempty_str(node, "node")
++    if len(set(nodes)) != len(nodes):
++        raise ValueError("nodes must be unique")
++    if not isinstance(edges, list):
++        raise ValueError("edges must be a list")
++    G = nx.MultiDiGraph()
++    G.add_nodes_from(nodes)
++    for edge in edges:
++        _check_fields(edge, _EDGE_REQUIRED, _EDGE_OPTIONAL, "edge")
++        u, v, key = edge["source"], edge["target"], edge["key"]
++        for end in (u, v):
++            if not isinstance(end, str) or end not in G:
++                raise ValueError(f"edge endpoint {end!r} is not a node")
++        _nonempty_str(key, "edge key")
++        if G.has_edge(u, v, key):
++            raise ValueError(f"duplicate edge {(u, v, key)!r}")
++        attrs = {f: edge[f] for f in edge if f not in ("source", "target", "key")}
++        G.add_edge(u, v, key=key, **attrs)
++    return G
++
++
++def _balances(records):
++    """Convert input balance records to a ``{(node, time): demand}`` dict."""
++    if not isinstance(records, list):
++        raise ValueError("balances must be a list")
++    balances = {}
++    for record in records:
++        _check_fields(record, _BALANCE_FIELDS, frozenset(), "balance")
++        node, time, demand = record["node"], record["time"], record["demand"]
++        if not isinstance(node, str) or type(time) is not int:
++            raise ValueError(f"balance {record!r} is malformed")
++        if type(demand) is not int:
++            raise ValueError(f"balance {record!r} demand must be an exact int")
++        if (node, time) in balances:
++            raise ValueError(f"duplicate balance for {(node, time)!r}")
++        balances[node, time] = demand
++    return balances
++
++
++def _problem(data):
++    """Validate input data and return ``(G, horizon, balances, storage)``."""
++    _check_fields(data, _REQUIRED, _OPTIONAL, "input")
++    G = _graph(data["nodes"], data["edges"])
++    return G, data["horizon"], _balances(data["balances"]), data.get("storage")
++
++
++def _parser():
++    parser = argparse.ArgumentParser(
++        prog="timecli", description="Solve temporal transshipment problems."
++    )
++    commands = parser.add_subparsers(dest="command", required=True)
++    for name, text in (
++        ("solve", "write a minimum cost schedule and its shipments"),
++        ("audit", "write the cost impact of edge outage scenarios"),
++    ):
++        command = commands.add_parser(name, help=text, description=text)
++        command.add_argument("input", metavar="INPUT", help="input JSON file")
++        command.add_argument(
++            "--output", metavar="PATH", required=True, help="output JSON file"
++        )
++    return parser
++
++
++def main(argv=None):
++    """Run the command line interface and return the exit status.
++
++    Returns 0 on success (and for ``--help``) and 2 after printing an error
++    message to stderr; an existing output file is left unchanged on error.
++    """
++    try:
++        args = _parser().parse_args(argv)
++    except SystemExit as exc:
++        return exc.code if isinstance(exc.code, int) else 2
++    try:
++        with open(args.input, encoding="utf-8") as f:
++            data = _load(f.read())
++        G, horizon, balances, storage = _problem(data)
++        if args.command == "solve":
++            schedule = solve(G, horizon, balances, storage)
++            shipments = paths(G, horizon, balances, schedule, storage)
++            result = {"schedule": schedule, "shipments": shipments}
++        else:
++            scenarios = data.get("scenarios", {})
++            result = analyze(G, horizon, balances, scenarios, storage)
++        save_json(args.output, result)
++    except (OSError, ValueError, RecursionError, nx.NetworkXException) as err:
++        print(f"error: {err}", file=sys.stderr)
++        return 2
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/networkx/algorithms/flow/timedecompose.py b/networkx/algorithms/flow/timedecompose.py
+new file mode 100644
+index 0000000..2d6f8fc
+--- /dev/null
++++ b/networkx/algorithms/flow/timedecompose.py
+@@ -0,0 +1,157 @@
++"""
++Validation and path decomposition of temporal transshipment schedules.
++"""
++
++from networkx.algorithms.flow.timeflow import expand
++from networkx.algorithms.flow.timeio import canonical_json
++from networkx.algorithms.flow.timeschedule import _record, _record_order
++
++__all__ = ["paths"]
++
++_SCHEDULE_FIELDS = frozenset({"cost", "flow"})
++_RECORD_FIELDS = frozenset(
++    {"kind", "source", "target", "key", "depart", "arrive", "amount"}
++)
++
++
++def _arc(H, record):
++    """Return the expanded arc ``(tail, head, hkey)`` of a schedule record."""
++    if not isinstance(record, dict) or set(record) != _RECORD_FIELDS:
++        raise ValueError(f"schedule record {record!r} has invalid fields")
++    kind, source, target = record["kind"], record["source"], record["target"]
++    key, depart, arrive = record["key"], record["depart"], record["arrive"]
++    amount = record["amount"]
++    if not (isinstance(kind, str) and isinstance(source, str)):
++        raise ValueError(f"schedule record {record!r} is malformed")
++    if not (isinstance(target, str) and (key is None or isinstance(key, str))):
++        raise ValueError(f"schedule record {record!r} is malformed")
++    if any(type(x) is not int for x in (depart, arrive, amount)):
++        raise ValueError(f"schedule record {record!r} has non-int numbers")
++    if amount <= 0:
++        raise ValueError(f"schedule record {record!r} has nonpositive amount")
++    if kind == "move":
++        hkey = ("move", source, target, key, depart)
++    elif kind == "hold" and key is None:
++        hkey = ("hold", source, depart)
++    else:
++        raise ValueError(f"schedule record {record!r} has invalid kind or key")
++    arc = ((source, depart), (target, arrive), hkey)
++    if not H.has_edge(*arc):
++        raise ValueError(f"schedule record {record!r} is not an arc")
++    return arc
++
++
++def _schedule_flows(H, schedule):
++    """Validate `schedule` against expanded network `H` and return arc flows."""
++    if not isinstance(schedule, dict) or set(schedule) != _SCHEDULE_FIELDS:
++        raise ValueError("schedule must be a dict with keys 'cost' and 'flow'")
++    if type(schedule["cost"]) is not int:
++        raise ValueError("schedule cost must be an exact int")
++    if not isinstance(schedule["flow"], list):
++        raise ValueError("schedule flow must be a list")
++    flows = {}
++    for record in schedule["flow"]:
++        arc = _arc(H, record)
++        if arc in flows:
++            raise ValueError(f"duplicate schedule record for arc {arc!r}")
++        flows[arc] = record["amount"]
++    net = dict.fromkeys(H, 0)
++    cost = 0
++    for tail, head, hkey, data in H.edges(keys=True, data=True):
++        f = flows.get((tail, head, hkey), 0)
++        if not data["lower"] <= f <= data["capacity"]:
++            raise ValueError(f"flow on arc {(tail, head, hkey)!r} violates bounds")
++        net[tail] -= f
++        net[head] += f
++        cost += f * data["weight"]
++    for node, demand in H.nodes(data="demand"):
++        if net[node] != demand:
++            raise ValueError(f"flow violates the balance of {node!r}")
++    if cost != schedule["cost"]:
++        raise ValueError(f"schedule cost {schedule['cost']} differs from {cost}")
++    return flows
++
++
++def _decompose(H, flows):
++    """Yield ``(amount, arcs)`` shipments decomposing valid `flows` on `H`."""
++    residual = dict(flows)
++    out = {}
++    for arc in sorted(flows, key=lambda arc: _record_order(_record(*arc, 0))):
++        out.setdefault(arc[0], []).append(arc)
++    first = dict.fromkeys(out, 0)
++    supply = {n: -d for n, d in H.nodes(data="demand") if d < 0}
++    demand = {n: d for n, d in H.nodes(data="demand") if d > 0}
++    for source in sorted(supply, key=lambda n: (n[1], n[0])):
++        while supply[source] > 0:
++            arcs = []
++            node = source
++            while demand.get(node, 0) == 0:
++                # Skip arcs exhausted by earlier shipments; flows only shrink.
++                while residual[out[node][first[node]]] == 0:
++                    first[node] += 1
++                arc = out[node][first[node]]
++                arcs.append(arc)
++                node = arc[1]
++            amount = min(
++                supply[source], demand[node], min(residual[arc] for arc in arcs)
++            )
++            supply[source] -= amount
++            demand[node] -= amount
++            for arc in arcs:
++                residual[arc] -= amount
++            yield amount, arcs
++
++
++def paths(G, horizon, balances, schedule, storage=None):
++    """Validates a schedule and decomposes it into shipments.
++
++    Parameters
++    ----------
++    G, horizon, balances, storage
++        As in :func:`~networkx.algorithms.flow.timeflow.expand`.
++
++    schedule : dict
++        A schedule in the form returned by
++        :func:`~networkx.algorithms.flow.timeschedule.solve`; record order
++        is arbitrary and arcs without records carry no flow. The schedule
++        must satisfy every arc bound and node balance and its cost must
++        equal the cost of its flow.
++
++    Returns
++    -------
++    shipments : list
++        Dicts ``{"amount": a, "route": [[node, time], ...],
++        "edges": [{"kind": kind, "key": key}, ...]}`` with one edge per
++        route step, sorted by canonical JSON. Supplies are processed in
++        ``(time, node)`` order; each shipment follows the first positive
++        residual arc in schedule order out of every node until it reaches
++        a node with unfilled demand, and carries as much as the supply,
++        that demand and the path allow.
++
++    Raises
++    ------
++    ValueError
++        If any input or the schedule is invalid.
++
++    Examples
++    --------
++    >>> from networkx.algorithms.flow.timedecompose import paths
++    >>> from networkx.algorithms.flow.timeschedule import solve
++    >>> G = nx.DiGraph()
++    >>> G.add_edge("a", "b", capacity=2, weight=3)
++    >>> balances = {("a", 0): -2, ("b", 1): 2}
++    >>> paths(G, 1, balances, solve(G, 1, balances))
++    [{'amount': 2, 'route': [['a', 0], ['b', 1]], 'edges': [{'kind': 'move', 'key': None}]}]
++    """
++    H = expand(G, horizon, balances, storage)
++    flows = _schedule_flows(H, schedule)
++    shipments = []
++    for amount, arcs in _decompose(H, flows):
++        route = [list(arcs[0][0])] + [list(head) for _, head, _ in arcs]
++        edges = [
++            {"kind": record["kind"], "key": record["key"]}
++            for record in (_record(*arc, amount) for arc in arcs)
++        ]
++        shipments.append({"amount": amount, "route": route, "edges": edges})
++    shipments.sort(key=canonical_json)
++    return shipments
+diff --git a/networkx/algorithms/flow/timeflow.py b/networkx/algorithms/flow/timeflow.py
+new file mode 100644
+index 0000000..db309a6
+--- /dev/null
++++ b/networkx/algorithms/flow/timeflow.py
+@@ -0,0 +1,180 @@
++"""
++Time-expanded networks for temporal transshipment problems.
++
++A physical network whose edges have integer transit times is expanded into
++a :class:`~networkx.MultiDiGraph` over ``(node, time)`` pairs. Movement arcs
++copy each physical edge at every possible departure time and optional hold
++arcs store goods at a node from one tick to the next.
++"""
++
++import networkx as nx
++from networkx.algorithms.flow.lowerbound import _check_digraph, _edge_bounds, _exact_int
++
++__all__ = ["expand"]
++
++_STORAGE_FIELDS = frozenset({"capacity", "weight", "lower"})
++
++
++def _check_label(value, what):
++    """Raise ValueError unless `value` is a nonempty string."""
++    if not isinstance(value, str) or not value:
++        raise ValueError(f"{what} must be a nonempty string, got {value!r}")
++    return value
++
++
++def _check_horizon(horizon):
++    if _exact_int(horizon, "horizon") < 0:
++        raise ValueError("horizon must be nonnegative")
++    return horizon
++
++
++def _physical_edges(G):
++    """Validate physical graph `G` and return its edge tuples.
++
++    Each tuple is ``(u, v, key, lower, capacity, weight, transit)`` where
++    `key` is None for a DiGraph.
++    """
++    _check_digraph(G)
++    for u in G:
++        _check_label(u, "node")
++    multigraph = G.is_multigraph()
++    if multigraph:
++        edges = G.edges(keys=True, data=True)
++    else:
++        edges = ((u, v, None, d) for u, v, d in G.edges(data=True))
++    result = []
++    for u, v, key, data in edges:
++        if multigraph:
++            _check_label(key, "edge key")
++        what = f"edge {(u, v, key)!r}"
++        bounds = _edge_bounds(data, "capacity", "weight", "lower", what)
++        transit = _exact_int(data.get("transit", 1), f"transit of {what}")
++        if transit <= 0:
++            raise ValueError(f"transit of {what} must be positive")
++        result.append((u, v, key) + bounds + (transit,))
++    return result
++
++
++def _check_time(G, horizon, node, time, what):
++    """Raise ValueError unless ``(node, time)`` is a node of the expansion."""
++    if not isinstance(node, str) or node not in G:
++        raise ValueError(f"{what} refers to unknown node {node!r}")
++    if type(time) is not int or not 0 <= time <= horizon:
++        raise ValueError(f"{what} refers to invalid time {time!r}")
++
++
++def _balances(G, horizon, balances):
++    """Validate `balances` and return them as a dict."""
++    if not isinstance(balances, dict):
++        raise ValueError("balances must be a dict")
++    for pair, amount in balances.items():
++        if not isinstance(pair, tuple) or len(pair) != 2:
++            raise ValueError(f"balance key {pair!r} must be a (node, time) pair")
++        _check_time(G, horizon, *pair, f"balance {pair!r}")
++        _exact_int(amount, f"balance of {pair!r}")
++    if sum(balances.values()) != 0:
++        raise ValueError("balances do not sum to zero")
++    return dict(balances)
++
++
++def _storage(G, storage):
++    """Validate `storage` and return ``{node: (lower, capacity, weight)}``."""
++    if storage is None:
++        return {}
++    if not isinstance(storage, dict):
++        raise ValueError("storage must be None or a dict")
++    result = {}
++    for node, record in storage.items():
++        if not isinstance(node, str) or node not in G:
++            raise ValueError(f"storage refers to unknown node {node!r}")
++        if not isinstance(record, dict):
++            raise ValueError(f"storage of {node!r} must be a dict")
++        extra = set(record) - _STORAGE_FIELDS
++        if extra:
++            raise ValueError(f"storage of {node!r} has unknown fields {extra!r}")
++        what = f"storage of {node!r}"
++        result[node] = _edge_bounds(record, "capacity", "weight", "lower", what)
++    return result
++
++
++def _validate(G, horizon, balances, storage):
++    """Validate all inputs of `expand`; return the normalized pieces."""
++    edges = _physical_edges(G)
++    _check_horizon(horizon)
++    return edges, _balances(G, horizon, balances), _storage(G, storage)
++
++
++def expand(G, horizon, balances, storage=None):
++    """Returns the time-expanded network of `G` over ``0 .. horizon``.
++
++    Parameters
++    ----------
++    G : DiGraph or MultiDiGraph
++        Physical network with nonempty string nodes (and nonempty string
++        keys for a MultiDiGraph). Edges require an exact nonnegative int
++        ``capacity`` and may have exact int ``weight`` (default 0), ``lower``
++        (default 0, at most the capacity) and positive ``transit``
++        (default 1). Node attributes are ignored.
++
++    horizon : int
++        Last time step; nodes exist for every time ``0 .. horizon``.
++
++    balances : dict
++        Maps ``(node, time)`` to an exact int demand (inflow minus outflow).
++        Missing pairs have demand 0 and all demands must sum to zero.
++
++    storage : dict or None
++        Maps nodes to ``{"capacity": c, "weight": w, "lower": l}`` records
++        (weight and lower optional) describing per-tick hold arcs.
++
++    Returns
++    -------
++    H : MultiDiGraph
++        Nodes are ``(node, time)`` with a ``demand`` attribute. Movement
++        arcs ``(u, d) -> (v, d + transit)`` have key
++        ``("move", u, v, key, d)`` and hold arcs ``(n, t) -> (n, t + 1)``
++        have key ``("hold", n, t)``; every arc has ``capacity``, ``weight``
++        and ``lower`` attributes. ``H.graph["horizon"]`` is `horizon`.
++
++    Raises
++    ------
++    ValueError
++        If any input is malformed.
++
++    Examples
++    --------
++    >>> from networkx.algorithms.flow.timeflow import expand
++    >>> G = nx.DiGraph()
++    >>> G.add_edge("a", "b", capacity=2, transit=1)
++    >>> H = expand(G, 1, {("a", 0): -1, ("b", 1): 1})
++    >>> list(H.edges(keys=True))
++    [(('a', 0), ('b', 1), ('move', 'a', 'b', None, 0))]
++    """
++    edges, balances, storage = _validate(G, horizon, balances, storage)
++    times = range(horizon + 1)
++    H = nx.MultiDiGraph()
++    H.graph["horizon"] = horizon
++    H.add_nodes_from(
++        ((u, t), {"demand": balances.get((u, t), 0)}) for u in G for t in times
++    )
++    for u, v, key, lo, cap, w, transit in edges:
++        for depart in range(horizon + 1 - transit):
++            H.add_edge(
++                (u, depart),
++                (v, depart + transit),
++                key=("move", u, v, key, depart),
++                capacity=cap,
++                weight=w,
++                lower=lo,
++            )
++    for node, (lo, cap, w) in storage.items():
++        for t in range(horizon):
++            H.add_edge(
++                (node, t),
++                (node, t + 1),
++                key=("hold", node, t),
++                capacity=cap,
++                weight=w,
++                lower=lo,
++            )
++    return H
+diff --git a/networkx/algorithms/flow/timeio.py b/networkx/algorithms/flow/timeio.py
+new file mode 100644
+index 0000000..2fa57ad
+--- /dev/null
++++ b/networkx/algorithms/flow/timeio.py
+@@ -0,0 +1,105 @@
++"""
++Canonical JSON encoding and atomic JSON output for temporal flow tools.
++"""
++
++import json
++import math
++import os
++import tempfile
++
++__all__ = ["canonical_json", "save_json"]
++
++
++def _check_json(value, active):
++    """Raise ValueError unless `value` is strict JSON data.
++
++    `active` holds the ids of the containers currently being checked, to
++    reject circular references.
++    """
++    if value is None or isinstance(value, bool | int | str):
++        return
++    if isinstance(value, float):
++        if not math.isfinite(value):
++            raise ValueError(f"nonfinite number {value!r} is not valid JSON")
++        return
++    if isinstance(value, list | dict):
++        if id(value) in active:
++            raise ValueError("circular reference is not valid JSON")
++        active.add(id(value))
++        if isinstance(value, dict):
++            for key, item in value.items():
++                if not isinstance(key, str):
++                    raise ValueError(f"JSON object key {key!r} is not a string")
++                _check_json(item, active)
++        else:
++            for item in value:
++                _check_json(item, active)
++        active.remove(id(value))
++        return
++    raise ValueError(f"{type(value).__name__} value {value!r} is not valid JSON")
++
++
++def canonical_json(value):
++    """Returns the canonical JSON text of `value`.
++
++    Object keys are sorted, separators are compact and non-ASCII characters
++    are kept, so the UTF-8 encoding of the text is canonical.
++
++    Raises
++    ------
++    ValueError
++        If `value` is not strict JSON data: only None, bools, ints, finite
++        floats, strings, lists and dicts with string keys are allowed.
++
++    Examples
++    --------
++    >>> from networkx.algorithms.flow.timeio import canonical_json
++    >>> canonical_json({"b": [1, None], "a": "é"})
++    '{"a":"é","b":[1,null]}'
++    """
++    try:
++        _check_json(value, set())
++        return json.dumps(
++            value,
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++            allow_nan=False,
++        )
++    except (TypeError, RecursionError) as err:
++        raise ValueError(f"value is not valid JSON: {err}") from err
++
++
++def save_json(path, value):
++    """Atomically write the canonical JSON of `value` and a newline to `path`.
++
++    The text is written to a temporary file in the same directory, which
++    then replaces `path`. On error the temporary file is removed and any
++    existing file at `path` is left unchanged.
++
++    Raises
++    ------
++    ValueError
++        If `value` is not strict JSON data.
++
++    OSError
++        If the file cannot be written.
++    """
++    data = (canonical_json(value) + "\n").encode("utf-8")
++    path = os.fspath(path)
++    directory = os.path.dirname(os.path.abspath(path))
++    fd, tmp = tempfile.mkstemp(
++        dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp"
++    )
++    try:
++        with os.fdopen(fd, "wb") as f:
++            f.write(data)
++            f.flush()
++            os.fsync(f.fileno())
++        os.replace(tmp, path)
++    except BaseException:
++        try:
++            os.unlink(tmp)
++        except OSError:
++            pass
++        raise
+diff --git a/networkx/algorithms/flow/timeschedule.py b/networkx/algorithms/flow/timeschedule.py
+new file mode 100644
+index 0000000..a33babb
+--- /dev/null
++++ b/networkx/algorithms/flow/timeschedule.py
+@@ -0,0 +1,84 @@
++"""
++Minimum cost schedules for temporal transshipment problems.
++"""
++
++from networkx.algorithms.flow.lowerbound import solve_bounded_flow
++from networkx.algorithms.flow.timeflow import expand
++
++__all__ = ["solve"]
++
++
++def _record(tail, head, hkey, amount):
++    """Return the schedule record of expanded arc ``(tail, head, hkey)``."""
++    return {
++        "kind": hkey[0],
++        "source": tail[0],
++        "target": head[0],
++        "key": hkey[3] if hkey[0] == "move" else None,
++        "depart": tail[1],
++        "arrive": head[1],
++        "amount": amount,
++    }
++
++
++def _record_order(record):
++    """Sort key of schedule records (and of expanded arcs in R5 order)."""
++    key = record["key"]
++    return (
++        record["depart"],
++        record["arrive"],
++        record["source"],
++        record["target"],
++        record["kind"],
++        "" if key is None else key,
++    )
++
++
++def solve(G, horizon, balances, storage=None):
++    """Returns a minimum cost schedule of a temporal transshipment problem.
++
++    The problem is expanded with :func:`~networkx.algorithms.flow.timeflow.expand`
++    and solved with
++    :func:`~networkx.algorithms.flow.lowerbound.solve_bounded_flow`.
++
++    Parameters
++    ----------
++    G, horizon, balances, storage
++        As in :func:`~networkx.algorithms.flow.timeflow.expand`.
++
++    Returns
++    -------
++    schedule : dict
++        ``{"cost": cost, "flow": records}`` where `records` lists every arc
++        with positive flow as a dict with keys ``kind`` (``"move"`` or
++        ``"hold"``), ``source``, ``target``, ``key`` (the physical edge key,
++        None for DiGraph edges and holds), ``depart``, ``arrive`` and
++        ``amount``, sorted by ``(depart, arrive, source, target, kind, key)``.
++
++    Raises
++    ------
++    ValueError
++        If any input is malformed.
++
++    NetworkXUnfeasible
++        If no schedule satisfies all balances and bounds.
++
++    Examples
++    --------
++    >>> from networkx.algorithms.flow.timeschedule import solve
++    >>> G = nx.DiGraph()
++    >>> G.add_edge("a", "b", capacity=2, weight=3)
++    >>> solve(G, 2, {("a", 0): -1, ("b", 2): 1}, storage={"b": {"capacity": 5}})
++    {'cost': 3, 'flow': [{'kind': 'move', 'source': 'a', 'target': 'b', 'key': None, 'depart': 0, 'arrive': 1, 'amount': 1}, {'kind': 'hold', 'source': 'b', 'target': 'b', 'key': None, 'depart': 1, 'arrive': 2, 'amount': 1}]}
++    """
++    H = expand(G, horizon, balances, storage)
++    cost, flow_dict = solve_bounded_flow(H)
++    records = [
++        _record(tail, head, hkey, amount)
++        for tail, nbrs in flow_dict.items()
++        for head, keyed in nbrs.items()
++        for hkey, amount in keyed.items()
++        if amount > 0
++    ]
++    records.sort(key=_record_order)
++    return {"cost": cost, "flow": records}
+diff --git a/test_timeflow_feature.py b/test_timeflow_feature.py
+new file mode 100644
+index 0000000..fb0a9c2
+--- /dev/null
++++ b/test_timeflow_feature.py
+@@ -0,0 +1,779 @@
++"""Behaviour tests for lower-bounded flow and temporal transshipment."""
++
++import contextlib
++import copy
++import inspect
++import io
++import itertools
++import json
++import os
++import random
++import tempfile
++import unittest
++from unittest import mock
++
++import networkx as nx
++from networkx.algorithms.flow import (
++    lowerbound,
++    lowerbound_max,
++    timeaudit,
++    timecli,
++    timedecompose,
++    timeflow,
++    timeio,
++    timeschedule,
++)
++
++
++def _edge_list(G):
++    if G.is_multigraph():
++        return list(G.edges(keys=True, data=True))
++    return [(u, v, None, d) for u, v, d in G.edges(data=True)]
++
++
++def _flow_of(flow_dict, u, v, k):
++    return flow_dict[u][v] if k is None else flow_dict[u][v][k]
++
++
++def _net_inflow(G, flows):
++    net = dict.fromkeys(G, 0)
++    for (u, v, _, _), f in zip(_edge_list(G), flows):
++        net[u] -= f
++        net[v] += f
++    return net
++
++
++def _feasible_flows(G):
++    """Yield every integral flow vector respecting edge bounds (brute force)."""
++    edges = _edge_list(G)
++    ranges = [range(d.get("lower", 0), d["capacity"] + 1) for *_, d in edges]
++    for flows in itertools.product(*ranges):
++        yield flows, sum(f * d.get("weight", 0) for (*_, d), f in zip(edges, flows))
++
++
++def _random_graph(rng, multigraph):
++    G = nx.MultiDiGraph() if multigraph else nx.DiGraph()
++    nodes = [0, "x", (1, 2), frozenset({3})]
++    G.add_nodes_from(nodes)
++    for i in range(rng.randint(1, 5)):
++        u, v = rng.choice(nodes), rng.choice(nodes)
++        if not multigraph and G.has_edge(u, v):
++            continue
++        cap = rng.randint(0, 2)
++        attrs = {"capacity": cap, "weight": rng.randint(-3, 3)}
++        if rng.random() < 0.5:
++            attrs["lower"] = rng.randint(0, cap)
++        if multigraph:
++            G.add_edge(u, v, key=("k", i), **attrs)
++        else:
++            G.add_edge(u, v, **attrs)
++    return G
++
++
++def _snapshot(G):
++    return (
++        type(G),
++        copy.deepcopy(dict(G.graph)),
++        copy.deepcopy(list(G.nodes(data=True))),
++        copy.deepcopy(_edge_list(G)),
++    )
++
++
++class TestTimeflowFeature(unittest.TestCase):
++    def test_r1_behavior(self):
++        solve = lowerbound.solve_bounded_flow
++        self.assertEqual(solve(nx.DiGraph()), (0, {}))
++        self.assertEqual(solve(nx.MultiDiGraph()), (0, {}))
++
++        # Lower bounds on a reverse arc and a negative cost cycle.
++        G = nx.DiGraph()
++        G.add_node("a", demand=-3)
++        G.add_node("b", demand=3)
++        G.add_edge("a", "b", capacity=5, weight=1)
++        G.add_edge("b", "a", capacity=2, weight=1, lower=1)
++        G.add_edge("c", "d", capacity=2, weight=-1)
++        G.add_edge("d", "c", capacity=4, weight=-1)
++        G.add_edge("c", "c", capacity=3, weight=2, lower=1)
++        before = _snapshot(G)
++        cost, flow = solve(G)
++        self.assertEqual(cost, 5 - 4 + 2)
++        self.assertEqual(
++            flow,
++            {"a": {"b": 4}, "b": {"a": 1}, "c": {"d": 2, "c": 1}, "d": {"c": 2}},
++        )
++        self.assertEqual(_snapshot(G), before)
++
++        # Custom attribute names and a keyed MultiDiGraph with zero flows.
++        M = nx.MultiDiGraph()
++        M.add_node(1, need=-2)
++        M.add_node((2,), need=2)
++        M.add_edge(1, (2,), key="p", cap=2, cost=3)
++        M.add_edge(1, (2,), key="q", cap=2, cost=1, low=1)
++        M.add_edge((2,), 1, key="r", cap=1, cost=1)
++        cost, flow = solve(M, "need", "cap", "cost", "low")
++        self.assertEqual(cost, 2)
++        self.assertEqual(flow, {1: {(2,): {"p": 0, "q": 2}}, (2,): {1: {"r": 0}}})
++
++        # Randomized comparison with brute force optimisation.
++        rng = random.Random(7)
++        for trial in range(150):
++            G = _random_graph(rng, multigraph=trial % 2 == 1)
++            for u in G:
++                G.nodes[u]["demand"] = 0
++            supplier, receiver = rng.sample(list(G), 2)
++            amount = rng.randint(0, 2)
++            G.nodes[supplier]["demand"] = -amount
++            G.nodes[receiver]["demand"] = amount
++            demands = dict(G.nodes(data="demand"))
++            best = min(
++                (c for fl, c in _feasible_flows(G) if _net_inflow(G, fl) == demands),
++                default=None,
++            )
++            with self.subTest(trial=trial):
++                if best is None:
++                    with self.assertRaises(nx.NetworkXUnfeasible):
++                        solve(G)
++                    continue
++                cost, flow = solve(G)
++                self.assertEqual(cost, best)
++                edges = _edge_list(G)
++                flows = [_flow_of(flow, u, v, k) for u, v, k, _ in edges]
++                self.assertEqual(_net_inflow(G, flows), demands)
++                self.assertEqual(
++                    cost, sum(f * d.get("weight", 0) for (*_, d), f in zip(edges, flows))
++                )
++                for (*_, d), f in zip(edges, flows):
++                    self.assertTrue(d.get("lower", 0) <= f <= d["capacity"])
++
++        # Infeasibility.
++        G = nx.DiGraph()
++        G.add_node("a", demand=1)
++        G.add_edge("a", "b", capacity=1)
++        with self.assertRaises(nx.NetworkXUnfeasible):
++            solve(G)
++        G = nx.DiGraph()
++        G.add_edge("a", "b", capacity=2, lower=1)
++        with self.assertRaises(nx.NetworkXUnfeasible):
++            solve(G)
++
++        # Malformed input.
++        def graph(**attrs):
++            G = nx.DiGraph()
++            G.add_edge("a", "b", **attrs)
++            return G
++
++        bad = [
++            (graph(),),
++            (graph(capacity=-1),),
++            (graph(capacity=1.0),),
++            (graph(capacity=True),),
++            (graph(capacity=1, weight=0.5),),
++            (graph(capacity=1, weight=False),),
++            (graph(capacity=1, lower=2),),
++            (graph(capacity=1, lower=-1),),
++            (graph(capacity=float("inf")),),
++            (nx.Graph([("a", "b", {"capacity": 1})]),),
++            ({"a": {}},),
++            (graph(capacity=1), ""),
++            (graph(capacity=1), "demand", None),
++            (graph(capacity=1), "demand", "capacity", 3),
++            (graph(capacity=1), "demand", "capacity", "weight", ""),
++        ]
++        for args in bad:
++            with self.subTest(args=args), self.assertRaises(ValueError):
++                solve(*args)
++        G = graph(capacity=1)
++        G.nodes["a"]["demand"] = True
++        with self.assertRaises(ValueError):
++            solve(G)
++        with self.assertRaises(ValueError):
++            solve(nx.DiGraph(), demand="")
++
++    def test_r2_behavior(self):
++        for func in (nx.min_cost_flow, nx.min_cost_flow_cost, nx.max_flow_min_cost):
++            param = inspect.signature(func).parameters["lower"]
++            self.assertIs(param.kind, inspect.Parameter.KEYWORD_ONLY)
++            self.assertIsNone(param.default)
++
++        G = nx.DiGraph()
++        G.add_node("a", demand=-5)
++        G.add_node("d", demand=5)
++        G.add_edge("a", "b", weight=3, capacity=4)
++        G.add_edge("a", "c", weight=6, capacity=10)
++        G.add_edge("b", "d", weight=1, capacity=9)
++        G.add_edge("c", "d", weight=2, capacity=5)
++        expected = {"a": {"b": 4, "c": 1}, "d": {}, "b": {"d": 4}, "c": {"d": 1}}
++        self.assertEqual(nx.min_cost_flow(G), expected)
++        self.assertEqual(nx.min_cost_flow(G, lower=None), expected)
++        self.assertEqual(nx.min_cost_flow_cost(G), 24)
++        G.edges["a", "c"]["low"] = 3
++        self.assertEqual(nx.min_cost_flow_cost(G, lower="low"), 32)
++        flow = nx.min_cost_flow(G, lower="low")
++        self.assertEqual(
++            flow, {"a": {"b": 2, "c": 3}, "d": {}, "b": {"d": 2}, "c": {"d": 3}}
++        )
++        self.assertEqual(lowerbound.solve_bounded_flow(G, lower="low"), (32, flow))
++        with self.assertRaises(ValueError):
++            nx.min_cost_flow(G, lower="")
++
++        # Existing infinite capacity defaults still apply without `lower`.
++        H = nx.DiGraph([("s", "t", {"weight": 2})])
++        H.nodes["s"]["demand"] = -3
++        H.nodes["t"]["demand"] = 3
++        self.assertEqual(nx.min_cost_flow_cost(H), 6)
++        with self.assertRaises(ValueError):
++            nx.min_cost_flow_cost(H, lower="lower")
++
++        # cost_of_flow on keyed MultiDiGraph flows and plain DiGraph flows.
++        M = nx.MultiDiGraph()
++        M.add_edge("a", "b", key="x", weight=2, capacity=1)
++        M.add_edge("a", "b", key="y", weight=5, capacity=3, lower=1)
++        M.nodes["a"]["demand"] = -3
++        M.nodes["b"]["demand"] = 3
++        flow = nx.min_cost_flow(M, lower="lower")
++        self.assertEqual(flow, {"a": {"b": {"x": 1, "y": 2}}, "b": {}})
++        self.assertEqual(nx.cost_of_flow(M, flow), 12)
++        self.assertEqual(nx.min_cost_flow_cost(M, lower="lower"), 12)
++        self.assertEqual(nx.cost_of_flow(G, expected), 24)
++
++        # max_flow_min_cost keeps its behaviour and delegates with `lower`.
++        F = nx.DiGraph()
++        F.add_edge("s", "a", capacity=4, weight=1)
++        F.add_edge("a", "t", capacity=3, weight=1)
++        F.add_edge("a", "s", capacity=2, lower=1)
++        self.assertEqual(
++            nx.max_flow_min_cost(F, "s", "t"),
++            {"s": {"a": 3}, "a": {"t": 3, "s": 0}, "t": {}},
++        )
++        bounded = nx.max_flow_min_cost(F, "s", "t", lower="lower")
++        self.assertEqual(bounded, {"s": {"a": 4}, "a": {"t": 3, "s": 1}, "t": {}})
++        self.assertEqual(bounded, lowerbound_max.max_flow(F, "s", "t"))
++
++    def test_r3_behavior(self):
++        max_flow = lowerbound_max.max_flow
++        rng = random.Random(11)
++        for trial in range(150):
++            G = _random_graph(rng, multigraph=trial % 2 == 0)
++            s, t = rng.sample(list(G), 2)
++            best = None
++            for flows, cost in _feasible_flows(G):
++                net = _net_inflow(G, flows)
++                if any(net[u] for u in G if u not in (s, t)) or -net[s] < 0:
++                    continue
++                if best is None or (net[s], cost) < best:
++                    best = (net[s], cost)
++            before = _snapshot(G)
++            with self.subTest(trial=trial):
++                if best is None:
++                    with self.assertRaises(nx.NetworkXUnfeasible):
++                        max_flow(G, s, t)
++                    continue
++                flow = max_flow(G, s, t)
++                edges = _edge_list(G)
++                flows = [_flow_of(flow, u, v, k) for u, v, k, _ in edges]
++                net = _net_inflow(G, flows)
++                cost = sum(f * d.get("weight", 0) for (*_, d), f in zip(edges, flows))
++                self.assertEqual((net[s], cost), best)
++                self.assertEqual(set(flow), set(G))
++                self.assertEqual(_snapshot(G), before)
++
++        # Large capacities with incoming source and outgoing sink arcs.
++        big = 10**18
++        M = nx.MultiDiGraph()
++        M.add_edge("s", "a", key=1, capacity=big, weight=1)
++        M.add_edge("s", "a", key=2, capacity=big, weight=3)
++        M.add_edge("a", "t", key=1, capacity=big + 5, weight=-1)
++        M.add_edge("a", "s", key=1, capacity=big, weight=0, lower=7)
++        M.add_edge("t", "a", key=1, capacity=3, weight=-2)
++        M.add_edge("t", "t", key=1, capacity=4, weight=-1)
++        flow = max_flow(M, "s", "t", weight="weight")
++        self.assertEqual(flow["a"]["t"][1], big + 5)
++        self.assertEqual(flow["t"]["a"][1], 0)
++        self.assertEqual(flow["t"]["t"][1], 4)
++        self.assertEqual(flow["a"]["s"][1], 7)
++        self.assertEqual(flow["s"]["a"], {1: big, 2: 12})
++
++        # No nonnegative flow: the only way out of s is forced backwards.
++        G = nx.DiGraph()
++        G.add_edge("t", "s", capacity=3, lower=1)
++        with self.assertRaises(nx.NetworkXUnfeasible):
++            max_flow(G, "s", "t")
++        G = nx.DiGraph()
++        G.add_edge("s", "t", capacity=0)
++        self.assertEqual(max_flow(G, "s", "t"), {"s": {"t": 0}, "t": {}})
++
++        G = nx.DiGraph([("s", "t", {"capacity": 1})])
++        for args in [(G, "s", "s"), (G, "s", "x"), (G, ["s"], "t"), (nx.Graph(G), "s", "t")]:
++            with self.subTest(args=args), self.assertRaises(ValueError):
++                max_flow(*args)
++        for bad_demand in (1, True, 0.0):
++            G.nodes["s"]["demand"] = bad_demand
++            with self.assertRaises(ValueError):
++                max_flow(G, "s", "t")
++        G.nodes["s"]["demand"] = 0
++        self.assertEqual(max_flow(G, "s", "t"), {"s": {"t": 1}, "t": {}})
++        G.edges["s", "t"]["weight"] = 1.5
++        with self.assertRaises(ValueError):
++            max_flow(G, "s", "t")
++
++    def test_r4_behavior(self):
++        expand = timeflow.expand
++        G = nx.MultiDiGraph()
++        G.add_node("a", demand=99)
++        G.add_edge("a", "b", key="k", capacity=3, weight=2, lower=1, transit=2)
++        G.add_edge("b", "b", key="loop", capacity=1)
++        G.add_edge("b", "a", key="far", capacity=1, transit=9)
++        balances = {("a", 0): -2, ("b", 3): 2}
++        storage = {"b": {"capacity": 5, "weight": 1}}
++        before = (_snapshot(G), dict(balances), copy.deepcopy(storage))
++        H = expand(G, 3, balances, storage)
++        self.assertEqual(before, (_snapshot(G), balances, storage))
++        self.assertIsInstance(H, nx.MultiDiGraph)
++        self.assertEqual(H.graph["horizon"], 3)
++        self.assertEqual(set(H), {(u, t) for u in "ab" for t in range(4)})
++        self.assertEqual(H.nodes["a", 0], {"demand": -2})
++        self.assertEqual(H.nodes["b", 3], {"demand": 2})
++        self.assertEqual(H.nodes["a", 1], {"demand": 0})
++        keys = {k: (u, v, d) for u, v, k, d in H.edges(keys=True, data=True)}
++        self.assertEqual(
++            set(keys),
++            {("move", "a", "b", "k", 0), ("move", "a", "b", "k", 1)}
++            | {("move", "b", "b", "loop", t) for t in range(3)}
++            | {("hold", "b", t) for t in range(3)},
++        )
++        self.assertEqual(
++            keys["move", "a", "b", "k", 1],
++            (("a", 1), ("b", 3), {"capacity": 3, "weight": 2, "lower": 1}),
++        )
++        self.assertEqual(
++            keys["hold", "b", 2],
++            (("b", 2), ("b", 3), {"capacity": 5, "weight": 1, "lower": 0}),
++        )
++
++        D = nx.DiGraph([("a", "b", {"capacity": 1})])
++        H = expand(D, 1, {})
++        self.assertEqual(
++            list(H.edges(keys=True)), [(("a", 0), ("b", 1), ("move", "a", "b", None, 0))]
++        )
++        H = expand(nx.DiGraph(), 0, {})
++        self.assertEqual((len(H), H.graph["horizon"]), (0, 0))
++        H = expand(D, 0, {("a", 0): 0}, {"a": {"capacity": 1}})
++        self.assertEqual((H.number_of_nodes(), H.number_of_edges()), (2, 0))
++
++        def multi(**attrs):
++            M = nx.MultiDiGraph()
++            M.add_edge("a", "b", key="k", **attrs)
++            return M
++
++        bad = [
++            (multi(capacity=1, transit=0), 0, {}),
++            (multi(capacity=1, transit=1.0), 5, {}),
++            (multi(capacity=1, transit=True), 5, {}),
++            (multi(), 1, {}),
++            (multi(capacity=1, lower=2), 1, {}),
++            (nx.MultiDiGraph([("a", "b", 0, {"capacity": 1})]), 1, {}),
++            (nx.MultiDiGraph([("a", "b", "", {"capacity": 1})]), 1, {}),
++            (nx.DiGraph([(1, "b", {"capacity": 1})]), 1, {}),
++            (nx.DiGraph([("", "b", {"capacity": 1})]), 1, {}),
++            (nx.Graph([("a", "b", {"capacity": 1})]), 1, {}),
++            (D, -1, {}),
++            (D, 1.0, {}),
++            (D, True, {}),
++            (D, 1, {("a", 0): -1}),
++            (D, 1, {("a", 0): -1, ("b", 1): True}),
++            (D, 1, {("a", 0): -1.0, ("b", 1): 1}),
++            (D, 1, {("c", 0): -1, ("b", 1): 1}),
++            (D, 1, {("a", 2): -1, ("b", 1): 1}),
++            (D, 1, {("a", False): -1, ("b", 1): 1}),
++            (D, 1, {"a": 0}),
++            (D, 1, {("a", 0, 1): 0}),
++            (D, 1, [("a", 0)]),
++            (D, 1, {}, {"c": {"capacity": 1}}),
++            (D, 1, {}, {"a": {"weight": 1}}),
++            (D, 1, {}, {"a": {"capacity": 1, "transit": 1}}),
++            (D, 1, {}, {"a": {"capacity": 1, "lower": 2}}),
++            (D, 1, {}, {"a": 3}),
++            (D, 1, {}, [("a", {"capacity": 1})]),
++        ]
++        for args in bad:
++            with self.subTest(args=args), self.assertRaises(ValueError):
++                expand(*args)
++
++    def test_r5_behavior(self):
++        solve = timeschedule.solve
++        G = nx.MultiDiGraph()
++        G.add_edge("a", "b", key="slow", capacity=2, weight=1, transit=2)
++        G.add_edge("a", "b", key="fast", capacity=1, weight=4)
++        G.add_edge("b", "c", key="k", capacity=5, weight=1)
++        balances = {("a", 0): -3, ("c", 3): 3}
++        storage = {"a": {"capacity": 9, "weight": 1}, "c": {"capacity": 9, "lower": 0}}
++        before = (_snapshot(G), dict(balances), copy.deepcopy(storage))
++        result = solve(G, 3, balances, storage)
++        self.assertEqual(before, (_snapshot(G), balances, storage))
++        self.assertEqual(set(result), {"cost", "flow"})
++
++        def rec(kind, source, target, key, depart, arrive, amount):
++            return dict(
++                kind=kind, source=source, target=target, key=key,
++                depart=depart, arrive=arrive, amount=amount,
++            )  # fmt: skip
++
++        # Two units go slowly at once; the third goes fast and waits at c.
++        self.assertEqual(result["cost"], 2 * (1 + 1) + (4 + 1))
++        self.assertEqual(
++            result["flow"],
++            [
++                rec("move", "a", "b", "fast", 0, 1, 1),
++                rec("move", "a", "b", "slow", 0, 2, 2),
++                rec("move", "b", "c", "k", 1, 2, 1),
++                rec("move", "b", "c", "k", 2, 3, 2),
++                rec("hold", "c", "c", None, 2, 3, 1),
++            ],
++        )
++
++        D = nx.DiGraph()
++        D.add_edge("a", "b", capacity=2, weight=3)
++        self.assertEqual(
++            solve(D, 2, {("a", 0): -1, ("b", 2): 1}, {"b": {"capacity": 5}}),
++            {
++                "cost": 3,
++                "flow": [
++                    rec("move", "a", "b", None, 0, 1, 1),
++                    rec("hold", "b", "b", None, 1, 2, 1),
++                ],
++            },
++        )
++        self.assertEqual(solve(nx.DiGraph(), 0, {}), {"cost": 0, "flow": []})
++        self.assertEqual(solve(D, 0, {}), {"cost": 0, "flow": []})
++        with self.assertRaises(nx.NetworkXUnfeasible):
++            solve(D, 2, {("a", 0): -1, ("b", 2): 1})
++        with self.assertRaises(ValueError):
++            solve(D, 2, {("a", 0): -1, ("b", 3): 1})
++
++    def test_r6_behavior(self):
++        paths = timedecompose.paths
++        solve = timeschedule.solve
++        D = nx.DiGraph()
++        D.add_edge("a", "b", capacity=5, weight=1)
++        D.add_edge("b", "c", capacity=5, weight=1)
++        balances = {("a", 0): -2, ("b", 1): 1, ("c", 2): 1}
++        schedule = solve(D, 2, balances)
++        move = {"kind": "move", "key": None}
++        expected = [
++            {"amount": 1, "route": [["a", 0], ["b", 1], ["c", 2]], "edges": [move, move]},
++            {"amount": 1, "route": [["a", 0], ["b", 1]], "edges": [move]},
++        ]
++        before = copy.deepcopy(schedule)
++        self.assertEqual(paths(D, 2, balances, schedule), expected)
++        self.assertEqual(schedule, before)
++        shuffled = {"cost": schedule["cost"], "flow": schedule["flow"][::-1]}
++        self.assertEqual(paths(D, 2, balances, shuffled), expected)
++        self.assertEqual(
++            [timeio.canonical_json(r) for r in expected],
++            sorted(timeio.canonical_json(r) for r in expected),
++        )
++
++        # Parallel movements and storage, consumed in R5 order.
++        M = nx.MultiDiGraph()
++        M.add_edge("a", "b", key="y", capacity=1, weight=2)
++        M.add_edge("a", "b", key="x", capacity=1, weight=1)
++        balances = {("a", 0): -2, ("a", 1): -1, ("b", 2): 3}
++        storage = {"b": {"capacity": 3}}
++        schedule = solve(M, 2, balances, storage)
++        shipments = paths(M, 2, balances, schedule, storage)
++        hold = {"kind": "hold", "key": None}
++        self.assertEqual(
++            shipments,
++            [
++                {
++                    "amount": 1,
++                    "route": [["a", 0], ["b", 1], ["b", 2]],
++                    "edges": [{"kind": "move", "key": "x"}, hold],
++                },
++                {
++                    "amount": 1,
++                    "route": [["a", 1], ["b", 2]],
++                    "edges": [{"kind": "move", "key": "x"}],
++                },
++                {
++                    "amount": 1,
++                    "route": [["a", 0], ["b", 1], ["b", 2]],
++                    "edges": [{"kind": "move", "key": "y"}, hold],
++                },
++            ],
++        )
++        total = sum(s["amount"] * len(s["edges"]) for s in shipments)
++        self.assertEqual(total, sum(r["amount"] for r in schedule["flow"]))
++        self.assertEqual(paths(nx.DiGraph(), 0, {}, {"cost": 0, "flow": []}), [])
++        self.assertEqual(paths(D, 1, {}, {"cost": 0, "flow": []}), [])
++
++        # A valid but non-optimal schedule is accepted.
++        balances = {("a", 0): -1, ("b", 2): 1}
++        other = {
++            "cost": 2,
++            "flow": [
++                {"kind": "move", "source": "a", "target": "b", "key": "y",
++                 "depart": 0, "arrive": 1, "amount": 1},
++                {"kind": "hold", "source": "b", "target": "b", "key": None,
++                 "depart": 1, "arrive": 2, "amount": 1},
++            ],
++        }  # fmt: skip
++        self.assertEqual(
++            paths(M, 2, balances, other, storage),
++            [
++                {
++                    "amount": 1,
++                    "route": [["a", 0], ["b", 1], ["b", 2]],
++                    "edges": [{"kind": "move", "key": "y"}, hold],
++                }
++            ],
++        )
++
++        def variant(**changes):
++            record = dict(other["flow"][0], **changes)
++            return {"cost": other["cost"], "flow": [record, other["flow"][1]]}
++
++        bad = [
++            {"cost": 2, "flow": other["flow"], "extra": 0},
++            {"cost": 2.0, "flow": other["flow"]},
++            {"cost": True, "flow": other["flow"]},
++            {"cost": 1, "flow": other["flow"]},
++            {"cost": 2, "flow": tuple(other["flow"])},
++            {"cost": 2, "flow": other["flow"][:1]},
++            {"cost": 4, "flow": other["flow"] + other["flow"][:1]},
++            {"cost": 2, "flow": [other["flow"][0], dict(other["flow"][1], amount=0)]},
++            variant(amount=True),
++            variant(amount=1.0),
++            variant(depart=False),
++            variant(key=None),
++            variant(key="z"),
++            variant(kind="hold"),
++            variant(kind="ship"),
++            variant(arrive=2),
++            variant(target="a"),
++            variant(source=["a"]),
++            {"cost": 2, "flow": [dict(other["flow"][0], note=1), other["flow"][1]]},
++            {"cost": 2, "flow": [other["flow"][0], dict(other["flow"][1], key="h")]},
++            [other],
++        ]
++        for schedule in bad:
++            with self.subTest(schedule=schedule), self.assertRaises(ValueError):
++                paths(M, 2, balances, schedule, storage)
++        # Bounds: lower bounds must be met even by unused arcs.
++        L = nx.DiGraph([("a", "b", {"capacity": 2, "lower": 1})])
++        with self.assertRaises(ValueError):
++            paths(L, 1, {}, {"cost": 0, "flow": []})
++        with self.assertRaises(ValueError):
++            paths(D, 1, {("a", 0): -9, ("b", 1): 9}, {"cost": 9, "flow": [
++                {"kind": "move", "source": "a", "target": "b", "key": None,
++                 "depart": 0, "arrive": 1, "amount": 9}]})  # fmt: skip
++
++    def test_r7_behavior(self):
++        analyze = timeaudit.analyze
++        M = nx.MultiDiGraph()
++        M.add_edge("a", "b", key="exp", capacity=1, lower=1, weight=5)
++        M.add_edge("a", "b", key="cheap", capacity=1, weight=1)
++        M.add_edge("a", "c", key="k", capacity=1, weight=1)
++        balances = {("a", 0): -1, ("b", 1): 1}
++        scenarios = {
++            "z-both": [("a", "b", "exp"), ["a", "b", "cheap"]],
++            "drop-exp": [["a", "b", "exp"], ("a", "b", "exp")],
++            "a-cheap": (("a", "b", "cheap"),),
++            "empty": [],
++        }
++        before = (_snapshot(M), copy.deepcopy(scenarios))
++        report = analyze(M, 1, balances, scenarios)
++        self.assertEqual(before, (_snapshot(M), scenarios))
++        self.assertEqual(
++            report,
++            {
++                "baseline_cost": 5,
++                "scenarios": {
++                    "a-cheap": {"feasible": True, "cost": 5, "delta": 0},
++                    "drop-exp": {"feasible": True, "cost": 1, "delta": -4},
++                    "empty": {"feasible": True, "cost": 5, "delta": 0},
++                    "z-both": {"feasible": False, "cost": None, "delta": None},
++                },
++            },
++        )
++        self.assertEqual(list(report["scenarios"]), sorted(scenarios))
++        self.assertEqual(analyze(M, 1, balances, {}), {"baseline_cost": 5, "scenarios": {}})
++
++        D = nx.DiGraph()
++        D.add_edge("a", "b", capacity=1, weight=1)
++        report = analyze(D, 1, {("a", 0): -1, ("b", 1): 1}, {"cut": [("a", "b", None)]})
++        self.assertEqual(report["scenarios"]["cut"], {"feasible": False, "cost": None, "delta": None})
++        with self.assertRaises(nx.NetworkXUnfeasible):
++            analyze(D, 1, {("a", 0): -2, ("b", 1): 2}, {"cut": [("a", "b", None)]})
++
++        bad = [
++            (D, {"cut": [("a", "b", "k")]}),
++            (D, {"cut": [("b", "a", None)]}),
++            (D, {"cut": [("a", "b")]}),
++            (D, {"cut": [("a", "b", None, 1)]}),
++            (D, {"cut": "ab"}),
++            (D, {"cut": [{"a", "b", None}]}),
++            (D, {"": []}),
++            (D, {1: []}),
++            (D, [("cut", [])]),
++            (M, {"cut": [("a", "b", None)]}),
++            (M, {"cut": [("a", "b", "nope")]}),
++            (M, {"cut": [(["a"], "b", "exp")]}),
++        ]
++        for G, scen in bad:
++            with self.subTest(scenarios=scen), self.assertRaises(ValueError):
++                analyze(G, 1, {}, scen)
++        with self.assertRaises(ValueError):
++            analyze(D, 1, {("q", 0): 0}, {})
++
++    def test_r8_behavior(self):
++        canonical_json = timeio.canonical_json
++        self.assertEqual(
++            canonical_json({"b": [1, None, True], "a": "é", "c": {"y": 1.5, "x": {}}}),
++            '{"a":"é","b":[1,null,true],"c":{"x":{},"y":1.5}}',
++        )
++        loop = []
++        loop.append(loop)
++        for bad in (float("nan"), float("inf"), {1: 2}, {("a",): 1}, {1, 2}, (1,), b"x", object(), loop):
++            with self.subTest(value=bad), self.assertRaises(ValueError):
++                canonical_json(bad)
++
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "out.json")
++            timeio.save_json(path, {"b": 1, "a": "ü"})
++            with open(path, "rb") as f:
++                self.assertEqual(f.read(), '{"a":"ü","b":1}\n'.encode())
++            with self.assertRaises(ValueError):
++                timeio.save_json(path, {"a": float("nan")})
++            with mock.patch.object(os, "replace", side_effect=OSError("boom")):
++                with self.assertRaises(OSError):
++                    timeio.save_json(path, {"new": 1})
++            with open(path, "rb") as f:
++                self.assertEqual(f.read(), '{"a":"ü","b":1}\n'.encode())
++            self.assertEqual(os.listdir(tmp), ["out.json"])
++            with self.assertRaises(OSError):
++                timeio.save_json(os.path.join(tmp, "missing", "x.json"), {})
++
++            def write(name, data):
++                p = os.path.join(tmp, name)
++                with open(p, "w", encoding="utf-8") as f:
++                    f.write(data if isinstance(data, str) else json.dumps(data))
++                return p
++
++            def run(*argv):
++                out, err = io.StringIO(), io.StringIO()
++                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
++                    code = timecli.main(list(argv))
++                return code, out.getvalue(), err.getvalue()
++
++            problem = {
++                "nodes": ["a", "b"],
++                "edges": [
++                    {"source": "a", "target": "b", "key": "exp", "capacity": 1,
++                     "lower": 1, "weight": 5},
++                    {"source": "a", "target": "b", "key": "cheap", "capacity": 1,
++                     "weight": 1, "transit": 1},
++                ],
++                "horizon": 2,
++                "balances": [
++                    {"node": "a", "time": 0, "demand": -1},
++                    {"node": "b", "time": 2, "demand": 1},
++                    {"node": "a", "time": 1, "demand": -1},
++                    {"node": "b", "time": 1, "demand": 1},
++                ],
++                "storage": {"b": {"capacity": 2}},
++                "scenarios": {"x": [["a", "b", "exp"]], "all": [["a", "b", "exp"], ["a", "b", "cheap"]]},
++            }  # fmt: skip
++            inp = write("in.json", problem)
++            G = nx.MultiDiGraph()
++            G.add_nodes_from(problem["nodes"])
++            for e in problem["edges"]:
++                attrs = {k: v for k, v in e.items() if k not in ("source", "target", "key")}
++                G.add_edge(e["source"], e["target"], key=e["key"], **attrs)
++            balances = {(b["node"], b["time"]): b["demand"] for b in problem["balances"]}
++            storage = problem["storage"]
++
++            out = os.path.join(tmp, "solve.json")
++            self.assertEqual(run("solve", inp, "--output", out), (0, "", ""))
++            schedule = timeschedule.solve(G, 2, balances, storage)
++            expected = {
++                "schedule": schedule,
++                "shipments": timedecompose.paths(G, 2, balances, schedule, storage),
++            }
++            with open(out, encoding="utf-8") as f:
++                self.assertEqual(f.read(), canonical_json(expected) + "\n")
++
++            out = os.path.join(tmp, "audit.json")
++            self.assertEqual(run("audit", inp, "--output", out), (0, "", ""))
++            expected = timeaudit.analyze(G, 2, balances, problem["scenarios"], storage)
++            with open(out, encoding="utf-8") as f:
++                self.assertEqual(json.load(f), expected)
++            self.assertEqual(expected["scenarios"]["all"]["feasible"], False)
++
++            no_scen = write("plain.json", {k: v for k, v in problem.items() if k != "scenarios"})
++            self.assertEqual(run("audit", no_scen, "--output", out)[0], 0)
++            with open(out, encoding="utf-8") as f:
++                self.assertEqual(json.load(f)["scenarios"], {})
++
++            code, stdout, _ = run("--help")
++            self.assertEqual(code, 0)
++            self.assertEqual(run("solve", "--help")[0], 0)
++
++            def broken(**changes):
++                return dict(problem, **changes)
++
++            invalid = [
++                "{",
++                '{"nodes": NaN}',
++                json.dumps(problem)[:-1] + ', "scenarios2": 1}',
++                json.dumps(broken(scenarios={"x": [["a", "b", "exp"]]})).replace(
++                    '"x": [', '"x": [1e999, '
++                ),
++                json.dumps(broken(scenarios={"x": []})).replace("[]", "[Infinity]"),
++                json.dumps(broken(extra=1)),
++                json.dumps({k: v for k, v in problem.items() if k != "balances"}),
++                json.dumps(broken(nodes=["a", "b", "a"])),
++                json.dumps(broken(nodes=["a", "b", ""])),
++                json.dumps(broken(nodes="ab")),
++                json.dumps(broken(edges=problem["edges"] + problem["edges"][:1])),
++                json.dumps(broken(edges=[dict(problem["edges"][0], key="")])),
++                json.dumps(broken(edges=[dict(problem["edges"][0], target="z")])),
++                json.dumps(broken(edges=[dict(problem["edges"][0], color=1)])),
++                json.dumps(broken(edges=[{"source": "a", "target": "b", "key": "k"}])),
++                json.dumps(broken(edges=[dict(problem["edges"][0], capacity=1.0)])),
++                json.dumps(broken(balances=problem["balances"] + problem["balances"][:1])),
++                json.dumps(broken(balances=[{"node": "a", "time": 0}])),
++                json.dumps(broken(balances=[{"node": "a", "time": 0, "demand": 0.5}])),
++                json.dumps(broken(balances=[{"node": "a", "time": [0], "demand": 0}])),
++                json.dumps(broken(horizon=-1)),
++                json.dumps(broken(storage={"b": {"capacity": 2, "x": 1}})),
++                json.dumps(broken(balances=problem["balances"][:1] + problem["balances"][2:])),
++                json.dumps(broken(storage=None, balances=problem["balances"][:3] + [
++                    {"node": "b", "time": 0, "demand": 1}])),  # fmt: skip
++                '{"nodes": [], "nodes": [], "edges": [], "horizon": 0, "balances": []}',
++                "[]",
++            ]
++            for i, text in enumerate(invalid):
++                for command in ("solve", "audit"):
++                    with self.subTest(text=text, command=command):
++                        out = write(f"keep{i}{command}.json", "old")
++                        code, stdout, stderr = run(command, write(f"bad{i}.json", text), "--output", out)
++                        self.assertEqual((code, stdout), (2, ""))
++                        self.assertTrue(stderr)
++                        with open(out, encoding="utf-8") as f:
++                            self.assertEqual(f.read(), "old")
++
++            bad_scenarios = write("bs.json", broken(scenarios={"x": [["a", "b", "nope"]]}))
++            self.assertEqual(run("solve", bad_scenarios, "--output", out)[0], 0)
++            self.assertEqual(run("audit", bad_scenarios, "--output", out)[0], 2)
++            self.assertEqual(run("solve", os.path.join(tmp, "none.json"), "--output", out)[0], 2)
++            self.assertEqual(
++                run("solve", inp, "--output", os.path.join(tmp, "no", "o.json"))[0], 2
++            )
++            self.assertEqual(run("solve", inp)[0], 2)
++            self.assertEqual(run("bogus")[0], 2)
++            self.assertEqual(run()[0], 2)
++
++
++if __name__ == "__main__":
++    unittest.main()

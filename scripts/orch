@@ -1,0 +1,9 @@
+#!/bin/sh
+# Orchestration CLI from this checkout, e.g.: scripts/orch --repo ~/code/app plan spec.md
+# An unpacked Linux package (install.sh leaves .package) runs from its own .venv;
+# a development checkout runs through uv.
+here="$(cd "$(dirname "$0")/.." && pwd)"
+if [ -f "$here/.package" ] && [ -x "$here/.venv/bin/python" ]; then
+  exec env PYTHONPATH="$here/src" "$here/.venv/bin/python" -m orchestragent.orch_cli "$@"
+fi
+exec env PYTHONPATH="$here/src" uv run --project "$here" python -m orchestragent.orch_cli "$@"

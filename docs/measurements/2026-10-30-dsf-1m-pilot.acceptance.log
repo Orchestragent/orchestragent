@@ -1,0 +1,83 @@
+test_bytes_blank_lines_and_partial_tail (_orch_bench_acceptance.test_acceptance.CheckpointReader.test_bytes_blank_lines_and_partial_tail) ... ok
+test_invalid_lines_and_offsets (_orch_bench_acceptance.test_acceptance.CheckpointReader.test_invalid_lines_and_offsets) ... ok
+test_atomic_json_preserves_original_on_encoding_failure (_orch_bench_acceptance.test_acceptance.DurableQueue.test_atomic_json_preserves_original_on_encoding_failure) ... ok
+test_bad_record_does_not_checkpoint_past_failure (_orch_bench_acceptance.test_acceptance.DurableQueue.test_bad_record_does_not_checkpoint_past_failure) ... ERROR
+test_inflight_recovery_order_and_completed_dedup (_orch_bench_acceptance.test_acceptance.DurableQueue.test_inflight_recovery_order_and_completed_dedup) ... ERROR
+test_ingest_save_resume_and_partial_tail (_orch_bench_acceptance.test_acceptance.DurableQueue.test_ingest_save_resume_and_partial_tail) ... ERROR
+test_invalid_input_is_nonmutating_and_state_version_is_checked (_orch_bench_acceptance.test_acceptance.DurableQueue.test_invalid_input_is_nonmutating_and_state_version_is_checked) ... ERROR
+test_backends_preserve_order_tombstones_and_custom_priority (_orch_bench_acceptance.test_acceptance.QueueBehavior.test_backends_preserve_order_tombstones_and_custom_priority) ... 
+  test_backends_preserve_order_tombstones_and_custom_priority (_orch_bench_acceptance.test_acceptance.QueueBehavior.test_backends_preserve_order_tombstones_and_custom_priority) (backend='HeapPriorityQueue') ... ERROR
+  test_backends_preserve_order_tombstones_and_custom_priority (_orch_bench_acceptance.test_acceptance.QueueBehavior.test_backends_preserve_order_tombstones_and_custom_priority) (backend='SortedPriorityQueue') ... ERROR
+
+======================================================================
+ERROR: test_bad_record_does_not_checkpoint_past_failure (_orch_bench_acceptance.test_acceptance.DurableQueue.test_bad_record_does_not_checkpoint_past_failure)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/boltons-dsf-1m-20261030/project/.git/orch/r28be9a03/work/acceptance-7441d1/_orch_bench_acceptance/test_acceptance.py", line 134, in test_bad_record_does_not_checkpoint_past_failure
+    queue = CheckpointQueue(self.path)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/boltons-dsf-1m-20261030/project/.git/orch/r28be9a03/work/acceptance-7441d1/boltons/taskqueueutils.py", line 31, in __init__
+    raise NotImplementedError
+NotImplementedError
+
+======================================================================
+ERROR: test_inflight_recovery_order_and_completed_dedup (_orch_bench_acceptance.test_acceptance.DurableQueue.test_inflight_recovery_order_and_completed_dedup)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/boltons-dsf-1m-20261030/project/.git/orch/r28be9a03/work/acceptance-7441d1/_orch_bench_acceptance/test_acceptance.py", line 91, in test_inflight_recovery_order_and_completed_dedup
+    queue = CheckpointQueue(self.path)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/boltons-dsf-1m-20261030/project/.git/orch/r28be9a03/work/acceptance-7441d1/boltons/taskqueueutils.py", line 31, in __init__
+    raise NotImplementedError
+NotImplementedError
+
+======================================================================
+ERROR: test_ingest_save_resume_and_partial_tail (_orch_bench_acceptance.test_acceptance.DurableQueue.test_ingest_save_resume_and_partial_tail)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/boltons-dsf-1m-20261030/project/.git/orch/r28be9a03/work/acceptance-7441d1/_orch_bench_acceptance/test_acceptance.py", line 116, in test_ingest_save_resume_and_partial_tail
+    queue = CheckpointQueue(self.path)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/boltons-dsf-1m-20261030/project/.git/orch/r28be9a03/work/acceptance-7441d1/boltons/taskqueueutils.py", line 31, in __init__
+    raise NotImplementedError
+NotImplementedError
+
+======================================================================
+ERROR: test_invalid_input_is_nonmutating_and_state_version_is_checked (_orch_bench_acceptance.test_acceptance.DurableQueue.test_invalid_input_is_nonmutating_and_state_version_is_checked)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/boltons-dsf-1m-20261030/project/.git/orch/r28be9a03/work/acceptance-7441d1/_orch_bench_acceptance/test_acceptance.py", line 143, in test_invalid_input_is_nonmutating_and_state_version_is_checked
+    queue = CheckpointQueue(self.path)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/boltons-dsf-1m-20261030/project/.git/orch/r28be9a03/work/acceptance-7441d1/boltons/taskqueueutils.py", line 31, in __init__
+    raise NotImplementedError
+NotImplementedError
+
+======================================================================
+ERROR: test_backends_preserve_order_tombstones_and_custom_priority (_orch_bench_acceptance.test_acceptance.QueueBehavior.test_backends_preserve_order_tombstones_and_custom_priority) (backend='HeapPriorityQueue')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/boltons-dsf-1m-20261030/project/.git/orch/r28be9a03/work/acceptance-7441d1/_orch_bench_acceptance/test_acceptance.py", line 29, in test_backends_preserve_order_tombstones_and_custom_priority
+    self.assertEqual(queue.peek_many(), ["a", "b", "c"])
+                     ^^^^^^^^^^^^^^^
+AttributeError: 'HeapPriorityQueue' object has no attribute 'peek_many'
+
+======================================================================
+ERROR: test_backends_preserve_order_tombstones_and_custom_priority (_orch_bench_acceptance.test_acceptance.QueueBehavior.test_backends_preserve_order_tombstones_and_custom_priority) (backend='SortedPriorityQueue')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/boltons-dsf-1m-20261030/project/.git/orch/r28be9a03/work/acceptance-7441d1/_orch_bench_acceptance/test_acceptance.py", line 29, in test_backends_preserve_order_tombstones_and_custom_priority
+    self.assertEqual(queue.peek_many(), ["a", "b", "c"])
+                     ^^^^^^^^^^^^^^^
+AttributeError: 'SortedPriorityQueue' object has no attribute 'peek_many'
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.003s
+
+FAILED (errors=6)
+
+issuer=controller
+mode=sandbox-exec
+revision=df82e90f7d758ddeb8b13f2ad10b2965eecaee0b
+exit=1
+command=python -I -S -B -c <unittest bootstrap>

@@ -1,0 +1,33 @@
+Source: 3fd90006773f5736cd3e1d0d65aa1c30b3ad0740
+Provider responses are scripted. macOS sandbox execution is real.
+No new measurement scripts or live provider spending.
+
+Full integration (one run):
+uv run pytest -q
+1 failed, 1524 passed, 5 skipped in 504.96s (0:08:24)
+Failure: test_imports_outside_the_sandbox_fail_the_attempt_with_a_clear_error
+Import rejection and subsequent repair both passed. The old text assertion expected
+'neither standard library nor in the'; new diagnostic names the pinned environment.
+Updated only the assertion to require the offending module and pinned-environment guidance.
+
+Targeted correction:
+uv run pytest -q tests/test_orch_index.py -k imports_outside
+1 passed, 45 deselected in 1.57s
+
+Related environment, audit, distributed planning, scheduling compatibility:
+110 passed in 78.09s
+Pinned dependencies and src layout: real sandbox nodes, merge, project pytest, resume,
+fresh-controller audit, index cache partitioning:
+4 passed in 10.42s
+Draft/review separation, structural and semantic repairs, settled JSON errors,
+phase reuse after interruptions and stable review prefixes:
+12 passed in 3.99s
+CLI resumes both default and reviewed planning under saved settings and unknown-call gates.
+
+uv run ruff check .
+All checks passed!
+uv run mypy
+Success: no issues found in 114 source files
+
+Reuse scan: one canonical serialization.dumps; settled JSON failure classification is
+orch_usage.settled_json_failure. Transport modules only create the error messages.

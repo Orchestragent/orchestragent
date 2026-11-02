@@ -1,0 +1,14 @@
+test_threads_and_cross_descriptor_file_lock (test_capability.RequiredCapabilities.test_threads_and_cross_descriptor_file_lock) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+OK
+
+issuer=controller
+mode=sandbox-exec
+revision=4fa222d2fb157e1b7f8c753c9f92e5907d1ddeb4
+exit=0
+command=python -I -S -B -c <unittest bootstrap>
+wall_limit_s=5
+cpu_limit_s=5

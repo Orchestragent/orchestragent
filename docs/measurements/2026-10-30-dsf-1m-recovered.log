@@ -1,0 +1,27 @@
+[run] T-001 a9 -> dsh/deepseek-flash (level 0)
+[run] T-001 a9 -> claude/claude-opus-5-5 (review)
+[rules] new planner candidate p5: When a test checks a count-limited read against pop order, compare the limited result to the first N pops or compare all pops to the full order, never to the truncated list.
+[run] T-001 frozen tests corrected by Claude; task restarts
+[run] T-001 a10 -> dsh/deepseek-flash (level 0)
+[run] T-001 a10 -> claude/claude-opus-5-5 (review)
+[run] T-001 a10 failed (dispute); next rung 1
+[run] T-001 a11 -> dsh/deepseek-flash (level 1)
+[run] T-001 DONE at 9c25208048 (a11)
+[run] T-004 a1 -> dsh/deepseek-flash (level 0)
+[run] T-004 a1 -> dsh/deepseek-flash (level 0)
+[run] T-004 a1 failed (test); next rung 1
+[run] T-004 a2 -> dsh/deepseek-flash (level 1)
+[run] T-004 a2 failed (test); next rung 3
+[run] T-004 a3 -> claude/claude-opus-5-5 (level 3)
+[run] T-004 a3 -> claude/claude-opus-5-5 (review)
+[rules] new planner candidate p6: When a test retries input after an error, change the stream bytes at the saved offset before expecting the retry to succeed, and expect an exception (not a return count) from any call that reaches a bad record.
+[run] T-004 frozen tests corrected by Claude; task restarts
+[run] T-004 a4 -> dsh/deepseek-flash (level 0)
+[run] T-004 a4 failed (edit); next rung 1
+[run] T-004 a5 -> dsh/deepseek-flash (level 1)
+[run] T-004 a5 failed (test); next rung 4
+[run] T-004 a6 -> claude/claude-opus-5-5 (thicken)
+[run] T-004 contract thickened
+[run] T-004 a6 -> dsh/deepseek-flash (level 4)
+[run] T-004 DONE at a22997d0ca (a6)
+{"status":"done","usage":{"cache_hit_rate":0.515078,"calls":40,"costs":{"cost_usd":{"known_sum":0,"reported_calls":0},"provider_estimate_usd":{"known_sum":2.023511,"reported_calls":15},"settled_cents":{"known_sum":77.0,"reported_calls":25}},"known_tokens":{"cache_read_tokens":286079,"cache_write_tokens":149085,"input_tokens":555409,"output_tokens":69169,"reasoning_tokens":0,"total_tokens":624578},"legacy_calls":0,"pending_calls":0,"reported_calls":{"cache_read_tokens":40,"cache_write_tokens":40,"input_tokens":40,"output_tokens":40,"reasoning_tokens":0,"total_tokens":40}}}

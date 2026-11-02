@@ -1,0 +1,27 @@
+test_bytes_blank_lines_and_partial_tail (_orch_bench_acceptance.test_acceptance.CheckpointReader.test_bytes_blank_lines_and_partial_tail) ... ok
+test_invalid_lines_and_offsets (_orch_bench_acceptance.test_acceptance.CheckpointReader.test_invalid_lines_and_offsets) ... ok
+test_atomic_json_preserves_original_on_encoding_failure (_orch_bench_acceptance.test_acceptance.DurableQueue.test_atomic_json_preserves_original_on_encoding_failure) ... ok
+test_bad_record_does_not_checkpoint_past_failure (_orch_bench_acceptance.test_acceptance.DurableQueue.test_bad_record_does_not_checkpoint_past_failure) ... FAIL
+test_inflight_recovery_order_and_completed_dedup (_orch_bench_acceptance.test_acceptance.DurableQueue.test_inflight_recovery_order_and_completed_dedup) ... ok
+test_ingest_save_resume_and_partial_tail (_orch_bench_acceptance.test_acceptance.DurableQueue.test_ingest_save_resume_and_partial_tail) ... ok
+test_invalid_input_is_nonmutating_and_state_version_is_checked (_orch_bench_acceptance.test_acceptance.DurableQueue.test_invalid_input_is_nonmutating_and_state_version_is_checked) ... ok
+test_backends_preserve_order_tombstones_and_custom_priority (_orch_bench_acceptance.test_acceptance.QueueBehavior.test_backends_preserve_order_tombstones_and_custom_priority) ... ok
+
+======================================================================
+FAIL: test_bad_record_does_not_checkpoint_past_failure (_orch_bench_acceptance.test_acceptance.DurableQueue.test_bad_record_does_not_checkpoint_past_failure)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/boltons-kernel-20261031/project/.git/orch/r8e94c786/work/acceptance-d059b7/_orch_bench_acceptance/test_acceptance.py", line 139, in test_bad_record_does_not_checkpoint_past_failure
+    with self.assertRaises(ValueError):
+AssertionError: ValueError not raised
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.003s
+
+FAILED (failures=1)
+
+issuer=controller
+mode=sandbox-exec
+revision=60b2995da0e9f66aef30ad3c06b24f38db69ea61
+exit=1
+command=python -I -S -B -c <unittest bootstrap>

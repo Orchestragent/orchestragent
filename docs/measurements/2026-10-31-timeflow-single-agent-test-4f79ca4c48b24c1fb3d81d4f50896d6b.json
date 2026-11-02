@@ -1,0 +1,1 @@
+{"log":"........ [100%]\n8 passed, 441 subtests passed in 0.40s\n\nissuer=controller\nmode=sandbox-exec\nrevision=4fa222d2fb157e1b7f8c753c9f92e5907d1ddeb4\nexit=0\ncommand=python -I -S -B -c <pytest bootstrap>\nwall_limit_s=600\ncpu_limit_s=300\nenvironment=e46f1ae40f2e83c2f95b77b95e57332975d1bd9c4b0bc589900802d59f4a8751\n","nodeids":["test_timeflow_feature.py"],"passed":true}

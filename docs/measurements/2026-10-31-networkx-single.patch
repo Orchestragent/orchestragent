@@ -1,0 +1,2514 @@
+diff --git a/networkx/deployment/__init__.py b/networkx/deployment/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/networkx/deployment/_util.py b/networkx/deployment/_util.py
+new file mode 100644
+index 0000000..4b489db
+--- /dev/null
++++ b/networkx/deployment/_util.py
+@@ -0,0 +1,103 @@
++"""Private validation and strict JSON helpers shared by the deployment modules."""
++
++import hashlib
++import json
++
++__all__ = []
++
++
++class JSONValueError(ValueError, TypeError):
++    """A value is not strict JSON.
++
++    Subclasses TypeError as well so callers expecting `json.dumps` semantics
++    for unserializable objects keep working.
++    """
++
++
++def canonical_json(value):
++    """Return the canonical JSON text of `value`.
++
++    Keys are sorted, separators are compact, non-ASCII text is kept and
++    NaN/infinity are rejected. Any serialization failure raises ValueError.
++    """
++    try:
++        return json.dumps(
++            value,
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++            allow_nan=False,
++        )
++    except (TypeError, ValueError, RecursionError) as err:
++        raise JSONValueError(f"value is not strict JSON: {err}") from None
++
++
++def _reject_constant(name):
++    raise ValueError(f"non-finite JSON number {name} is not allowed")
++
++
++def _unique_object(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError(f"duplicate JSON object key {key!r}")
++        result[key] = value
++    return result
++
++
++def loads_strict(data):
++    """Parse UTF-8 bytes or text as strict JSON (no NaN, no duplicate keys)."""
++    try:
++        if isinstance(data, bytes | bytearray):
++            data = bytes(data).decode("utf-8")
++        return json.loads(
++            data, parse_constant=_reject_constant, object_pairs_hook=_unique_object
++        )
++    except (TypeError, ValueError, RecursionError) as err:
++        raise ValueError(f"invalid JSON: {err}") from None
++
++
++def encode(value):
++    """Return the UTF-8 bytes of the canonical JSON text of `value`."""
++    text = canonical_json(value)
++    try:
++        return text.encode("utf-8")
++    except UnicodeEncodeError as err:
++        raise ValueError(f"value is not UTF-8 encodable: {err}") from None
++
++
++def normalize(value):
++    """Return a fresh copy of `value` after a strict JSON round trip."""
++    return loads_strict(encode(value))
++
++
++def digest(value):
++    """Return the SHA-256 hex digest of the canonical JSON of `value`."""
++    return hashlib.sha256(encode(value)).hexdigest()
++
++
++def is_int(value):
++    return isinstance(value, int) and not isinstance(value, bool)
++
++
++def is_id(value):
++    return isinstance(value, str) and value != ""
++
++
++def check_id(value, what):
++    if not is_id(value):
++        raise ValueError(f"{what} must be a nonempty string, got {value!r}")
++    return str(value)
++
++
++def check_int(value, what, minimum=0):
++    if not is_int(value) or value < minimum:
++        kind = "positive" if minimum == 1 else "nonnegative"
++        raise ValueError(f"{what} must be a {kind} integer, got {value!r}")
++    return int(value)
++
++
++def check_bool(value, what):
++    if not isinstance(value, bool):
++        raise ValueError(f"{what} must be a bool, got {value!r}")
++    return value
+diff --git a/networkx/deployment/batches.py b/networkx/deployment/batches.py
+new file mode 100644
+index 0000000..4e94d30
+--- /dev/null
++++ b/networkx/deployment/batches.py
+@@ -0,0 +1,125 @@
++"""Dependency- and host-aware grouping of services into rollout batches."""
++
++from collections.abc import Mapping
++
++from networkx.deployment._util import check_int, is_id, is_int
++from networkx.deployment.placement import _check_model
++
++__all__ = ["rollout_batches"]
++
++
++def _unwrap(placements):
++    """Accept either ``{service: hosts}`` or the full result of `place`."""
++    if (
++        isinstance(placements, Mapping)
++        and set(placements) == {"placements", "cost"}
++        and isinstance(placements["placements"], Mapping)
++    ):
++        return placements["placements"], placements["cost"]
++    return placements, None
++
++
++def _validate_placements(model, placements):
++    """Return a normalized copy of a complete, feasible placement."""
++    services = model._services
++    hosts = model._hosts
++    placements, cost = _unwrap(placements)
++    if not isinstance(placements, Mapping):
++        raise ValueError("placements must map service IDs to host lists")
++    if set(placements) != set(services):
++        raise ValueError("placements must contain exactly the model's services")
++    load = dict.fromkeys(hosts, 0)
++    result = {}
++    total = 0
++    for service, spec in services.items():
++        chosen = placements[service]
++        what = f"placement of service {service!r}"
++        if not isinstance(chosen, list | tuple):
++            raise ValueError(f"{what} must be a list of host IDs")
++        for host in chosen:
++            if not is_id(host) or host not in hosts:
++                raise ValueError(f"{what} uses unknown host {host!r}")
++        if len(set(chosen)) != len(chosen):
++            raise ValueError(f"{what} repeats a host")
++        if len(chosen) != spec["replicas"]:
++            raise ValueError(f"{what} must have exactly {spec['replicas']} hosts")
++        zones = [hosts[host]["zone"] for host in chosen]
++        if len(set(zones)) != len(zones):
++            raise ValueError(f"{what} puts two replicas in one zone")
++        allowed = spec["allowed_zones"]
++        if allowed is not None and not set(zones) <= set(allowed):
++            raise ValueError(f"{what} uses a zone that is not allowed")
++        for host in chosen:
++            load[host] += 1
++        total += sum(spec["costs"][host] for host in chosen)
++        result[service] = sorted(chosen)
++    for host, used in load.items():
++        if used > hosts[host]["slots"]:
++            raise ValueError(f"host {host!r} exceeds its {hosts[host]['slots']} slots")
++    if cost is not None and (not is_int(cost) or cost != total):
++        raise ValueError(f"placement cost {cost!r} does not match {total}")
++    return result
++
++
++def rollout_batches(model, placements, max_parallel=4):
++    """Group services into ordered rollout batches.
++
++    All replicas of a service move together. Each batch scans the services
++    whose prerequisites completed in earlier batches, in lexical order, and
++    admits a service if its replica count fits in what remains of
++    `max_parallel` and none of its hosts is already used by the batch.
++    Services that do not fit are deferred without blocking later ones.
++
++    Parameters
++    ----------
++    model : Model
++    placements : dict
++        Either ``{service: hosts}`` or the result of
++        :func:`~networkx.deployment.placement.place`. It must be complete
++        and feasible for `model`.
++    max_parallel : int
++        Positive bound on the number of replicas moved per batch.
++
++    Returns
++    -------
++    list of lists of service IDs
++
++    Raises
++    ------
++    ValueError
++        For an invalid placement or `max_parallel`, or if a service has more
++        replicas than `max_parallel`.
++    """
++    _check_model(model)
++    max_parallel = check_int(max_parallel, "max_parallel", minimum=1)
++    placements = _validate_placements(model, placements)
++    services = model._services
++    for service, spec in services.items():
++        if spec["replicas"] > max_parallel:
++            raise ValueError(
++                f"service {service!r} has {spec['replicas']} replicas, more than "
++                f"max_parallel={max_parallel}"
++            )
++
++    completed = set()
++    remaining = sorted(services)
++    batches = []
++    while remaining:
++        budget = max_parallel
++        busy = set()
++        batch = []
++        for service in remaining:
++            if not completed.issuperset(services[service]["requires"]):
++                continue
++            replicas = services[service]["replicas"]
++            if replicas > budget or busy.intersection(placements[service]):
++                continue
++            batch.append(service)
++            budget -= replicas
++            busy.update(placements[service])
++        # The model is acyclic and every service fits an empty batch, so the
++        # lexically first ready service is always admitted.
++        completed.update(batch)
++        remaining = [service for service in remaining if service not in completed]
++        batches.append(batch)
++    return batches
+diff --git a/networkx/deployment/cli.py b/networkx/deployment/cli.py
+new file mode 100644
+index 0000000..ae1f6a2
+--- /dev/null
++++ b/networkx/deployment/cli.py
+@@ -0,0 +1,159 @@
++"""Command line interface for planning and driving a rollout.
++
++Every command prints one strict JSON value to stdout and returns 0, or prints
++a diagnostic to stderr and returns 2 for invalid input, conflicts,
++infeasibility and I/O errors::
++
++    plan INPUT OUTPUT
++    status PLAN JOURNAL --now N [--max-attempts N]
++    claim PLAN JOURNAL WORKER --now N --ttl N [--max-attempts N]
++    ack PLAN JOURNAL LEASE --now N (--success | --failure) [--max-attempts N]
++"""
++
++import argparse
++import sys
++from collections.abc import Mapping
++
++import networkx as nx
++from networkx.deployment._util import canonical_json, check_id, loads_strict
++from networkx.deployment.controller import Controller
++from networkx.deployment.journal import ConflictError, Journal, save_json
++from networkx.deployment.model import Model
++from networkx.deployment.planner import compile_plan
++
++__all__ = ["main"]
++
++_INPUT_KEYS = frozenset({"services", "hosts", "network"})
++_CONTROL_KEYS = frozenset({"path_redundancy", "max_parallel"})
++
++
++def _load_json(path):
++    with open(path, "rb") as handle:
++        return loads_strict(handle.read())
++
++
++def _network_from_json(network):
++    if not isinstance(network, Mapping) or set(network) != {"nodes", "edges"}:
++        raise ValueError("network must have exactly 'nodes' and 'edges'")
++    nodes, edges = network["nodes"], network["edges"]
++    if not isinstance(nodes, list) or not isinstance(edges, list):
++        raise ValueError("network nodes and edges must be lists")
++    graph = nx.Graph()
++    for node in nodes:
++        check_id(node, "network node")
++        if node in graph:
++            raise ValueError(f"duplicate network node {node!r}")
++        graph.add_node(node)
++    for edge in edges:
++        if not isinstance(edge, list) or len(edge) != 3:
++            raise ValueError(f"network edge {edge!r} must be [u, v, weight]")
++        u, v, weight = edge
++        for node in (u, v):
++            if not isinstance(node, str) or node not in graph:
++                raise ValueError(f"network edge {edge!r} uses an unknown node")
++        if graph.has_edge(u, v):
++            raise ValueError(f"duplicate network edge {edge!r}")
++        graph.add_edge(u, v, weight=weight)
++    return graph
++
++
++def _plan(args):
++    document = _load_json(args.input)
++    if not isinstance(document, dict) or not (
++        _INPUT_KEYS <= set(document) <= _INPUT_KEYS | _CONTROL_KEYS
++    ):
++        raise ValueError(
++            "input must contain services, hosts and network, and optionally "
++            "path_redundancy and max_parallel"
++        )
++    model = Model(
++        document["services"],
++        document["hosts"],
++        _network_from_json(document["network"]),
++    )
++    plan = compile_plan(
++        model,
++        path_redundancy=document.get("path_redundancy", 1),
++        max_parallel=document.get("max_parallel", 4),
++    )
++    save_json(args.output, plan)
++    return plan
++
++
++def _controller(args):
++    return Controller(
++        _load_json(args.plan), Journal(args.journal), max_attempts=args.max_attempts
++    )
++
++
++def _status(args):
++    return _controller(args).snapshot(args.now)
++
++
++def _claim(args):
++    return _controller(args).claim(args.worker, args.now, args.ttl)
++
++
++def _ack(args):
++    controller = _controller(args)
++    return controller.ack(_load_json(args.lease), args.success, args.now)
++
++
++def _parser():
++    parser = argparse.ArgumentParser(
++        prog="python -m networkx.deployment.cli",
++        description="Plan and drive a failure-domain-aware rollout.",
++    )
++    commands = parser.add_subparsers(dest="command", required=True)
++
++    plan = commands.add_parser("plan", help="compile a model into a plan file")
++    plan.add_argument("input", help="model JSON file")
++    plan.add_argument("output", help="plan JSON file to write")
++    plan.set_defaults(handler=_plan)
++
++    def controller_command(name, handler, summary):
++        command = commands.add_parser(name, help=summary)
++        command.add_argument("plan", help="plan JSON file")
++        command.add_argument("journal", help="journal JSON file")
++        command.set_defaults(handler=handler)
++        return command
++
++    def add_clock(command):
++        command.add_argument("--now", type=int, required=True)
++        command.add_argument("--max-attempts", type=int, default=2)
++
++    status = controller_command("status", _status, "show the rollout state")
++    add_clock(status)
++
++    claim = controller_command("claim", _claim, "lease the next service")
++    claim.add_argument("worker")
++    add_clock(claim)
++    claim.add_argument("--ttl", type=int, required=True)
++
++    ack = controller_command("ack", _ack, "record the outcome of a lease")
++    ack.add_argument("lease", help="lease JSON file")
++    add_clock(ack)
++    outcome = ack.add_mutually_exclusive_group(required=True)
++    outcome.add_argument("--success", dest="success", action="store_true")
++    outcome.add_argument("--failure", dest="success", action="store_false")
++    return parser
++
++
++def main(argv=None):
++    """Run the CLI with `argv` (default ``sys.argv[1:]``) and return the status."""
++    parser = _parser()
++    try:
++        args = parser.parse_args(argv)
++    except SystemExit as error:
++        return error.code if isinstance(error.code, int) else 2
++    try:
++        output = canonical_json(args.handler(args))
++    except (ValueError, ConflictError, nx.NetworkXException, OSError) as err:
++        print(f"error: {err}", file=sys.stderr)
++        return 2
++    print(output)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/networkx/deployment/controller.py b/networkx/deployment/controller.py
+new file mode 100644
+index 0000000..f3bb390
+--- /dev/null
++++ b/networkx/deployment/controller.py
+@@ -0,0 +1,333 @@
++"""A durable, lease-based rollout controller driven by a :class:`Journal`.
++
++All controller state is reconstructed by replaying the journal, so any
++number of :class:`Controller` objects (in one or several processes) can share
++it. Writes use optimistic compare-and-swap on the journal revision.
++
++Controller events are ordinary journal records. Their IDs are
++``controller/claim/<revision>`` and ``controller/ack/<token>``; their payload
++is a dict pinning the plan id and ``max_attempts``::
++
++    {"controller": 1, "plan": ..., "max_attempts": ..., "action": "claim",
++     "now": ..., "service": ..., "worker": ..., "expires": ...}
++    {"controller": 1, "plan": ..., "max_attempts": ..., "action": "ack",
++     "now": ..., "service": ..., "worker": ..., "token": ..., "expires": ...,
++     "success": ...}
++
++Journal events with other IDs are ignored.
++"""
++
++from collections.abc import Mapping
++
++from networkx.deployment._util import (
++    check_bool,
++    check_id,
++    check_int,
++    is_id,
++    is_int,
++)
++from networkx.deployment.journal import ConflictError, Journal
++from networkx.deployment.planner import _verify_plan
++
++__all__ = ["Controller"]
++
++_PREFIX = "controller/"
++_VERSION = 1
++_CAS_ATTEMPTS = 64
++_LEASE_KEYS = frozenset({"service", "worker", "token", "expires"})
++_CLAIM_KEYS = frozenset({"controller", "plan", "max_attempts", "action", "now"}) | (
++    _LEASE_KEYS - {"token"}
++)
++_ACK_KEYS = _CLAIM_KEYS | {"token", "success"}
++
++
++class _State:
++    """Controller state replayed from a journal document."""
++
++    def __init__(self, revision):
++        self.revision = revision
++        self.clock = None
++        self.attempts = {}
++        self.done = set()
++        self.failed = set()
++        self.leases = {}  # service -> latest unacknowledged lease
++        self.claims = {}  # token -> lease
++        self.acks = {}  # token -> success
++
++
++def _check_lease(lease):
++    if not isinstance(lease, Mapping) or set(lease) != _LEASE_KEYS:
++        raise ValueError("lease must have exactly service, worker, token, expires")
++    check_id(lease["service"], "lease service")
++    check_id(lease["worker"], "lease worker")
++    check_int(lease["token"], "lease token", minimum=1)
++    check_int(lease["expires"], "lease expires")
++    return {key: lease[key] for key in sorted(_LEASE_KEYS)}
++
++
++class Controller:
++    """Hand out and settle rollout work for a compiled plan.
++
++    Parameters
++    ----------
++    plan : dict
++        A plan from :func:`~networkx.deployment.planner.compile_plan`. It is
++        copied and its ``id`` is verified against all other fields.
++    journal : Journal
++        Durable shared state. The constructor only reads it, to reject a
++        journal recorded for a different plan or ``max_attempts``.
++    max_attempts : int
++        How many times a service may be granted before an expired or failed
++        attempt makes it ``failed``.
++    """
++
++    def __init__(self, plan, journal, max_attempts=2):
++        if not isinstance(journal, Journal):
++            raise ValueError(f"expected a Journal, got {type(journal).__name__}")
++        self._max_attempts = check_int(max_attempts, "max_attempts", minimum=1)
++        self._plan = _verify_plan(plan)
++        self._journal = journal
++        self._services = sorted(self._plan["dependencies"])
++        self._load()
++
++    @property
++    def plan(self):
++        return _verify_plan(self._plan)
++
++    @property
++    def max_attempts(self):
++        return self._max_attempts
++
++    # -- replay ---------------------------------------------------------------
++
++    def _load(self):
++        document = self._journal.read()
++        state = _State(document["revision"])
++        state.attempts = dict.fromkeys(self._services, 0)
++        for record in document["events"]:
++            event = record["event"]
++            if event["id"].startswith(_PREFIX):
++                self._apply(state, record["revision"], event)
++        return state
++
++    def _apply(self, state, revision, event):
++        payload = event["payload"]
++        if not isinstance(payload, dict) or payload.get("controller") != _VERSION:
++            raise ValueError(f"malformed controller event at revision {revision}")
++        if payload.get("plan") != self._plan["id"]:
++            raise ValueError("journal was recorded for a different plan")
++        if payload.get("max_attempts") != self._max_attempts:
++            raise ValueError("journal was recorded with a different max_attempts")
++        action = payload.get("action")
++        keys = {"claim": _CLAIM_KEYS, "ack": _ACK_KEYS}.get(action)
++        if keys is None or set(payload) != keys:
++            raise ValueError(f"malformed controller event at revision {revision}")
++        now = payload["now"]
++        service = payload["service"]
++        if (
++            not is_int(now)
++            or now < 0
++            or (state.clock is not None and now < state.clock)
++            or not is_id(service)
++            or service not in state.attempts
++            or not is_id(payload["worker"])
++            or not is_int(payload["expires"])
++        ):
++            raise ValueError(f"inconsistent controller event at revision {revision}")
++        state.clock = now
++        corrupt = ValueError(f"inconsistent controller event at revision {revision}")
++
++        if action == "claim":
++            current = state.leases.get(service)
++            if (
++                event["id"] != f"{_PREFIX}claim/{revision}"
++                or service in state.done
++                or service in state.failed
++                or (current is not None and now < current["expires"])
++                or state.attempts[service] >= self._max_attempts
++            ):
++                raise corrupt
++            lease = {
++                "service": service,
++                "worker": payload["worker"],
++                "token": revision,
++                "expires": payload["expires"],
++            }
++            state.attempts[service] += 1
++            state.leases[service] = lease
++            state.claims[revision] = lease
++        else:
++            token = payload["token"]
++            lease = state.claims.get(token) if is_int(token) else None
++            if (
++                event["id"] != f"{_PREFIX}ack/{token}"
++                or lease is None
++                or token in state.acks
++                or state.leases.get(service) is not lease
++                or lease["worker"] != payload["worker"]
++                or lease["expires"] != payload["expires"]
++                or now >= lease["expires"]
++                or not isinstance(payload["success"], bool)
++            ):
++                raise corrupt
++            state.acks[token] = payload["success"]
++            del state.leases[service]
++            if payload["success"]:
++                state.done.add(service)
++            elif state.attempts[service] >= self._max_attempts:
++                state.failed.add(service)
++
++    def _states(self, state, now):
++        """Return the status of every service at time `now`."""
++        dependencies = self._plan["dependencies"]
++        states = {}
++        for batch in self._plan["batches"]:
++            for service in batch:
++                lease = state.leases.get(service)
++                if service in state.done:
++                    status = "done"
++                elif service in state.failed:
++                    status = "failed"
++                elif lease is not None and now < lease["expires"]:
++                    status = "leased"
++                elif state.attempts[service] >= self._max_attempts:
++                    status = "failed"
++                elif any(
++                    states[p] in ("failed", "blocked") for p in dependencies[service]
++                ):
++                    status = "blocked"
++                else:
++                    status = "pending"
++                states[service] = status
++        return {service: states[service] for service in self._services}
++
++    def _active_leases(self, state, now):
++        return {
++            service: dict(lease)
++            for service, lease in sorted(state.leases.items())
++            if now < lease["expires"]
++        }
++
++    def _check_clock(self, state, now):
++        if state.clock is not None and now < state.clock:
++            raise ValueError(
++                f"now={now} is older than the last controller action at {state.clock}"
++            )
++
++    def _payload(self, action, now, **fields):
++        return {
++            "controller": _VERSION,
++            "plan": self._plan["id"],
++            "max_attempts": self._max_attempts,
++            "action": action,
++            "now": now,
++            **fields,
++        }
++
++    # -- public API -----------------------------------------------------------
++
++    def snapshot(self, now):
++        """Return ``{"states", "attempts", "leases", "revision"}`` at `now`.
++
++        ``states`` and ``attempts`` cover every service in lexical order;
++        ``leases`` maps services to their active, unexpired leases.
++        """
++        now = check_int(now, "now")
++        state = self._load()
++        return {
++            "states": self._states(state, now),
++            "attempts": dict(state.attempts),
++            "leases": self._active_leases(state, now),
++            "revision": state.revision,
++        }
++
++    def claim(self, worker, now, ttl):
++        """Lease the next available service to `worker`, or return None.
++
++        A worker that already holds an unexpired lease gets that same lease
++        back without a write. Otherwise the lexically first available service
++        of the earliest batch with unfinished services is granted until
++        ``now + ttl``; its token is the journal revision of the grant.
++        """
++        worker = check_id(worker, "worker")
++        now = check_int(now, "now")
++        ttl = check_int(ttl, "ttl", minimum=1)
++        dependencies = self._plan["dependencies"]
++        for _ in range(_CAS_ATTEMPTS):
++            state = self._load()
++            self._check_clock(state, now)
++            for lease in self._active_leases(state, now).values():
++                if lease["worker"] == worker:
++                    return lease
++            states = self._states(state, now)
++            service = None
++            for batch in self._plan["batches"]:
++                if all(states[s] in ("done", "failed", "blocked") for s in batch):
++                    continue
++                service = next(
++                    (
++                        s
++                        for s in sorted(batch)
++                        if states[s] == "pending"
++                        and all(states[p] == "done" for p in dependencies[s])
++                    ),
++                    None,
++                )
++                break
++            if service is None:
++                return None
++            expires = now + ttl
++            payload = self._payload(
++                "claim", now, service=service, worker=worker, expires=expires
++            )
++            event = {"id": f"{_PREFIX}claim/{state.revision + 1}", "payload": payload}
++            try:
++                token = self._journal.append(state.revision, event)
++            except ConflictError:
++                continue
++            return {
++                "service": service,
++                "worker": worker,
++                "token": token,
++                "expires": expires,
++            }
++        raise ConflictError("too much contention while claiming; retry")
++
++    def ack(self, lease, success, now):
++        """Record the outcome of a lease.
++
++        Returns True when the decision is recorded, or False when exactly
++        this decision was already recorded for this lease. Stale, forged,
++        expired or contradicting acknowledgements raise ConflictError.
++        """
++        lease = _check_lease(lease)
++        success = check_bool(success, "success")
++        now = check_int(now, "now")
++        token = lease["token"]
++        for _ in range(_CAS_ATTEMPTS):
++            state = self._load()
++            if state.claims.get(token) != lease:
++                raise ConflictError("lease does not match a recorded grant")
++            if token in state.acks:
++                if state.acks[token] == success:
++                    return False
++                raise ConflictError("a different decision was already recorded")
++            self._check_clock(state, now)
++            if now >= lease["expires"]:
++                raise ConflictError("lease has expired")
++            payload = self._payload(
++                "ack",
++                now,
++                service=lease["service"],
++                worker=lease["worker"],
++                token=token,
++                expires=lease["expires"],
++                success=success,
++            )
++            event = {"id": f"{_PREFIX}ack/{token}", "payload": payload}
++            try:
++                revision = self._journal.append(state.revision, event)
++            except ConflictError:
++                continue
++            return revision == state.revision + 1
++        raise ConflictError("too much contention while acknowledging; retry")
+diff --git a/networkx/deployment/journal.py b/networkx/deployment/journal.py
+new file mode 100644
+index 0000000..2a3972c
+--- /dev/null
++++ b/networkx/deployment/journal.py
+@@ -0,0 +1,213 @@
++"""Atomic JSON files and an append-only, optimistically versioned event journal.
++
++The journal is a single canonical JSON document ``{"schema": 1, "revision":
++N, "events": [...]}`` that is rewritten atomically on every append. Appends
++from independent :class:`Journal` objects (or processes) are serialized by an
++exclusive ``fcntl`` lock on a ``<path>.lock`` sidecar file.
++"""
++
++import os
++import tempfile
++from collections.abc import Mapping
++
++from networkx.deployment._util import (
++    canonical_json,
++    check_id,
++    check_int,
++    encode,
++    is_id,
++    is_int,
++    loads_strict,
++    normalize,
++)
++
++try:
++    import fcntl
++except ImportError:  # pragma: no cover - non-POSIX platforms
++    fcntl = None
++
++__all__ = ["ConflictError", "Journal", "save_json"]
++
++_SCHEMA = 1
++
++
++class ConflictError(ValueError):
++    """A write conflicts with state recorded by another writer.
++
++    Raised for stale expected revisions, an event ID reused with a different
++    payload, and controller leases or decisions that are no longer valid.
++    """
++
++
++def save_json(path, value):
++    """Atomically write the canonical JSON of `value` to `path` as UTF-8.
++
++    `value` is normalized by a strict JSON round trip first; NaN, infinity
++    and unserializable values raise ValueError. The data is written to a
++    temporary file in the destination directory and moved into place with
++    :func:`os.replace`, so readers see either the old or the new document.
++    On any failure the temporary file is removed and an existing destination
++    is left untouched.
++    """
++    path = os.fspath(path)
++    data = encode(normalize(value))
++    directory = os.path.dirname(os.path.abspath(path))
++    fd, temporary = tempfile.mkstemp(
++        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
++    )
++    try:
++        with os.fdopen(fd, "wb") as handle:
++            handle.write(data)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, path)
++    except BaseException:
++        try:
++            os.unlink(temporary)
++        except OSError:
++            pass
++        raise
++    _fsync_directory(directory)
++
++
++def _fsync_directory(directory):
++    try:
++        fd = os.open(directory, os.O_RDONLY)
++    except OSError:
++        return
++    try:
++        os.fsync(fd)
++    except OSError:
++        pass
++    finally:
++        os.close(fd)
++
++
++def _check_event(event, what="event"):
++    if not isinstance(event, Mapping) or set(event) != {"id", "payload"}:
++        raise ValueError(f"{what} must be a dict with exactly 'id' and 'payload'")
++    check_id(event["id"], f"{what} id")
++    return normalize({"id": event["id"], "payload": event["payload"]})
++
++
++def _validate_document(document):
++    if not isinstance(document, dict) or set(document) != {
++        "schema",
++        "revision",
++        "events",
++    }:
++        raise ValueError("journal must contain exactly schema, revision and events")
++    if not is_int(document["schema"]) or document["schema"] != _SCHEMA:
++        raise ValueError(f"unsupported journal schema {document['schema']!r}")
++    events = document["events"]
++    if not isinstance(events, list):
++        raise ValueError("journal events must be a list")
++    seen = set()
++    for index, record in enumerate(events, 1):
++        if not isinstance(record, dict) or set(record) != {"revision", "event"}:
++            raise ValueError("journal records must have exactly revision and event")
++        if not is_int(record["revision"]) or record["revision"] != index:
++            raise ValueError(f"journal revision {record['revision']!r} is not {index}")
++        event = record["event"]
++        if not isinstance(event, dict) or set(event) != {"id", "payload"}:
++            raise ValueError("journal events must have exactly id and payload")
++        if not is_id(event["id"]):
++            raise ValueError(f"journal event id {event['id']!r} is invalid")
++        if event["id"] in seen:
++            raise ValueError(f"duplicate journal event id {event['id']!r}")
++        seen.add(event["id"])
++    if not is_int(document["revision"]) or document["revision"] != len(events):
++        raise ValueError("journal revision does not match its events")
++    return document
++
++
++class Journal:
++    """An append-only event journal stored as one JSON file at `path`.
++
++    Each record is ``{"revision": N, "event": {"id": ..., "payload": ...}}``
++    with revisions numbered consecutively from 1. Event IDs are unique.
++    """
++
++    def __init__(self, path):
++        try:
++            path = os.fspath(path)
++        except TypeError:
++            raise ValueError(f"journal path must be path-like, got {path!r}") from None
++        if not isinstance(path, str) or not path:
++            raise ValueError(f"journal path must be a nonempty string, got {path!r}")
++        self._path = path
++        self._lock_path = path + ".lock"
++
++    @property
++    def path(self):
++        return self._path
++
++    def __repr__(self):
++        return f"Journal({self._path!r})"
++
++    def read(self):
++        """Return ``{"schema": 1, "revision": N, "events": [...]}``.
++
++        A missing journal reads as revision 0 and is not created. Malformed
++        or unsupported content raises ValueError.
++        """
++        try:
++            with open(self._path, "rb") as handle:
++                data = handle.read()
++        except FileNotFoundError:
++            return {"schema": _SCHEMA, "revision": 0, "events": []}
++        return _validate_document(loads_strict(data))
++
++    def append(self, expected_revision, event):
++        """Append `event` if the journal is still at `expected_revision`.
++
++        Parameters
++        ----------
++        expected_revision : int
++            The revision the caller last observed.
++        event : dict
++            ``{"id": nonempty_str, "payload": JSON_value}``; it is copied.
++
++        Returns
++        -------
++        int
++            The revision of the new record. If an event with the same ID and
++            normalized payload already exists, its original revision is
++            returned and nothing is written, even for a stale
++            `expected_revision`.
++
++        Raises
++        ------
++        ConflictError
++            If the ID exists with a different payload, or if a new event is
++            appended with a stale `expected_revision`.
++        ValueError
++            For invalid arguments or a malformed journal.
++        """
++        expected_revision = check_int(expected_revision, "expected_revision")
++        event = _check_event(event)
++        if fcntl is None:  # pragma: no cover - non-POSIX platforms
++            raise OSError("journal locking requires fcntl")
++        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o666)
++        try:
++            fcntl.flock(fd, fcntl.LOCK_EX)
++            document = self.read()
++            for record in document["events"]:
++                if record["event"]["id"] == event["id"]:
++                    if canonical_json(record["event"]) == canonical_json(event):
++                        return record["revision"]
++                    raise ConflictError(
++                        f"event {event['id']!r} already exists with another payload"
++                    )
++            if document["revision"] != expected_revision:
++                raise ConflictError(
++                    f"journal is at revision {document['revision']}, "
++                    f"not {expected_revision}"
++                )
++            revision = expected_revision + 1
++            document["events"].append({"revision": revision, "event": event})
++            document["revision"] = revision
++            save_json(self._path, document)
++            return revision
++        finally:
++            os.close(fd)
+diff --git a/networkx/deployment/model.py b/networkx/deployment/model.py
+new file mode 100644
+index 0000000..355bb34
+--- /dev/null
++++ b/networkx/deployment/model.py
+@@ -0,0 +1,201 @@
++"""Validated, immutable description of services, hosts and their network.
++
++A :class:`Model` snapshots and normalizes its input so that later changes to
++the caller's objects cannot affect planning, and so that equal deployments
++share one :attr:`Model.fingerprint`.
++"""
++
++import copy
++from collections.abc import Mapping
++
++import networkx as nx
++from networkx.deployment._util import (
++    canonical_json,
++    check_id,
++    check_int,
++    digest,
++    is_id,
++)
++
++__all__ = ["Model", "canonical_json"]
++
++_SERVICE_KEYS = frozenset({"replicas", "requires", "allowed_zones", "costs"})
++_HOST_KEYS = frozenset({"zone", "slots"})
++
++
++def _check_exact_keys(value, keys, what):
++    if not isinstance(value, Mapping):
++        raise ValueError(f"{what} must be a dict, got {type(value).__name__}")
++    actual = set(value)
++    if actual != keys:
++        missing = sorted(keys - actual)
++        extra = sorted(map(repr, actual - keys))
++        raise ValueError(f"{what} has missing keys {missing} or extra keys {extra}")
++
++
++def _check_id_list(value, what):
++    if not isinstance(value, list | tuple):
++        raise ValueError(f"{what} must be a list or tuple, got {value!r}")
++    return sorted({check_id(item, f"{what} entry") for item in value})
++
++
++def _normalize_hosts(hosts):
++    if not isinstance(hosts, Mapping):
++        raise ValueError("hosts must be a dict")
++    for host in hosts:
++        check_id(host, "host ID")
++    result = {}
++    for host in sorted(hosts):
++        spec = hosts[host]
++        _check_exact_keys(spec, _HOST_KEYS, f"host {host!r}")
++        result[str(host)] = {
++            "zone": check_id(spec["zone"], f"zone of host {host!r}"),
++            "slots": check_int(spec["slots"], f"slots of host {host!r}"),
++        }
++    return result
++
++
++def _normalize_services(services, hosts):
++    if not isinstance(services, Mapping):
++        raise ValueError("services must be a dict")
++    zones = {spec["zone"] for spec in hosts.values()}
++    for service in services:
++        check_id(service, "service ID")
++    result = {}
++    for service in sorted(services):
++        spec = services[service]
++        what = f"service {service!r}"
++        _check_exact_keys(spec, _SERVICE_KEYS, what)
++        replicas = check_int(spec["replicas"], f"replicas of {what}", minimum=1)
++        requires = _check_id_list(spec["requires"], f"requires of {what}")
++        for prerequisite in requires:
++            if prerequisite == service:
++                raise ValueError(f"{what} depends on itself")
++            if prerequisite not in services:
++                raise ValueError(f"{what} requires unknown service {prerequisite!r}")
++        allowed = spec["allowed_zones"]
++        if allowed is not None:
++            allowed = _check_id_list(allowed, f"allowed_zones of {what}")
++            unknown = [zone for zone in allowed if zone not in zones]
++            if unknown:
++                raise ValueError(f"{what} allows unknown zones {unknown}")
++        costs = spec["costs"]
++        if not isinstance(costs, Mapping):
++            raise ValueError(f"costs of {what} must be a dict")
++        if set(costs) != set(hosts):
++            raise ValueError(f"costs of {what} must cover exactly all host IDs")
++        result[str(service)] = {
++            "replicas": replicas,
++            "requires": requires,
++            "allowed_zones": allowed,
++            "costs": {
++                host: check_int(costs[host], f"cost of {what} on host {host!r}")
++                for host in hosts
++            },
++        }
++    dependencies = nx.DiGraph()
++    dependencies.add_nodes_from(result)
++    for service, spec in result.items():
++        dependencies.add_edges_from((p, service) for p in spec["requires"])
++    if not nx.is_directed_acyclic_graph(dependencies):
++        cycle = [u for u, _ in nx.find_cycle(dependencies)]
++        raise ValueError(f"service dependencies contain a cycle: {cycle}")
++    return result
++
++
++def _normalize_network(network, hosts):
++    if not isinstance(network, nx.Graph):
++        raise ValueError("network must be a networkx Graph")
++    if network.is_directed() or network.is_multigraph():
++        raise ValueError("network must be a simple undirected nx.Graph")
++    nodes = []
++    for node in network.nodes:
++        if not is_id(node):
++            raise ValueError(f"network node IDs must be nonempty strings, got {node!r}")
++        nodes.append(str(node))
++    nodes.sort()
++    missing = sorted(set(hosts) - set(nodes))
++    if missing:
++        raise ValueError(f"network is missing hosts {missing}")
++    edges = []
++    for u, v, data in network.edges(data=True):
++        if u == v:
++            raise ValueError(f"network has a self-loop on {u!r}")
++        weight = check_int(data.get("weight"), f"weight of edge {(u, v)!r}", minimum=1)
++        edges.append([min(u, v), max(u, v), weight])
++    edges.sort()
++    return {"nodes": nodes, "edges": edges}
++
++
++def _graph_from(network):
++    graph = nx.Graph()
++    graph.add_nodes_from(network["nodes"])
++    graph.add_weighted_edges_from(network["edges"])
++    return graph
++
++
++class Model:
++    """An immutable deployment model.
++
++    Parameters
++    ----------
++    services : dict
++        Maps service IDs to dicts with exactly the keys ``replicas``
++        (positive int), ``requires`` (list or tuple of prerequisite service
++        IDs), ``allowed_zones`` (None or a list or tuple of zone IDs) and
++        ``costs`` (a dict from every host ID to a nonnegative int).
++    hosts : dict
++        Maps host IDs to dicts with exactly the keys ``zone`` (nonempty str)
++        and ``slots`` (nonnegative int).
++    network : nx.Graph
++        A simple undirected graph whose string nodes include every host and
++        whose edges all carry a positive int ``weight``. Other attributes are
++        ignored.
++
++    Raises
++    ------
++    ValueError
++        If any part of the input is invalid. The input is never modified.
++    """
++
++    __slots__ = ("_services", "_hosts", "_network", "_graph", "_fingerprint")
++
++    def __init__(self, services, hosts, network):
++        hosts = _normalize_hosts(hosts)
++        self._hosts = hosts
++        self._services = _normalize_services(services, hosts)
++        self._network = _normalize_network(network, hosts)
++        self._graph = _graph_from(self._network)
++        self._fingerprint = digest(
++            {
++                "services": self._services,
++                "hosts": self._hosts,
++                "network": self._network,
++            }
++        )
++
++    @property
++    def services(self):
++        """A normalized copy of the services, keyed in lexical order."""
++        return copy.deepcopy(self._services)
++
++    @property
++    def hosts(self):
++        """A normalized copy of the hosts, keyed in lexical order."""
++        return copy.deepcopy(self._hosts)
++
++    @property
++    def network(self):
++        """A new nx.Graph holding only the network nodes and edge weights."""
++        return _graph_from(self._network)
++
++    @property
++    def fingerprint(self):
++        """SHA-256 hex digest of the canonical normalized model."""
++        return self._fingerprint
++
++    def __repr__(self):
++        return (
++            f"<Model services={len(self._services)} hosts={len(self._hosts)} "
++            f"fingerprint={self._fingerprint[:12]}>"
++        )
+diff --git a/networkx/deployment/placement.py b/networkx/deployment/placement.py
+new file mode 100644
+index 0000000..5d62cce
+--- /dev/null
++++ b/networkx/deployment/placement.py
+@@ -0,0 +1,90 @@
++"""Globally cost-optimal, zone-spread replica placement."""
++
++import networkx as nx
++from networkx.deployment.model import Model
++
++__all__ = ["place"]
++
++_SINK = ("sink",)
++
++
++def _check_model(model):
++    if not isinstance(model, Model):
++        raise ValueError(f"expected a deployment Model, got {type(model).__name__}")
++
++
++def place(model):
++    """Place every service's replicas on hosts at minimum total cost.
++
++    Each service gets exactly ``replicas`` distinct hosts, at most one per
++    failure zone and only in its allowed zones, and no host receives more
++    replicas (over all services) than its slots. The total cost is minimized
++    globally with :func:`networkx.min_cost_flow` on the network::
++
++        service -> (service, zone) -> host -> sink
++
++    where the service/zone arcs have capacity 1 (zone spreading), zone/host
++    arcs cost the service's host cost, and host/sink arcs carry the slots.
++
++    Returns
++    -------
++    dict
++        ``{"placements": {service: sorted_hosts}, "cost": int}`` with every
++        service present in lexical order.
++
++    Raises
++    ------
++    NetworkXUnfeasible
++        If not all replicas can be placed.
++    """
++    _check_model(model)
++    services = model._services
++    hosts = model._hosts
++    if not services:
++        return {"placements": {}, "cost": 0}
++
++    zone_hosts = {}
++    for host, spec in hosts.items():
++        if spec["slots"] > 0:
++            zone_hosts.setdefault(spec["zone"], []).append(host)
++
++    G = nx.DiGraph()
++    total = 0
++    for service, spec in services.items():
++        total += spec["replicas"]
++        G.add_node(("service", service), demand=-spec["replicas"])
++        zones = spec["allowed_zones"]
++        if zones is None:
++            zones = sorted(zone_hosts)
++        for zone in zones:
++            if zone not in zone_hosts:
++                continue
++            spread = ("zone", service, zone)
++            G.add_edge(("service", service), spread, capacity=1, weight=0)
++            for host in zone_hosts[zone]:
++                G.add_edge(
++                    spread, ("host", host), capacity=1, weight=spec["costs"][host]
++                )
++    for host in hosts:
++        if ("host", host) in G:
++            G.add_edge(("host", host), _SINK, capacity=hosts[host]["slots"], weight=0)
++    G.add_node(_SINK, demand=total)
++
++    flow = nx.min_cost_flow(G)
++
++    placements = {}
++    cost = 0
++    for service, spec in services.items():
++        chosen = [
++            host_node[1]
++            for spread, used in flow[("service", service)].items()
++            if used
++            for host_node, units in flow[spread].items()
++            if units
++        ]
++        if len(chosen) != spec["replicas"]:  # pragma: no cover - flow invariant
++            raise nx.NetworkXUnfeasible(f"cannot place service {service!r}")
++        chosen.sort()
++        placements[service] = chosen
++        cost += sum(spec["costs"][host] for host in chosen)
++    return {"placements": placements, "cost": cost}
+diff --git a/networkx/deployment/planner.py b/networkx/deployment/planner.py
+new file mode 100644
+index 0000000..d1a2b2a
+--- /dev/null
++++ b/networkx/deployment/planner.py
+@@ -0,0 +1,156 @@
++"""Compile a model into a self-verifying deployment plan."""
++
++from collections.abc import Mapping
++
++from networkx.deployment._util import check_int, digest, is_id, is_int, normalize
++from networkx.deployment.batches import rollout_batches
++from networkx.deployment.placement import _check_model, place
++from networkx.deployment.routing import route
++
++__all__ = ["compile_plan"]
++
++_SCHEMA = 1
++_PLAN_KEYS = frozenset(
++    {
++        "schema",
++        "id",
++        "deployment",
++        "dependencies",
++        "placements",
++        "cost",
++        "batches",
++        "routes",
++        "path_redundancy",
++        "max_parallel",
++    }
++)
++
++
++def _plan_id(plan):
++    return digest({key: value for key, value in plan.items() if key != "id"})
++
++
++def compile_plan(model, path_redundancy=1, max_parallel=4):
++    """Return a complete deployment plan for `model`.
++
++    The plan combines :func:`~networkx.deployment.placement.place`,
++    :func:`~networkx.deployment.batches.rollout_batches` and, for every
++    direct dependency and every pair of producer/consumer hosts,
++    :func:`~networkx.deployment.routing.route` with ``k=path_redundancy``.
++
++    Returns
++    -------
++    dict
++        With exactly the keys ``schema`` (1), ``id`` (SHA-256 of the
++        canonical JSON of all other fields), ``deployment`` (the model
++        fingerprint), ``dependencies``, ``placements``, ``cost``,
++        ``batches``, ``routes``, ``path_redundancy`` and ``max_parallel``.
++
++    Raises
++    ------
++    ValueError
++        For invalid controls or a model that cannot be batched.
++    NetworkXUnfeasible
++        If placement or any route is infeasible.
++    """
++    _check_model(model)
++    path_redundancy = check_int(path_redundancy, "path_redundancy", minimum=1)
++    max_parallel = check_int(max_parallel, "max_parallel", minimum=1)
++
++    placed = place(model)
++    placements = placed["placements"]
++    batches = rollout_batches(model, placed, max_parallel)
++    dependencies = {
++        service: list(spec["requires"]) for service, spec in model._services.items()
++    }
++
++    paths = {}
++    routes = []
++    for consumer, producers in dependencies.items():
++        for producer in producers:
++            for source in placements[producer]:
++                for target in placements[consumer]:
++                    if (source, target) not in paths:
++                        paths[source, target] = route(
++                            model, source, target, k=path_redundancy
++                        )
++                    routes.append(
++                        {
++                            "producer": producer,
++                            "consumer": consumer,
++                            "source": source,
++                            "target": target,
++                            "paths": [list(p) for p in paths[source, target]],
++                        }
++                    )
++    routes.sort(
++        key=lambda r: (r["producer"], r["consumer"], r["source"], r["target"])
++    )
++
++    plan = {
++        "schema": _SCHEMA,
++        "deployment": model.fingerprint,
++        "dependencies": dependencies,
++        "placements": placements,
++        "cost": placed["cost"],
++        "batches": batches,
++        "routes": routes,
++        "path_redundancy": path_redundancy,
++        "max_parallel": max_parallel,
++    }
++    plan["id"] = _plan_id(plan)
++    return {key: plan[key] for key in sorted(plan)}
++
++
++def _verify_plan(plan):
++    """Return a normalized copy of a compiled `plan`, checking its integrity.
++
++    Raises ValueError unless `plan` has exactly the plan fields, a matching
++    ``id`` and a consistent dependency/batch structure.
++    """
++    if not isinstance(plan, Mapping) or set(plan) != _PLAN_KEYS:
++        raise ValueError("plan must have exactly the compiled plan fields")
++    plan = normalize(plan)
++    if not is_int(plan["schema"]) or plan["schema"] != _SCHEMA:
++        raise ValueError(f"unsupported plan schema {plan['schema']!r}")
++    if not isinstance(plan["id"], str) or plan["id"] != _plan_id(plan):
++        raise ValueError("plan id does not match its contents")
++    check_int(plan["path_redundancy"], "plan path_redundancy", minimum=1)
++    check_int(plan["max_parallel"], "plan max_parallel", minimum=1)
++    check_int(plan["cost"], "plan cost")
++
++    dependencies = plan["dependencies"]
++    if not isinstance(dependencies, dict):
++        raise ValueError("plan dependencies must be a dict")
++    for service, requires in dependencies.items():
++        if not is_id(service) or not isinstance(requires, list):
++            raise ValueError(f"plan dependencies of {service!r} are malformed")
++        if any(not is_id(p) or p not in dependencies or p == service for p in requires):
++            raise ValueError(f"plan dependencies of {service!r} are inconsistent")
++    if not isinstance(plan["placements"], dict) or set(plan["placements"]) != set(
++        dependencies
++    ):
++        raise ValueError("plan placements do not match its services")
++
++    batches = plan["batches"]
++    if not isinstance(batches, list):
++        raise ValueError("plan batches must be a list")
++    completed = set()
++    for batch in batches:
++        if not isinstance(batch, list) or not batch:
++            raise ValueError("plan batches must be nonempty lists")
++        current = set()
++        for service in batch:
++            if not is_id(service) or service not in dependencies:
++                raise ValueError(f"plan batch entry {service!r} is unknown")
++            if service in completed or service in current:
++                raise ValueError(f"plan batches {service!r} twice")
++            if not completed.issuperset(dependencies[service]):
++                raise ValueError(f"plan batches {service!r} before a prerequisite")
++            current.add(service)
++        completed |= current
++    if completed != set(dependencies):
++        raise ValueError("plan batches do not cover every service")
++    if not isinstance(plan["routes"], list):
++        raise ValueError("plan routes must be a list")
++    return plan
+diff --git a/networkx/deployment/routing.py b/networkx/deployment/routing.py
+new file mode 100644
+index 0000000..57b185f
+--- /dev/null
++++ b/networkx/deployment/routing.py
+@@ -0,0 +1,78 @@
++"""Minimum-weight sets of edge-disjoint network paths."""
++
++import networkx as nx
++from networkx.deployment._util import check_int
++from networkx.deployment.placement import _check_model
++
++__all__ = ["route"]
++
++
++def _check_endpoint(graph, node, what):
++    if not isinstance(node, str) or node not in graph:
++        raise ValueError(f"{what} {node!r} is not a network node")
++
++
++def route(model, source, target, k=1):
++    """Return `k` edge-disjoint `source`-`target` paths of minimum total weight.
++
++    Each undirected network edge becomes two opposite unit-capacity arcs, and
++    :func:`networkx.min_cost_flow` sends `k` units from `source` to `target`.
++    Because all weights are positive, an optimal flow never uses both arcs of
++    an edge and contains no cycles, so it decomposes into `k` simple paths
++    that share no undirected edge.
++
++    Returns
++    -------
++    list of lists
++        The node paths, sorted lexicographically. A local route
++        (``source == target``) is ``[[source]]`` regardless of `k`.
++
++    Raises
++    ------
++    ValueError
++        If an endpoint is not a network node or `k` is not a positive int.
++    NetworkXUnfeasible
++        If fewer than `k` edge-disjoint paths exist.
++    """
++    _check_model(model)
++    k = check_int(k, "k", minimum=1)
++    graph = model._graph
++    _check_endpoint(graph, source, "source")
++    _check_endpoint(graph, target, "target")
++    if source == target:
++        return [[source]]
++
++    G = nx.DiGraph()
++    G.add_nodes_from(graph)
++    for u, v, weight in graph.edges(data="weight"):
++        G.add_edge(u, v, capacity=1, weight=weight)
++        G.add_edge(v, u, capacity=1, weight=weight)
++    G.nodes[source]["demand"] = -k
++    G.nodes[target]["demand"] = k
++    flow = nx.min_cost_flow(G)
++
++    successors = {}
++    for u, targets in flow.items():
++        for v, units in targets.items():
++            if units and not flow[v][u]:
++                successors.setdefault(u, []).append(v)
++    for nodes in successors.values():
++        nodes.sort(reverse=True)
++
++    paths = []
++    for _ in range(k):
++        path = [source]
++        position = {source: 0}
++        while path[-1] != target:
++            node = successors[path[-1]].pop()
++            if node in position:
++                # Optimal flows are acyclic; drop a cycle rather than repeat it.
++                for dropped in path[position[node] + 1 :]:
++                    del position[dropped]
++                del path[position[node] + 1 :]
++            else:
++                position[node] = len(path)
++                path.append(node)
++        paths.append(path)
++    paths.sort()
++    return paths
+diff --git a/test_r1_behavior.py b/test_r1_behavior.py
+new file mode 100644
+index 0000000..7fe409f
+--- /dev/null
++++ b/test_r1_behavior.py
+@@ -0,0 +1,149 @@
++import copy
++import hashlib
++import json
++import unittest
++
++import networkx as nx
++from networkx.deployment.model import Model, canonical_json
++
++
++def sample_inputs():
++    hosts = {
++        "h2": {"zone": "b", "slots": 2},
++        "h1": {"zone": "a", "slots": 1},
++    }
++    services = {
++        "web": {
++            "replicas": 2,
++            "requires": ("db", "db"),
++            "allowed_zones": ["b", "a", "a"],
++            "costs": {"h1": 1, "h2": 0},
++        },
++        "db": {
++            "replicas": 1,
++            "requires": [],
++            "allowed_zones": None,
++            "costs": {"h1": 3, "h2": 5},
++        },
++    }
++    network = nx.Graph(name="ignored")
++    network.add_node("h1", color="red")
++    network.add_edge("h2", "h1", weight=4, label="ignored")
++    network.add_edge("router", "h2", weight=1)
++    return services, hosts, network
++
++
++class TestR1Behavior(unittest.TestCase):
++    def test_normalizes_and_fingerprints(self):
++        model = Model(*sample_inputs())
++        self.assertEqual(list(model.services), ["db", "web"])
++        self.assertEqual(model.services["web"]["requires"], ["db"])
++        self.assertEqual(model.services["web"]["allowed_zones"], ["a", "b"])
++        self.assertIsNone(model.services["db"]["allowed_zones"])
++        self.assertEqual(list(model.hosts), ["h1", "h2"])
++        normalized = {
++            "services": model.services,
++            "hosts": model.hosts,
++            "network": {
++                "nodes": ["h1", "h2", "router"],
++                "edges": [["h1", "h2", 4], ["h2", "router", 1]],
++            },
++        }
++        text = json.dumps(
++            normalized,
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++            allow_nan=False,
++        )
++        expected = hashlib.sha256(text.encode("utf-8")).hexdigest()
++        self.assertEqual(model.fingerprint, expected)
++        self.assertEqual(model.fingerprint, Model(*sample_inputs()).fingerprint)
++        network = model.network
++        self.assertEqual(sorted(network.nodes), ["h1", "h2", "router"])
++        self.assertEqual(network.edges["h1", "h2"], {"weight": 4})
++        self.assertEqual(network.graph, {})
++
++    def test_snapshots_and_defensive_copies(self):
++        services, hosts, network = sample_inputs()
++        before = copy.deepcopy((services, hosts))
++        model = Model(services, hosts, network)
++        self.assertEqual((services, hosts), before)
++        fingerprint = model.fingerprint
++        services["db"]["replicas"] = 9
++        hosts["h1"]["slots"] = 0
++        network.add_edge("h1", "router", weight=1)
++        model.services["db"]["costs"]["h1"] = 99
++        model.hosts["h2"]["zone"] = "z"
++        model.network.add_edge("x", "y", weight=1)
++        self.assertEqual(model.fingerprint, fingerprint)
++        self.assertEqual(model.services["db"]["replicas"], 1)
++        self.assertEqual(model.services["db"]["costs"]["h1"], 3)
++        self.assertEqual(model.hosts["h1"]["slots"], 1)
++        self.assertFalse(model.network.has_edge("h1", "router"))
++
++    def test_unicode_and_empty(self):
++        hosts = {"hôst/1": {"zone": "zöne:α", "slots": 1}}
++        services = {
++            "sërvice.α": {
++                "replicas": 1,
++                "requires": [],
++                "allowed_zones": ["zöne:α"],
++                "costs": {"hôst/1": 0},
++            }
++        }
++        network = nx.Graph()
++        network.add_node("hôst/1")
++        model = Model(services, hosts, network)
++        self.assertIn("sërvice.α", model.services)
++        empty = Model({}, {}, nx.Graph())
++        self.assertEqual(empty.services, {})
++        self.assertEqual(canonical_json({"b": "é", "a": [1]}), '{"a":[1],"b":"é"}')
++
++    def test_rejects_invalid_input(self):
++        def mutate(change):
++            services, hosts, network = sample_inputs()
++            change(services, hosts, network)
++            before = copy.deepcopy((services, hosts))
++            with self.assertRaises(ValueError):
++                Model(services, hosts, network)
++            self.assertEqual((services, hosts), before)
++
++        cases = [
++            lambda s, h, n: s["db"].update(replicas=True),
++            lambda s, h, n: s["db"].update(replicas=0),
++            lambda s, h, n: s["db"].update(requires="web"),
++            lambda s, h, n: s["db"].update(requires=["db"]),
++            lambda s, h, n: s["db"].update(requires=["nope"]),
++            lambda s, h, n: s["db"].update(requires=["web"]),
++            lambda s, h, n: s["db"].update(allowed_zones=["zz"]),
++            lambda s, h, n: s["db"].update(costs={"h1": 1}),
++            lambda s, h, n: s["db"].update(costs={"h1": -1, "h2": 0}),
++            lambda s, h, n: s["db"].update(costs={"h1": False, "h2": 0}),
++            lambda s, h, n: s["db"].update(extra=1),
++            lambda s, h, n: s.update({"": s["db"]}),
++            lambda s, h, n: h["h1"].update(slots=-1),
++            lambda s, h, n: h["h1"].update(zone=""),
++            lambda s, h, n: n.remove_node("h1"),
++            lambda s, h, n: n.add_edge("h1", "h1", weight=1),
++            lambda s, h, n: n.add_edge("h1", "router", weight=0),
++            lambda s, h, n: n.add_edge("h1", "router", weight=True),
++            lambda s, h, n: n.add_edge("h1", "router", weight=1.0),
++            lambda s, h, n: n.add_edge("h1", "router"),
++            lambda s, h, n: n.add_node(7),
++        ]
++        for case in cases:
++            with self.subTest(case=case):
++                mutate(case)
++        services, hosts, _ = sample_inputs()
++        for network in (nx.DiGraph(), nx.MultiGraph(), {"nodes": []}):
++            with self.assertRaises(ValueError):
++                Model(services, hosts, network)
++
++    def test_canonical_json_rejects_nan(self):
++        with self.assertRaises(ValueError):
++            canonical_json(float("nan"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test_r2_behavior.py b/test_r2_behavior.py
+new file mode 100644
+index 0000000..d3db86f
+--- /dev/null
++++ b/test_r2_behavior.py
+@@ -0,0 +1,139 @@
++import itertools
++import unittest
++
++import networkx as nx
++from networkx.deployment.model import Model
++from networkx.deployment.placement import place
++
++
++def build(services, hosts):
++    network = nx.Graph()
++    network.add_nodes_from(hosts)
++    return Model(services, hosts, network)
++
++
++def brute_force(model):
++    services, hosts = model.services, model.hosts
++    options = []
++    for service, spec in services.items():
++        zones = spec["allowed_zones"]
++        choices = [
++            combo
++            for combo in itertools.combinations(sorted(hosts), spec["replicas"])
++            if len({hosts[h]["zone"] for h in combo}) == len(combo)
++            and (zones is None or all(hosts[h]["zone"] in zones for h in combo))
++        ]
++        options.append((service, choices))
++    best = None
++    for pick in itertools.product(*(choices for _, choices in options)):
++        load = {}
++        for combo in pick:
++            for host in combo:
++                load[host] = load.get(host, 0) + 1
++        if any(load[h] > hosts[h]["slots"] for h in load):
++            continue
++        cost = sum(
++            services[s]["costs"][h] for (s, _), combo in zip(options, pick) for h in combo
++        )
++        best = cost if best is None else min(best, cost)
++    return best
++
++
++class TestR2Behavior(unittest.TestCase):
++    def test_global_optimum_beats_greedy(self):
++        hosts = {
++            "a1": {"zone": "a", "slots": 1},
++            "b1": {"zone": "b", "slots": 1},
++        }
++        # Greedy in lexical order would give "x" the cheap host a1.
++        services = {
++            "x": {
++                "replicas": 1,
++                "requires": [],
++                "allowed_zones": None,
++                "costs": {"a1": 0, "b1": 1},
++            },
++            "y": {
++                "replicas": 1,
++                "requires": [],
++                "allowed_zones": None,
++                "costs": {"a1": 0, "b1": 10},
++            },
++        }
++        model = build(services, hosts)
++        result = place(model)
++        self.assertEqual(result, {"placements": {"x": ["b1"], "y": ["a1"]}, "cost": 1})
++
++    def test_zone_spread_capacity_and_brute_force(self):
++        hosts = {
++            "a1": {"zone": "a", "slots": 2},
++            "a2": {"zone": "a", "slots": 1},
++            "b1": {"zone": "b", "slots": 1},
++            "c1": {"zone": "c", "slots": 2},
++        }
++        services = {
++            "s1": {
++                "replicas": 3,
++                "requires": [],
++                "allowed_zones": None,
++                "costs": {"a1": 5, "a2": 1, "b1": 2, "c1": 7},
++            },
++            "s2": {
++                "replicas": 2,
++                "requires": ["s1"],
++                "allowed_zones": ["a", "c"],
++                "costs": {"a1": 1, "a2": 1, "b1": 0, "c1": 3},
++            },
++            "s3": {
++                "replicas": 1,
++                "requires": [],
++                "allowed_zones": ["a"],
++                "costs": {"a1": 0, "a2": 0, "b1": 0, "c1": 0},
++            },
++        }
++        model = build(services, hosts)
++        snapshot = model.services
++        result = place(model)
++        self.assertEqual(list(result["placements"]), ["s1", "s2", "s3"])
++        self.assertEqual(result["cost"], brute_force(model))
++        load = {}
++        for service, chosen in result["placements"].items():
++            self.assertEqual(chosen, sorted(chosen))
++            self.assertEqual(len(chosen), services[service]["replicas"])
++            zones = [hosts[h]["zone"] for h in chosen]
++            self.assertEqual(len(set(zones)), len(zones))
++            for host in chosen:
++                load[host] = load.get(host, 0) + 1
++        for host, used in load.items():
++            self.assertLessEqual(used, hosts[host]["slots"])
++        self.assertEqual(model.services, snapshot)
++
++    def test_infeasible_and_empty(self):
++        hosts = {"a1": {"zone": "a", "slots": 5}, "a2": {"zone": "a", "slots": 5}}
++        spread = {
++            "s": {
++                "replicas": 2,
++                "requires": [],
++                "allowed_zones": None,
++                "costs": {"a1": 0, "a2": 0},
++            }
++        }
++        with self.assertRaises(nx.NetworkXUnfeasible):
++            place(build(spread, hosts))
++        tight = {"a1": {"zone": "a", "slots": 1}, "b1": {"zone": "b", "slots": 0}}
++        services = {
++            name: {
++                "replicas": 1,
++                "requires": [],
++                "allowed_zones": None,
++                "costs": {"a1": 0, "b1": 0},
++            }
++            for name in ("p", "q")
++        }
++        with self.assertRaises(nx.NetworkXUnfeasible):
++            place(build(services, tight))
++        self.assertEqual(place(Model({}, {}, nx.Graph())), {"placements": {}, "cost": 0})
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test_r3_behavior.py b/test_r3_behavior.py
+new file mode 100644
+index 0000000..e675041
+--- /dev/null
++++ b/test_r3_behavior.py
+@@ -0,0 +1,85 @@
++import unittest
++
++import networkx as nx
++from networkx.deployment.model import Model
++from networkx.deployment.routing import route
++
++
++def model_with(edges):
++    network = nx.Graph()
++    network.add_weighted_edges_from(edges)
++    return Model({}, {}, network)
++
++
++class TestR3Behavior(unittest.TestCase):
++    def test_disjoint_paths_minimize_total_weight(self):
++        # The single shortest path s-a-b-t blocks two disjoint paths if
++        # chosen greedily; the optimal pair is s-a-t and s-b-t.
++        model = model_with(
++            [
++                ("s", "a", 1),
++                ("a", "b", 1),
++                ("b", "t", 1),
++                ("a", "t", 3),
++                ("s", "b", 3),
++            ]
++        )
++        self.assertEqual(route(model, "s", "t"), [["s", "a", "b", "t"]])
++        paths = route(model, "s", "t", k=2)
++        self.assertEqual(paths, [["s", "a", "t"], ["s", "b", "t"]])
++        with self.assertRaises(nx.NetworkXUnfeasible):
++            route(model, "s", "t", k=3)
++
++    def test_paths_are_simple_and_edge_disjoint(self):
++        G = nx.circular_ladder_graph(6)
++        edges = [(f"n{u}", f"n{v}", 1 + (u * v) % 4) for u, v in G.edges]
++        model = model_with(edges)
++        network = model.network
++        paths = route(model, "n0", "n3", k=3)
++        self.assertEqual(paths, sorted(paths))
++        used = set()
++        total = 0
++        for path in paths:
++            self.assertEqual(len(path), len(set(path)))
++            self.assertEqual((path[0], path[-1]), ("n0", "n3"))
++            for u, v in zip(path, path[1:]):
++                edge = frozenset((u, v))
++                self.assertNotIn(edge, used)
++                used.add(edge)
++                total += network.edges[u, v]["weight"]
++        expected = nx.min_cost_flow_cost(self._flow_graph(network, "n0", "n3", 3))
++        self.assertEqual(total, expected)
++
++    @staticmethod
++    def _flow_graph(network, source, target, k):
++        D = nx.DiGraph()
++        for u, v, w in network.edges(data="weight"):
++            D.add_edge(u, v, capacity=1, weight=w)
++            D.add_edge(v, u, capacity=1, weight=w)
++        D.nodes[source]["demand"] = -k
++        D.nodes[target]["demand"] = k
++        return D
++
++    def test_local_route_and_validation(self):
++        model = model_with([("x", "y", 2)])
++        self.assertEqual(route(model, "x", "x", k=5), [["x"]])
++        for k in (0, -1, True, 1.0, "1"):
++            with self.assertRaises(ValueError):
++                route(model, "x", "y", k=k)
++        with self.assertRaises(ValueError):
++            route(model, "x", "missing")
++        with self.assertRaises(ValueError):
++            route(model, None, "x")
++        fingerprint = model.fingerprint
++        route(model, "x", "y")
++        self.assertEqual(model.fingerprint, fingerprint)
++
++    def test_disconnected_is_unfeasible(self):
++        network = nx.Graph()
++        network.add_nodes_from(["p", "q"])
++        with self.assertRaises(nx.NetworkXUnfeasible):
++            route(Model({}, {}, network), "p", "q")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test_r4_behavior.py b/test_r4_behavior.py
+new file mode 100644
+index 0000000..aef4378
+--- /dev/null
++++ b/test_r4_behavior.py
+@@ -0,0 +1,119 @@
++import copy
++import unittest
++
++import networkx as nx
++from networkx.deployment.batches import rollout_batches
++from networkx.deployment.model import Model
++from networkx.deployment.placement import place
++
++
++def service(replicas, requires=(), costs=None):
++    return {
++        "replicas": replicas,
++        "requires": list(requires),
++        "allowed_zones": None,
++        "costs": costs,
++    }
++
++
++def build():
++    hosts = {f"h{i}": {"zone": f"z{i}", "slots": 3} for i in range(1, 5)}
++    zero = dict.fromkeys(hosts, 0)
++    services = {
++        "a": service(2, costs=zero),
++        "b": service(3, costs=zero),
++        "c": service(1, ["a"], zero),
++        "d": service(1, costs=zero),
++        "e": service(2, ["c"], zero),
++    }
++    network = nx.Graph()
++    network.add_nodes_from(hosts)
++    return Model(services, hosts, network)
++
++
++class TestR4Behavior(unittest.TestCase):
++    placements = {
++        "a": ["h1", "h2"],
++        "b": ["h2", "h3", "h4"],
++        "c": ["h1"],
++        "d": ["h4"],
++        "e": ["h1", "h4"],
++    }
++
++    def test_scan_defers_nonfitting_services(self):
++        model = build()
++        placements = copy.deepcopy(self.placements)
++        batches = rollout_batches(model, placements, max_parallel=3)
++        # Batch 1: a (2), b does not fit, d (1). Batch 2: b (3). Then c and e.
++        self.assertEqual(batches, [["a", "d"], ["b"], ["c"], ["e"]])
++        self.assertEqual(placements, self.placements)
++
++    def test_host_conflicts_and_wide_batches(self):
++        model = build()
++        batches = rollout_batches(model, self.placements, max_parallel=10)
++        # b shares h2 with a, so it waits; c (on h1) then joins b.
++        self.assertEqual(batches, [["a", "d"], ["b", "c"], ["e"]])
++
++    def test_accepts_place_result(self):
++        model = build()
++        result = place(model)
++        batches = rollout_batches(model, result)
++        self.assertEqual(sorted(s for batch in batches for s in batch), list("abcde"))
++
++    def test_validation(self):
++        model = build()
++        bad = []
++        for change in (
++            lambda p: p.pop("a"),
++            lambda p: p.update(a=["h1"]),
++            lambda p: p.update(a=["h1", "h1"]),
++            lambda p: p.update(a=["h1", "nope"]),
++            lambda p: p.update(z=["h1"]),
++            lambda p: p.update(a="h1"),
++        ):
++            placements = copy.deepcopy(self.placements)
++            change(placements)
++            bad.append(placements)
++        for placements in bad:
++            with self.assertRaises(ValueError):
++                rollout_batches(model, placements)
++        for max_parallel in (0, True, 2.0):
++            with self.assertRaises(ValueError):
++                rollout_batches(model, self.placements, max_parallel)
++        with self.assertRaises(ValueError):
++            rollout_batches(model, self.placements, max_parallel=2)
++
++        hosts = {
++            "a1": {"zone": "a", "slots": 1},
++            "a2": {"zone": "a", "slots": 1},
++            "b1": {"zone": "b", "slots": 1},
++        }
++        costs = dict.fromkeys(hosts, 0)
++        network = nx.Graph()
++        network.add_nodes_from(hosts)
++        spec = {
++            "s": {
++                "replicas": 2,
++                "requires": [],
++                "allowed_zones": ["a", "b"],
++                "costs": costs,
++            },
++            "t": {"replicas": 1, "requires": [], "allowed_zones": ["b"], "costs": costs},
++        }
++        small = Model(spec, hosts, network)
++        for placements in (
++            {"s": ["a1", "a2"], "t": ["b1"]},  # same zone
++            {"s": ["a1", "b1"], "t": ["b1"]},  # host capacity
++            {"s": ["a1", "b1"], "t": ["a2"]},  # zone not allowed
++        ):
++            with self.assertRaises(ValueError):
++                rollout_batches(small, placements)
++        with self.assertRaises(ValueError):  # wrong cost in a place() result
++            rollout_batches(small, {"placements": {"s": ["a1", "b1"]}, "cost": 0})
++
++    def test_empty(self):
++        self.assertEqual(rollout_batches(Model({}, {}, nx.Graph()), {}), [])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test_r5_behavior.py b/test_r5_behavior.py
+new file mode 100644
+index 0000000..7c3e2b0
+--- /dev/null
++++ b/test_r5_behavior.py
+@@ -0,0 +1,115 @@
++import json
++import os
++import tempfile
++import threading
++import unittest
++from unittest import mock
++
++from networkx.deployment.journal import ConflictError, Journal, save_json
++from networkx.deployment.model import canonical_json
++
++
++class TestR5Behavior(unittest.TestCase):
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.dir = self._tmp.name
++        self.path = os.path.join(self.dir, "journal.json")
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_save_json_is_canonical_and_atomic(self):
++        target = os.path.join(self.dir, "out.json")
++        save_json(target, {"b": ("x", "é"), "a": 1})
++        with open(target, "rb") as handle:
++            self.assertEqual(handle.read(), canonical_json({"a": 1, "b": ["x", "é"]}).encode())
++        for bad in ({"x": float("nan")}, {"x": float("inf")}, {"x": object()}):
++            with self.assertRaises(ValueError):
++                save_json(target, bad)
++        with mock.patch("os.replace", side_effect=OSError("boom")):
++            with self.assertRaises(OSError):
++                save_json(target, {"new": True})
++        with open(target, "rb") as handle:
++            self.assertEqual(json.loads(handle.read()), {"a": 1, "b": ["x", "é"]})
++        self.assertEqual(os.listdir(self.dir), ["out.json"])
++
++    def test_read_append_and_idempotency(self):
++        journal = Journal(self.path)
++        self.assertEqual(journal.read(), {"schema": 1, "revision": 0, "events": []})
++        self.assertFalse(os.path.exists(self.path))
++        payload = {"n": [1, 2], "s": "ü"}
++        self.assertEqual(journal.append(0, {"id": "e1", "payload": payload}), 1)
++        payload["n"].append(3)
++        self.assertEqual(journal.append(1, {"id": "e2", "payload": None}), 2)
++        other = Journal(self.path)
++        snapshot = other.read()
++        self.assertEqual(
++            snapshot,
++            {
++                "schema": 1,
++                "revision": 2,
++                "events": [
++                    {"revision": 1, "event": {"id": "e1", "payload": {"n": [1, 2], "s": "ü"}}},
++                    {"revision": 2, "event": {"id": "e2", "payload": None}},
++                ],
++            },
++        )
++        snapshot["events"].clear()
++        self.assertEqual(other.read()["revision"], 2)
++        # Idempotent replay returns the original revision even when stale.
++        same = {"id": "e1", "payload": {"s": "ü", "n": (1, 2)}}
++        self.assertEqual(other.append(0, same), 1)
++        with self.assertRaises(ConflictError):
++            other.append(2, {"id": "e1", "payload": {"n": [1]}})
++        with self.assertRaises(ConflictError):
++            other.append(1, {"id": "e3", "payload": 1})
++        self.assertEqual(journal.read()["revision"], 2)
++        for revision in (-1, True, 1.0):
++            with self.assertRaises(ValueError):
++                journal.append(revision, {"id": "e3", "payload": 1})
++        for event in ({"id": "", "payload": 1}, {"id": "x"}, {"id": "x", "payload": float("nan")}):
++            with self.assertRaises(ValueError):
++                journal.append(2, event)
++        self.assertEqual(journal.read()["revision"], 2)
++
++    def test_rejects_malformed_files(self):
++        documents = [
++            b"{not json",
++            b'{"schema":2,"revision":0,"events":[]}',
++            b'{"schema":1,"revision":1,"events":[]}',
++            b'{"schema":1,"revision":1,"events":[{"revision":2,"event":{"id":"a","payload":1}}]}',
++            b'{"schema":1,"revision":2,"events":[{"revision":1,"event":{"id":"a","payload":1}},'
++            b'{"revision":2,"event":{"id":"a","payload":2}}]}',
++            b'{"schema":1,"revision":1,"events":[{"revision":1,"event":{"id":"a","payload":NaN}}]}',
++            b'[]',
++        ]
++        for data in documents:
++            with open(self.path, "wb") as handle:
++                handle.write(data)
++            with self.subTest(data=data), self.assertRaises(ValueError):
++                Journal(self.path).read()
++
++    def test_concurrent_appends_do_not_lose_updates(self):
++        def writer(name):
++            journal = Journal(self.path)
++            for i in range(10):
++                while True:
++                    revision = journal.read()["revision"]
++                    try:
++                        journal.append(revision, {"id": f"{name}-{i}", "payload": i})
++                        break
++                    except ConflictError:
++                        continue
++
++        threads = [threading.Thread(target=writer, args=(f"w{n}",)) for n in range(4)]
++        for thread in threads:
++            thread.start()
++        for thread in threads:
++            thread.join()
++        document = Journal(self.path).read()
++        self.assertEqual(document["revision"], 40)
++        self.assertEqual(len({r["event"]["id"] for r in document["events"]}), 40)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test_r6_behavior.py b/test_r6_behavior.py
+new file mode 100644
+index 0000000..a5eb67d
+--- /dev/null
++++ b/test_r6_behavior.py
+@@ -0,0 +1,91 @@
++import hashlib
++import unittest
++
++import networkx as nx
++from networkx.deployment.model import Model, canonical_json
++from networkx.deployment.planner import compile_plan
++from networkx.deployment.routing import route
++
++
++def build_model():
++    hosts = {
++        "a1": {"zone": "a", "slots": 2},
++        "b1": {"zone": "b", "slots": 2},
++        "c1": {"zone": "c", "slots": 2},
++    }
++    zero = dict.fromkeys(hosts, 0)
++    services = {
++        "db": {"replicas": 2, "requires": [], "allowed_zones": ["a", "b"], "costs": zero},
++        "api": {
++            "replicas": 1,
++            "requires": ["db"],
++            "allowed_zones": None,
++            "costs": {"a1": 0, "b1": 5, "c1": 5},
++        },
++        "web": {"replicas": 1, "requires": ["api"], "allowed_zones": ["c"], "costs": zero},
++    }
++    network = nx.Graph()
++    network.add_weighted_edges_from(
++        [("a1", "b1", 1), ("b1", "c1", 1), ("a1", "r", 1), ("r", "c1", 1), ("a1", "c1", 5)]
++    )
++    return Model(services, hosts, network)
++
++
++class TestR6Behavior(unittest.TestCase):
++    def test_plan_fields_and_id(self):
++        model = build_model()
++        plan = compile_plan(model, path_redundancy=2, max_parallel=4)
++        self.assertEqual(
++            set(plan),
++            {
++                "schema",
++                "id",
++                "deployment",
++                "dependencies",
++                "placements",
++                "cost",
++                "batches",
++                "routes",
++                "path_redundancy",
++                "max_parallel",
++            },
++        )
++        rest = {k: v for k, v in plan.items() if k != "id"}
++        self.assertEqual(
++            plan["id"], hashlib.sha256(canonical_json(rest).encode("utf-8")).hexdigest()
++        )
++        self.assertEqual(plan["schema"], 1)
++        self.assertEqual(plan["deployment"], model.fingerprint)
++        self.assertEqual(plan["dependencies"], {"api": ["db"], "db": [], "web": ["api"]})
++        self.assertEqual(plan["placements"], {"api": ["a1"], "db": ["a1", "b1"], "web": ["c1"]})
++        self.assertEqual(plan["cost"], 0)
++        self.assertEqual(plan["batches"], [["db"], ["api"], ["web"]])
++        keys = [(r["producer"], r["consumer"], r["source"], r["target"]) for r in plan["routes"]]
++        self.assertEqual(
++            keys,
++            [("api", "web", "a1", "c1"), ("db", "api", "a1", "a1"), ("db", "api", "b1", "a1")],
++        )
++        for record in plan["routes"]:
++            self.assertEqual(set(record), {"producer", "consumer", "source", "target", "paths"})
++            self.assertEqual(
++                record["paths"], route(model, record["source"], record["target"], k=2)
++            )
++        self.assertEqual(plan["routes"][1]["paths"], [["a1"]])
++        self.assertEqual(compile_plan(model, 2, 4), plan)
++
++    def test_controls_and_infeasibility(self):
++        empty = Model({}, {}, nx.Graph())
++        plan = compile_plan(empty)
++        self.assertEqual(plan["batches"], [])
++        self.assertEqual(plan["routes"], [])
++        for kwargs in ({"path_redundancy": 0}, {"max_parallel": True}, {"max_parallel": 1.5}):
++            with self.assertRaises(ValueError):
++                compile_plan(empty, **kwargs)
++        with self.assertRaises(nx.NetworkXUnfeasible):
++            compile_plan(build_model(), path_redundancy=3)
++        with self.assertRaises(ValueError):
++            compile_plan(build_model(), max_parallel=1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test_r7_behavior.py b/test_r7_behavior.py
+new file mode 100644
+index 0000000..0cb54df
+--- /dev/null
++++ b/test_r7_behavior.py
+@@ -0,0 +1,164 @@
++import os
++import tempfile
++import threading
++import unittest
++
++import networkx as nx
++from networkx.deployment.controller import Controller
++from networkx.deployment.journal import ConflictError, Journal
++from networkx.deployment.model import Model
++from networkx.deployment.planner import compile_plan
++
++
++def build_plan():
++    hosts = {f"h{i}": {"zone": f"z{i}", "slots": 4} for i in range(4)}
++
++    def service(home, requires=()):
++        costs = {host: 0 if host == home else 1 for host in hosts}
++        return {"replicas": 1, "requires": list(requires), "allowed_zones": None, "costs": costs}
++
++    services = {
++        "a": service("h0"),
++        "b": service("h1"),
++        "c": service("h2", ["a"]),
++        "d": service("h0", ["c"]),
++        "e": service("h3", ["b"]),
++    }
++    network = nx.Graph()
++    network.add_nodes_from(hosts)
++    network.add_weighted_edges_from([("h0", "h1", 1), ("h1", "h2", 1), ("h2", "h3", 1)])
++    return compile_plan(Model(services, hosts, network), max_parallel=4)
++
++
++class TestR7Behavior(unittest.TestCase):
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.path = os.path.join(self._tmp.name, "journal.json")
++        self.plan = build_plan()
++        self.assertEqual(self.plan["batches"], [["a", "b"], ["c", "e"], ["d"]])
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def controller(self, max_attempts=2):
++        return Controller(self.plan, Journal(self.path), max_attempts=max_attempts)
++
++    def test_happy_path_and_restart(self):
++        controller = self.controller()
++        self.assertFalse(os.path.exists(self.path))
++        snap = controller.snapshot(0)
++        self.assertEqual(snap["states"], dict.fromkeys("abcde", "pending"))
++        self.assertEqual(snap["revision"], 0)
++        self.assertFalse(os.path.exists(self.path))
++
++        first = controller.claim("w1", 0, 10)
++        self.assertEqual(first, {"service": "a", "worker": "w1", "token": 1, "expires": 10})
++        self.assertEqual(controller.claim("w1", 1, 10), first)  # no write
++        second = controller.claim("w2", 1, 10)
++        self.assertEqual(second["service"], "b")
++        self.assertIsNone(controller.claim("w3", 1, 10))  # c waits for a
++        self.assertEqual(Journal(self.path).read()["revision"], 2)
++
++        self.assertTrue(controller.ack(first, True, 2))
++        self.assertFalse(controller.ack(first, True, 50))  # duplicate after expiry
++        with self.assertRaises(ConflictError):
++            controller.ack(first, False, 3)
++        # Only the earliest unfinished batch is served: b is still leased.
++        self.assertIsNone(controller.claim("w1", 3, 10))
++        self.assertTrue(controller.ack(second, True, 3))
++        third = controller.claim("w1", 4, 10)
++        self.assertEqual(third["service"], "c")
++
++        restarted = self.controller().snapshot(5)
++        self.assertEqual(
++            restarted["states"],
++            {"a": "done", "b": "done", "c": "leased", "d": "pending", "e": "pending"},
++        )
++        self.assertEqual(restarted["attempts"], {"a": 1, "b": 1, "c": 1, "d": 0, "e": 0})
++        self.assertEqual(restarted["leases"], {"c": third})
++        self.assertEqual(restarted["revision"], 5)
++        restarted["leases"]["c"]["token"] = 99
++        self.assertEqual(self.controller().snapshot(5)["leases"]["c"], third)
++
++    def test_expiry_failure_and_blocking(self):
++        controller = self.controller(max_attempts=2)
++        lease = controller.claim("w1", 0, 5)
++        self.assertEqual(lease["service"], "a")
++        with self.assertRaises(ConflictError):
++            controller.ack(lease, True, 5)  # expired: now >= expires
++        self.assertEqual(controller.snapshot(5)["states"]["a"], "pending")
++        retry = controller.claim("w2", 5, 5)
++        self.assertEqual((retry["service"], retry["token"]), ("a", 2))
++        with self.assertRaises(ValueError):
++            controller.claim("w3", 4, 5)  # clock went backwards
++        self.assertTrue(controller.ack(retry, False, 6))
++        self.assertFalse(controller.ack(retry, False, 7))
++        snap = controller.snapshot(7)
++        self.assertEqual(snap["states"]["a"], "failed")
++        self.assertEqual(snap["states"]["c"], "blocked")
++        self.assertEqual(snap["states"]["d"], "blocked")
++        self.assertEqual(snap["attempts"]["a"], 2)
++        # Independent work proceeds.
++        self.assertEqual(controller.claim("w1", 7, 5)["service"], "b")
++
++    def test_rejections(self):
++        controller = self.controller()
++        lease = controller.claim("w1", 0, 10)
++        revision = Journal(self.path).read()["revision"]
++        for forged in (
++            dict(lease, worker="other"),
++            dict(lease, token=lease["token"] + 5),
++            dict(lease, expires=99),
++            dict(lease, service="b"),
++        ):
++            with self.assertRaises(ConflictError):
++                controller.ack(forged, True, 1)
++        for bad in ({"service": "a"}, dict(lease, token=True)):
++            with self.assertRaises(ValueError):
++                controller.ack(bad, True, 1)
++        with self.assertRaises(ValueError):
++            controller.ack(lease, 1, 1)
++        for args in (("", 1, 1), ("w", -1, 1), ("w", 1, 0), ("w", True, 1)):
++            with self.assertRaises(ValueError):
++                controller.claim(*args)
++        self.assertEqual(Journal(self.path).read()["revision"], revision)
++
++        with self.assertRaises(ValueError):
++            self.controller(max_attempts=3)
++        other = compile_plan(Model({}, {}, nx.Graph()))
++        with self.assertRaises(ValueError):
++            Controller(other, Journal(self.path))
++        tampered = dict(self.plan, cost=self.plan["cost"] + 1)
++        with self.assertRaises(ValueError):
++            Controller(tampered, Journal(os.path.join(self._tmp.name, "x.json")))
++        for attempts in (0, True):
++            with self.assertRaises(ValueError):
++                Controller(self.plan, Journal(self.path), max_attempts=attempts)
++
++    def test_concurrent_claimers(self):
++        results = []
++        errors = []
++        barrier = threading.Barrier(4)
++
++        def claimer(worker):
++            controller = self.controller()
++            barrier.wait()
++            try:
++                results.append(controller.claim(worker, 0, 100))
++            except Exception as err:  # pragma: no cover - reported below
++                errors.append(err)
++
++        threads = [threading.Thread(target=claimer, args=(f"w{i}",)) for i in range(4)]
++        for thread in threads:
++            thread.start()
++        for thread in threads:
++            thread.join()
++        self.assertEqual(errors, [])
++        leases = [lease for lease in results if lease is not None]
++        self.assertEqual(sorted(lease["service"] for lease in leases), ["a", "b"])
++        self.assertEqual(len({lease["token"] for lease in leases}), 2)
++        self.assertEqual(Journal(self.path).read()["revision"], 2)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test_r8_behavior.py b/test_r8_behavior.py
+new file mode 100644
+index 0000000..e57e296
+--- /dev/null
++++ b/test_r8_behavior.py
+@@ -0,0 +1,89 @@
++import contextlib
++import io
++import json
++import os
++import tempfile
++import unittest
++
++from networkx.deployment.cli import main
++
++INPUT = {
++    "services": {
++        "db": {"replicas": 2, "requires": [], "allowed_zones": None, "costs": {"a": 1, "b": 2}},
++        "web": {"replicas": 1, "requires": ["db"], "allowed_zones": None, "costs": {"a": 0, "b": 0}},
++    },
++    "hosts": {"a": {"zone": "za", "slots": 2}, "b": {"zone": "zb", "slots": 1}},
++    "network": {"nodes": ["a", "b"], "edges": [["a", "b", 3]]},
++    "max_parallel": 2,
++}
++
++
++class TestR8Behavior(unittest.TestCase):
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.dir = self._tmp.name
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def file(self, name, value=None):
++        path = os.path.join(self.dir, name)
++        if value is not None:
++            with open(path, "w", encoding="utf-8") as handle:
++                json.dump(value, handle)
++        return path
++
++    def run_cli(self, *argv):
++        out, err = io.StringIO(), io.StringIO()
++        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
++            code = main(list(argv))
++        result = json.loads(out.getvalue()) if code == 0 else None
++        return code, result, err.getvalue()
++
++    def test_plan_and_controller_flow(self):
++        model, plan_path = self.file("in.json", INPUT), self.file("plan.json")
++        code, plan, _ = self.run_cli("plan", model, plan_path)
++        self.assertEqual(code, 0)
++        with open(plan_path, encoding="utf-8") as handle:
++            self.assertEqual(json.load(handle), plan)
++        self.assertEqual(plan["placements"], {"db": ["a", "b"], "web": ["a"]})
++        self.assertEqual(plan["batches"], [["db"], ["web"]])
++
++        journal = self.file("journal.json")
++        code, lease, _ = self.run_cli("claim", plan_path, journal, "w1", "--now", "1", "--ttl", "5")
++        self.assertEqual(code, 0)
++        self.assertEqual(lease["service"], "db")
++        lease_path = self.file("lease.json", lease)
++        args = ("ack", plan_path, journal, lease_path, "--now", "2", "--success")
++        self.assertEqual(self.run_cli(*args)[:2], (0, True))
++        self.assertEqual(self.run_cli(*args)[:2], (0, False))
++        code, snap, _ = self.run_cli("status", plan_path, journal, "--now", "3")
++        self.assertEqual(snap["states"], {"db": "done", "web": "pending"})
++        code, _, err = self.run_cli("status", plan_path, journal, "--now", "3", "--max-attempts", "3")
++        self.assertEqual(code, 2)
++        self.assertTrue(err)
++        code, _, _ = self.run_cli(
++            "ack", plan_path, journal, lease_path, "--now", "3", "--failure"
++        )
++        self.assertEqual(code, 2)
++        code, result, _ = self.run_cli("claim", plan_path, journal, "w2", "--now", "4", "--ttl", "1")
++        self.assertEqual(result["service"], "web")
++
++    def test_invalid_input_preserves_output(self):
++        output = self.file("plan.json", {"keep": True})
++        bad = dict(INPUT, max_parallel=0)
++        code, _, err = self.run_cli("plan", self.file("bad.json", bad), output)
++        self.assertEqual(code, 2)
++        self.assertTrue(err)
++        infeasible = dict(INPUT, path_redundancy=2)
++        self.assertEqual(self.run_cli("plan", self.file("x.json", infeasible), output)[0], 2)
++        missing = os.path.join(self.dir, "missing.json")
++        self.assertEqual(self.run_cli("plan", missing, output)[0], 2)
++        with open(output, encoding="utf-8") as handle:
++            self.assertEqual(json.load(handle), {"keep": True})
++        self.assertEqual(self.run_cli("bogus")[0], 2)
++        self.assertEqual(self.run_cli("ack", "p", "j", "l", "--now", "1")[0], 2)
++
++
++if __name__ == "__main__":
++    unittest.main()

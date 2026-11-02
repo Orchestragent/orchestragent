@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Linux sandbox (bubblewrap)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q bubblewrap
+          # Ubuntu 24.04 restricts unprivileged user namespaces, which bwrap needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: git identity for test repositories
+        run: git config --global user.name ci && git config --global user.email ci@example.com
+      - run: uv sync --locked
+      - run: uv run ruff check src tests
+      - run: uv run mypy
+      - run: uv run pytest -q
+      - name: package builds and installs
+        run: |
+          uv build --wheel -o dist-ci
+          uv venv -q /tmp/orch-install && uv pip install -q --python /tmp/orch-install/bin/python dist-ci/*.whl
+          /tmp/orch-install/bin/orch --help >/dev/null
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | /tmp/orch-install/bin/orch mcp | grep -q orch_start

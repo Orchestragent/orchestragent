@@ -1,0 +1,199 @@
+planner_and_durable_controller_without_losing_files (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r8_cli_uses_real_planner_and_durable_controller_without_losing_files) ... ERROR
+
+======================================================================
+ERROR: test_r1_normalized_snapshots_and_whole_model_validation (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r1_normalized_snapshots_and_whole_model_validation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 63, in test_r1_normalized_snapshots_and_whole_model_validation
+    model = self.model()
+            ^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 53, in model
+    return module("model").Model(
+           ^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 19, in module
+    return importlib.import_module("networkx.deployment." + name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/anaconda3/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1310, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'networkx.deployment'
+
+======================================================================
+ERROR: test_r2_global_cost_capacity_and_failure_domain_constraints (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r2_global_cost_capacity_and_failure_domain_constraints)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 92, in test_r2_global_cost_capacity_and_failure_domain_constraints
+    placement = module("placement").place(self.model())
+                ^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 19, in module
+    return importlib.import_module("networkx.deployment." + name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/anaconda3/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1310, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'networkx.deployment'
+
+======================================================================
+ERROR: test_r3_minimum_cost_undirected_edge_disjoint_routing (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r3_minimum_cost_undirected_edge_disjoint_routing)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 127, in test_r3_minimum_cost_undirected_edge_disjoint_routing
+    model = self.model(network=graph)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 53, in model
+    return module("model").Model(
+           ^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 19, in module
+    return importlib.import_module("networkx.deployment." + name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/anaconda3/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1310, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'networkx.deployment'
+
+======================================================================
+ERROR: test_r4_composed_batches_keep_dependencies_and_scan_past_nonfitting_work (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r4_composed_batches_keep_dependencies_and_scan_past_nonfitting_work)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 150, in test_r4_composed_batches_keep_dependencies_and_scan_past_nonfitting_work
+    placements = module("placement").place(self.model())["placements"]
+                 ^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 19, in module
+    return importlib.import_module("networkx.deployment." + name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/anaconda3/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1310, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'networkx.deployment'
+
+======================================================================
+ERROR: test_r5_atomic_cas_idempotence_corruption_and_concurrent_writers (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r5_atomic_cas_idempotence_corruption_and_concurrent_writers)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 176, in test_r5_atomic_cas_idempotence_corruption_and_concurrent_writers
+    api = module("journal")
+          ^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 19, in module
+    return importlib.import_module("networkx.deployment." + name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/anaconda3/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1310, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'networkx.deployment'
+
+======================================================================
+ERROR: test_r6_compiled_plan_joins_all_algorithms_and_fingerprints_full_payload (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r6_compiled_plan_joins_all_algorithms_and_fingerprints_full_payload)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 219, in test_r6_compiled_plan_joins_all_algorithms_and_fingerprints_full_payload
+    plan = self.plan(path_redundancy=2, max_parallel=3)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 60, in plan
+    return module("planner").compile_plan(self.model(), **kwargs)
+           ^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 19, in module
+    return importlib.import_module("networkx.deployment." + name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/anaconda3/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1310, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'networkx.deployment'
+
+======================================================================
+ERROR: test_r7_durable_leases_fencing_retry_expiry_and_parallel_reconciliation (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r7_durable_leases_fencing_retry_expiry_and_parallel_reconciliation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 260, in test_r7_durable_leases_fencing_retry_expiry_and_parallel_reconciliation
+    api, storage = module("controller"), module("journal")
+                   ^^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 19, in module
+    return importlib.import_module("networkx.deployment." + name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/anaconda3/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1310, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'networkx.deployment'
+
+======================================================================
+ERROR: test_r8_cli_uses_real_planner_and_durable_controller_without_losing_files (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r8_cli_uses_real_planner_and_durable_controller_without_losing_files)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 339, in test_r8_cli_uses_real_planner_and_durable_controller_without_losing_files
+    cli = module("cli")
+          ^^^^^^^^^^^^^
+  File "/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031/project/.git/orch/oracle-reassessment/work/acceptance-4354ee/_orch_bench_acceptance/test_acceptance.py", line 19, in module
+    return importlib.import_module("networkx.deployment." + name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/anaconda3/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1310, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'networkx.deployment'
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.002s
+
+FAILED (errors=8)
+
+issuer=controller
+mode=sandbox-exec
+revision=4fa222d2fb157e1b7f8c753c9f92e5907d1ddeb4
+exit=1
+command=python -I -S -B -c <unittest bootstrap>
+wall_limit_s=25
+cpu_limit_s=15

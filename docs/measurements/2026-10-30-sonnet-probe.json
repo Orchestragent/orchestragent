@@ -1,0 +1,1 @@
+{"effort":"medium","outcome":"ok","requested_model":"claude-sonnet-5-5","source_revision":"6770695a764be55c2b43c55a3629a758295572a9","usage":{"cache_creation_input_tokens":5688,"cache_read_input_tokens":0,"input_tokens":2,"output_tokens":53,"provider_estimate_usd":0.046572,"served_model":"claude-sonnet-5-5"},"verified":true}

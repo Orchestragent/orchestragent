@@ -1,0 +1,435 @@
+FFFFFFF...FF                                                             [100%]
+=================================== FAILURES ===================================
+_ test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\n def test_r1(self): pass-True] _
+
+source = 'class Case:\n def test_r1(self): pass\n def test_r1(self): pass'
+invalid = True
+
+    @pytest.mark.parametrize("source,invalid", [
+        ("class Case:\n def test_r1(self): pass\n def test_r1(self): pass", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1 = None", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1: object = None", True),
+        ("class Case:\n def test_r1(self): pass\nCase = None", True),
+        ("class Case:\n def test_r1(self): pass\nfrom helper import Case", True),
+        ("class Case:\n def test_r1(self): pass\nclass Case:\n def test_r2(self): pass", True),
+        ("class Case:\n def setUp(self): pass\n def setUp(self): pass", True),
+        ("class A:\n def test_r1(self): pass\nclass B:\n def test_r1(self): pass", False),
+        ("class Case:\n value = 1\n value = 2\n def test_r1(self): pass", False),
+        ("class Case:\n @property\n def value(self): pass\n @value.setter\n def value(self, v): pass",
+         False),
+    ])
+    def test_generated_test_namespace_does_not_silently_replace_checks(
+        source: str, invalid: bool,
+    ) -> None:
+        errors = fixture_errors(source)
+>       assert bool(errors) is invalid
+E       assert False is True
+E        +  where False = bool([])
+
+tests/test_orch_testlint.py:25: AssertionError
+_ test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\n test_r1 = None-True] _
+
+source = 'class Case:\n def test_r1(self): pass\n test_r1 = None'
+invalid = True
+
+    @pytest.mark.parametrize("source,invalid", [
+        ("class Case:\n def test_r1(self): pass\n def test_r1(self): pass", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1 = None", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1: object = None", True),
+        ("class Case:\n def test_r1(self): pass\nCase = None", True),
+        ("class Case:\n def test_r1(self): pass\nfrom helper import Case", True),
+        ("class Case:\n def test_r1(self): pass\nclass Case:\n def test_r2(self): pass", True),
+        ("class Case:\n def setUp(self): pass\n def setUp(self): pass", True),
+        ("class A:\n def test_r1(self): pass\nclass B:\n def test_r1(self): pass", False),
+        ("class Case:\n value = 1\n value = 2\n def test_r1(self): pass", False),
+        ("class Case:\n @property\n def value(self): pass\n @value.setter\n def value(self, v): pass",
+         False),
+    ])
+    def test_generated_test_namespace_does_not_silently_replace_checks(
+        source: str, invalid: bool,
+    ) -> None:
+        errors = fixture_errors(source)
+>       assert bool(errors) is invalid
+E       assert False is True
+E        +  where False = bool([])
+
+tests/test_orch_testlint.py:25: AssertionError
+_ test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\n test_r1: object = None-True] _
+
+source = 'class Case:\n def test_r1(self): pass\n test_r1: object = None'
+invalid = True
+
+    @pytest.mark.parametrize("source,invalid", [
+        ("class Case:\n def test_r1(self): pass\n def test_r1(self): pass", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1 = None", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1: object = None", True),
+        ("class Case:\n def test_r1(self): pass\nCase = None", True),
+        ("class Case:\n def test_r1(self): pass\nfrom helper import Case", True),
+        ("class Case:\n def test_r1(self): pass\nclass Case:\n def test_r2(self): pass", True),
+        ("class Case:\n def setUp(self): pass\n def setUp(self): pass", True),
+        ("class A:\n def test_r1(self): pass\nclass B:\n def test_r1(self): pass", False),
+        ("class Case:\n value = 1\n value = 2\n def test_r1(self): pass", False),
+        ("class Case:\n @property\n def value(self): pass\n @value.setter\n def value(self, v): pass",
+         False),
+    ])
+    def test_generated_test_namespace_does_not_silently_replace_checks(
+        source: str, invalid: bool,
+    ) -> None:
+        errors = fixture_errors(source)
+>       assert bool(errors) is invalid
+E       assert False is True
+E        +  where False = bool([])
+
+tests/test_orch_testlint.py:25: AssertionError
+_ test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\nCase = None-True] _
+
+source = 'class Case:\n def test_r1(self): pass\nCase = None', invalid = True
+
+    @pytest.mark.parametrize("source,invalid", [
+        ("class Case:\n def test_r1(self): pass\n def test_r1(self): pass", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1 = None", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1: object = None", True),
+        ("class Case:\n def test_r1(self): pass\nCase = None", True),
+        ("class Case:\n def test_r1(self): pass\nfrom helper import Case", True),
+        ("class Case:\n def test_r1(self): pass\nclass Case:\n def test_r2(self): pass", True),
+        ("class Case:\n def setUp(self): pass\n def setUp(self): pass", True),
+        ("class A:\n def test_r1(self): pass\nclass B:\n def test_r1(self): pass", False),
+        ("class Case:\n value = 1\n value = 2\n def test_r1(self): pass", False),
+        ("class Case:\n @property\n def value(self): pass\n @value.setter\n def value(self, v): pass",
+         False),
+    ])
+    def test_generated_test_namespace_does_not_silently_replace_checks(
+        source: str, invalid: bool,
+    ) -> None:
+        errors = fixture_errors(source)
+>       assert bool(errors) is invalid
+E       assert False is True
+E        +  where False = bool([])
+
+tests/test_orch_testlint.py:25: AssertionError
+_ test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\nfrom helper import Case-True] _
+
+source = 'class Case:\n def test_r1(self): pass\nfrom helper import Case'
+invalid = True
+
+    @pytest.mark.parametrize("source,invalid", [
+        ("class Case:\n def test_r1(self): pass\n def test_r1(self): pass", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1 = None", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1: object = None", True),
+        ("class Case:\n def test_r1(self): pass\nCase = None", True),
+        ("class Case:\n def test_r1(self): pass\nfrom helper import Case", True),
+        ("class Case:\n def test_r1(self): pass\nclass Case:\n def test_r2(self): pass", True),
+        ("class Case:\n def setUp(self): pass\n def setUp(self): pass", True),
+        ("class A:\n def test_r1(self): pass\nclass B:\n def test_r1(self): pass", False),
+        ("class Case:\n value = 1\n value = 2\n def test_r1(self): pass", False),
+        ("class Case:\n @property\n def value(self): pass\n @value.setter\n def value(self, v): pass",
+         False),
+    ])
+    def test_generated_test_namespace_does_not_silently_replace_checks(
+        source: str, invalid: bool,
+    ) -> None:
+        errors = fixture_errors(source)
+>       assert bool(errors) is invalid
+E       assert False is True
+E        +  where False = bool([])
+
+tests/test_orch_testlint.py:25: AssertionError
+_ test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\nclass Case:\n def test_r2(self): pass-True] _
+
+source = 'class Case:\n def test_r1(self): pass\nclass Case:\n def test_r2(self): pass'
+invalid = True
+
+    @pytest.mark.parametrize("source,invalid", [
+        ("class Case:\n def test_r1(self): pass\n def test_r1(self): pass", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1 = None", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1: object = None", True),
+        ("class Case:\n def test_r1(self): pass\nCase = None", True),
+        ("class Case:\n def test_r1(self): pass\nfrom helper import Case", True),
+        ("class Case:\n def test_r1(self): pass\nclass Case:\n def test_r2(self): pass", True),
+        ("class Case:\n def setUp(self): pass\n def setUp(self): pass", True),
+        ("class A:\n def test_r1(self): pass\nclass B:\n def test_r1(self): pass", False),
+        ("class Case:\n value = 1\n value = 2\n def test_r1(self): pass", False),
+        ("class Case:\n @property\n def value(self): pass\n @value.setter\n def value(self, v): pass",
+         False),
+    ])
+    def test_generated_test_namespace_does_not_silently_replace_checks(
+        source: str, invalid: bool,
+    ) -> None:
+        errors = fixture_errors(source)
+>       assert bool(errors) is invalid
+E       assert False is True
+E        +  where False = bool([])
+
+tests/test_orch_testlint.py:25: AssertionError
+_ test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def setUp(self): pass\n def setUp(self): pass-True] _
+
+source = 'class Case:\n def setUp(self): pass\n def setUp(self): pass'
+invalid = True
+
+    @pytest.mark.parametrize("source,invalid", [
+        ("class Case:\n def test_r1(self): pass\n def test_r1(self): pass", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1 = None", True),
+        ("class Case:\n def test_r1(self): pass\n test_r1: object = None", True),
+        ("class Case:\n def test_r1(self): pass\nCase = None", True),
+        ("class Case:\n def test_r1(self): pass\nfrom helper import Case", True),
+        ("class Case:\n def test_r1(self): pass\nclass Case:\n def test_r2(self): pass", True),
+        ("class Case:\n def setUp(self): pass\n def setUp(self): pass", True),
+        ("class A:\n def test_r1(self): pass\nclass B:\n def test_r1(self): pass", False),
+        ("class Case:\n value = 1\n value = 2\n def test_r1(self): pass", False),
+        ("class Case:\n @property\n def value(self): pass\n @value.setter\n def value(self, v): pass",
+         False),
+    ])
+    def test_generated_test_namespace_does_not_silently_replace_checks(
+        source: str, invalid: bool,
+    ) -> None:
+        errors = fixture_errors(source)
+>       assert bool(errors) is invalid
+E       assert False is True
+E        +  where False = bool([])
+
+tests/test_orch_testlint.py:25: AssertionError
+_ test_distributed_existing_repo_parallel_tests_and_local_retry[duplicate-test] _
+
+distributed_case = (<orchestragent.orch_run.Orchestrator object at 0x104b40b60>, ScriptedCaller(responses={'plan': [], 'dsh:T-001': [Nati...ent add","id":"T-001","reqs":["R1"],"tests":[]}]},"errors":[]}')], lock=<unlocked _thread.lock object at 0x105231dc0>))
+repair = 'duplicate-test'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x104b40230>
+
+    @pytest.mark.parametrize("repair", [
+        "none", "ownership", "settled-json", "capacity", "duplicate-test", "rebound-test",
+    ])
+    def test_distributed_existing_repo_parallel_tests_and_local_retry(
+        distributed_case: tuple[Orchestrator, ScriptedCaller], repair: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("orchestragent.orch_run.DSF_BUDGET", 39919)
+        orch, caller = distributed_case
+        if repair == "ownership":
+            caller.responses["dsh:T-001"].insert(0, NativeResult("ok", {"files": [{
+                "path": "test_foreign.py", "content": "import unittest\n",
+            }]}))
+        elif repair == "settled-json":
+            caller.responses["dsh:T-001"].insert(0, NativeResult(
+                "failed", {}, usage={"settled_cents": 1}, message="Invalid DSH JSON result: truncated"))
+        elif repair == "capacity":
+            oversized = copy.deepcopy(caller.responses["dsh:T-001"][0])
+            cast(list[dict[str, str]], oversized.data["files"])[0]["content"] += "# verbose\n" * 5000
+            caller.responses["dsh:T-001"].insert(0, oversized)
+        elif repair in {"duplicate-test", "rebound-test"}:
+            invalid = copy.deepcopy(caller.responses["dsh:T-001"][0])
+            file = cast(list[dict[str, str]], invalid.data["files"])[0]
+            method = unittest_ids(file["path"], file["content"])[0].rsplit(".", 1)[1]
+            file["content"] += (f"\n    def {method}(self):\n        pass\n"
+                                if repair == "duplicate-test" else f"\n    {method} = None\n")
+            caller.responses["dsh:T-001"].insert(0, invalid)
+>       run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=2)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_orch_thin.py:689: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/orchestragent/orch_run.py:654: in plan
+    return self._plan(run_id, spec, base, attempts, samples, modules,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <orchestragent.orch_run.Orchestrator object at 0x104b40b60>
+run_id = 'rfeaed3b6', spec = 'Implement adder.add and doubler.double'
+base = 'a9f352b25f29a0fddfb52eeb93db4b897aa33db6', attempts = 3, samples = 1
+modules = False, distributed = True, test_jobs = 2, reviewed_boundary = False
+integration_checks = True
+
+    def _plan(
+        self, run_id: str, spec: str, base: str, attempts: int, samples: int, modules: bool,
+        distributed: bool = False, test_jobs: int = 4,
+        reviewed_boundary: bool = False,
+        integration_checks: bool = True,
+    ) -> Run:
+        self.strategy = self._run_strategy(run_id)
+        thin = self.strategy == "sonnet-dsf" or distributed
+        if self.strategy == "sonnet-dsf" and self.policy is not None:
+            raise PlanError("sonnet-dsf planning does not support frozen policy mode")
+        base_sha = self.git(self.repo, "rev-parse", "--verify", f"{base}^{{commit}}")
+        environment = self.environment_override
+        self.bind_environment()
+        project_report = ""
+        if environment is not None:
+            try:
+                self.bind_environment(str(environment.root), environment.fingerprint)
+                assert self.environment is not None
+                environment = self.environment
+                passed, project_report = self._project_tests(run_id, base_sha, environment)
+            except Exception as error:
+                raise PlanError(
+                    f"project pytest baseline unavailable: {type(error).__name__}"
+                ) from None
+            if not passed:
+                raise PlanError("project pytest baseline failed", [project_report[-4000:]])
+        self.policies.observe_spec(spec)
+        notes = [] if thin else self._settle_planner_rules()
+        rules_text, rule_ids, evicted = layer(
+            [] if thin and self.policy is None else self._rules("planner"), "planner")
+        for rule in evicted:
+            self.state.save_rule(replace(rule, status="retired", note="evicted by rule budget"))
+            notes.append(("rule.retired", {"rule": rule.id, "note": "budget"}))
+        trial = None if thin else self._planner_trial(run_id)
+        coupling = self.index.cochange(base_sha)
+        inputs = PlanInputs(
+            spec, base_sha,
+            frozenset(self.git(self.repo, "ls-tree", "-r", "--name-only", base_sha).splitlines()),
+            (self.index.at(base_sha).planning_map(spec) if distributed else
+             self.index.at(base_sha).repo_map(PLANNER_MAP_BYTES)), coupling_text(coupling),
+            rules_text, trial[0].text if trial is not None and trial[1] else "",
+            tuple([*rule_ids, *([trial[0].id] if trial is not None and trial[1] else [])]),
+        )
+        count = 1 if modules else max(1, min(samples, len(PLAN_HINTS)))
+        if distributed:
+            outcomes: list[Draft | PlanError] = [
+                self._draft_thin(run_id, inputs, attempts, distributed=True, jobs=test_jobs,
+                                 reviewed_boundary=reviewed_boundary,
+                                 integration_checks=integration_checks)]
+        elif modules:
+            outcomes = [self._draft_modules(run_id, inputs, attempts)]
+        else:
+            with ThreadPoolExecutor(max_workers=count) as pool:
+                outcomes = list(pool.map(
+                    lambda i: self._draft(run_id, inputs, PLAN_HINTS[i] if count > 1 else "",
+                                          f"s{i + 1}" if count > 1 else "", attempts),
+                    range(count),
+                ))
+        drafts = [item for item in outcomes if isinstance(item, Draft)]
+        if not thin:
+            for draft in drafts:
+                for errors in draft.errors:
+                    for text in lint_lessons(errors):
+                        self._learn("", text, f"{run_id} lint", "planner")
+        clean = [draft for draft in drafts if draft.plan is not None]
+        if not clean:
+            rejected = [errors for draft in drafts for errors in draft.errors[-1:]]
+            if rejected:
+>               raise PlanError("plan failed lint", rejected[-1])
+E               orchestragent.orch_run.PlanError: plan failed lint
+
+src/orchestragent/orch_run.py:770: PlanError
+_ test_distributed_existing_repo_parallel_tests_and_local_retry[rebound-test] __
+
+distributed_case = (<orchestragent.orch_run.Orchestrator object at 0x104b3dac0>, ScriptedCaller(responses={'plan': [], 'dsh:T-001': [], '...% obj)\nTypeError: don\'t know how to make test from: None\n\n')], lock=<unlocked _thread.lock object at 0x1052f71c0>))
+repair = 'rebound-test'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x104b3e300>
+
+    @pytest.mark.parametrize("repair", [
+        "none", "ownership", "settled-json", "capacity", "duplicate-test", "rebound-test",
+    ])
+    def test_distributed_existing_repo_parallel_tests_and_local_retry(
+        distributed_case: tuple[Orchestrator, ScriptedCaller], repair: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("orchestragent.orch_run.DSF_BUDGET", 39919)
+        orch, caller = distributed_case
+        if repair == "ownership":
+            caller.responses["dsh:T-001"].insert(0, NativeResult("ok", {"files": [{
+                "path": "test_foreign.py", "content": "import unittest\n",
+            }]}))
+        elif repair == "settled-json":
+            caller.responses["dsh:T-001"].insert(0, NativeResult(
+                "failed", {}, usage={"settled_cents": 1}, message="Invalid DSH JSON result: truncated"))
+        elif repair == "capacity":
+            oversized = copy.deepcopy(caller.responses["dsh:T-001"][0])
+            cast(list[dict[str, str]], oversized.data["files"])[0]["content"] += "# verbose\n" * 5000
+            caller.responses["dsh:T-001"].insert(0, oversized)
+        elif repair in {"duplicate-test", "rebound-test"}:
+            invalid = copy.deepcopy(caller.responses["dsh:T-001"][0])
+            file = cast(list[dict[str, str]], invalid.data["files"])[0]
+            method = unittest_ids(file["path"], file["content"])[0].rsplit(".", 1)[1]
+            file["content"] += (f"\n    def {method}(self):\n        pass\n"
+                                if repair == "duplicate-test" else f"\n    {method} = None\n")
+            caller.responses["dsh:T-001"].insert(0, invalid)
+        run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=2)
+>       completed = orch.execute(run.id, jobs=2)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_orch_thin.py:690: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/orchestragent/orch_run.py:1620: in execute
+    self._drain(run_id)
+src/orchestragent/orch_run.py:1787: in _drain
+    future.result()
+/opt/homebrew/anaconda3/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/homebrew/anaconda3/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/opt/homebrew/anaconda3/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/orchestragent/orch_run.py:2389: in _attempt
+    self._attempt_once(run_id, task)
+src/orchestragent/orch_run.py:2403: in _attempt_once
+    self._step(run_id, task)
+src/orchestragent/orch_run.py:2472: in _step
+    self._build(run_id, task, route, count)
+src/orchestragent/orch_run.py:2809: in _build
+    made = list(pool.map(
+/opt/homebrew/anaconda3/lib/python3.12/concurrent/futures/_base.py:619: in result_iterator
+    yield _result_or_cancel(fs.pop())
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/homebrew/anaconda3/lib/python3.12/concurrent/futures/_base.py:317: in _result_or_cancel
+    return fut.result(timeout)
+           ^^^^^^^^^^^^^^^^^^^
+/opt/homebrew/anaconda3/lib/python3.12/concurrent/futures/_base.py:456: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/homebrew/anaconda3/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/opt/homebrew/anaconda3/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/orchestragent/orch_run.py:2810: in <lambda>
+    lambda job: self._generate(run, context, task, route, base, *job), jobs
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/orchestragent/orch_run.py:3036: in _generate
+    result = self._call_model(
+src/orchestragent/orch_run.py:595: in _call_model
+    result = self.call(route.provider, route.model, prompt, schema, call_id,
+tests/test_orch_thin.py:212: in call
+    return caller(provider, model, prompt, schema, run_id, cancelled, effort=effort)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = ScriptedCaller(responses={'plan': [], 'dsh:T-001': [], 'dsh:T-002': [NativeResult(outcome='ok', data={'status': 'DONE'... % obj)\nTypeError: don\'t know how to make test from: None\n\n')], lock=<unlocked _thread.lock object at 0x1052f71c0>)
+provider = 'dsh', model = 'deepseek-flash'
+prompt = 'You implement exactly one task of a larger build. The ORIGINAL SPECIFICATION is authoritative. Derived requirements, ...raise TypeError("don\'t know how to make test from: %s" % obj)\nTypeError: don\'t know how to make test from: None\n\n'
+schema = {'type': 'object', 'properties': {'status': {'type': 'string', 'enum': ['DONE', 'BLOCKED', 'TEST_DISPUTE', 'NEED_FILES...': 'string'}}, ...}, 'required': ['status', 'summary', 'reason', 'need_files', 'edits'], 'additionalProperties': False}
+run_id = 'orch-r684f8fd4-T-001-a3s1-7a895eedef99'
+cancelled = <bound method Event.is_set of <threading.Event at 0x104b3f350: unset>>
+effort = ''
+
+    def __call__(
+        self,
+        provider: str,
+        model: str,
+        prompt: str,
+        schema: dict[str, object],
+        run_id: str,
+        cancelled: Callable[[], bool],
+        *,
+        effort: str = "",
+    ) -> NativeResult:
+        task = re.search(r"T-[0-9]{3}", run_id)
+        key = f"{provider}:{task.group(0)}" if task else "plan"
+        with self.lock:
+            self.calls.append((provider, key, prompt))
+            queue = self.responses.get(key)
+            if not queue:
+>               pytest.fail(f"unexpected model call {key} ({model})")
+E               Failed: unexpected model call dsh:T-001 (deepseek-flash)
+
+tests/conftest.py:222: Failed
+=========================== short test summary info ============================
+FAILED tests/test_orch_testlint.py::test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\n def test_r1(self): pass-True]
+FAILED tests/test_orch_testlint.py::test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\n test_r1 = None-True]
+FAILED tests/test_orch_testlint.py::test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\n test_r1: object = None-True]
+FAILED tests/test_orch_testlint.py::test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\nCase = None-True]
+FAILED tests/test_orch_testlint.py::test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\nfrom helper import Case-True]
+FAILED tests/test_orch_testlint.py::test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def test_r1(self): pass\nclass Case:\n def test_r2(self): pass-True]
+FAILED tests/test_orch_testlint.py::test_generated_test_namespace_does_not_silently_replace_checks[class Case:\n def setUp(self): pass\n def setUp(self): pass-True]
+FAILED tests/test_orch_thin.py::test_distributed_existing_repo_parallel_tests_and_local_retry[duplicate-test]
+FAILED tests/test_orch_thin.py::test_distributed_existing_repo_parallel_tests_and_local_retry[rebound-test]
+9 failed, 3 passed, 130 deselected in 8.72s

@@ -1,0 +1,28 @@
+Source: 466dac72fcf1eb14c8dbb6935753fd639730c625
+No live provider calls. No new measurement script.
+
+Full integration (one run):
+uv run pytest -q
+2 failed, 1493 passed, 5 skipped in 469.79s (0:07:49)
+Failures: test_planning_never_writes_through_existing_symlinks
+  outside-checkpoint-EditError
+  inside-checkpoint-EditError
+Checkpoint now refuses unsafe content earlier with PlanError. Assertions expected
+EditError. Updated only the two expected exception types; no execution-source change.
+Preservation of user file bytes and original repository HEAD remains asserted.
+
+Targeted correction:
+uv run pytest -q tests/test_orch_run.py -k planning_never_writes
+6 passed, 107 deselected in 1.47s
+
+Planning recovery: interrupted provider / unknown authorization / transaction rollback /
+request drift / Git checkpoint interruption / user edits / CLI:
+9 passed, 49 deselected in 5.17s
+
+uv run ruff check .
+All checks passed!
+uv run mypy
+Success: no issues found in 114 source files
+
+Duplicate helper scan: canonical compact JSON remains serialization.dumps.
+Other json.dumps uses are existing worker/server transport boundaries.

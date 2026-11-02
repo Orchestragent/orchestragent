@@ -1,0 +1,19 @@
+test_r1_stable_layers_and_whole_graph_validation (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r1_stable_layers_and_whole_graph_validation) ... ok
+test_r2_single_flight_parallel_keys_invalidation_and_failure (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r2_single_flight_parallel_keys_invalidation_and_failure) ... ok
+test_r3_graph_snapshots_fingerprints_and_local_impact (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r3_graph_snapshots_fingerprints_and_local_impact) ... ok
+test_r4_result_store_atomicity_isolation_and_reopen (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r4_result_store_atomicity_isolation_and_reopen) ... ok
+test_r5_parallel_execution_and_resource_release (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r5_parallel_execution_and_resource_release) ... ok
+test_r6_target_closure_and_defensive_results (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r6_target_closure_and_defensive_results) ... ok
+test_r7_retries_failures_and_blocked_components (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r7_retries_failures_and_blocked_components) ... ok
+test_r8_restart_reuses_success_and_version_change_is_local (_orch_bench_acceptance.test_acceptance.BuildGraphAcceptance.test_r8_restart_reuses_success_and_version_change_is_local) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.007s
+
+OK
+
+issuer=controller
+mode=sandbox-exec
+revision=5403d3b8893e0614d972a12e59dec76f3e5bf38b
+exit=0
+command=python -I -S -B -c <unittest bootstrap>

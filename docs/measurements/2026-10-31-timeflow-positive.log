@@ -1,0 +1,21 @@
+test_r1_lower_bound_optima_keys_cycles_and_strict_validation (_orch_bench_acceptance.test_acceptance.TemporalFlowAcceptance.test_r1_lower_bound_optima_keys_cycles_and_strict_validation) ... ok
+test_r2_existing_public_api_and_legacy_defaults (_orch_bench_acceptance.test_acceptance.TemporalFlowAcceptance.test_r2_existing_public_api_and_legacy_defaults) ... ok
+test_r3_maximum_then_minimum_with_large_capacity (_orch_bench_acceptance.test_acceptance.TemporalFlowAcceptance.test_r3_maximum_then_minimum_with_large_capacity) ... ok
+test_r4_expansion_provenance_and_input_validation (_orch_bench_acceptance.test_acceptance.TemporalFlowAcceptance.test_r4_expansion_provenance_and_input_validation) ... ok
+test_r5_global_temporal_cost_and_canonical_records (_orch_bench_acceptance.test_acceptance.TemporalFlowAcceptance.test_r5_global_temporal_cost_and_canonical_records) ... ok
+test_r6_decomposition_consumes_intermediate_demand_and_all_arc_flow (_orch_bench_acceptance.test_acceptance.TemporalFlowAcceptance.test_r6_decomposition_consumes_intermediate_demand_and_all_arc_flow) ... ok
+test_r7_independent_outages_and_negative_cost_delta (_orch_bench_acceptance.test_acceptance.TemporalFlowAcceptance.test_r7_independent_outages_and_negative_cost_delta) ... ok
+test_r8_cli_composition_strict_json_and_atomic_error_preservation (_orch_bench_acceptance.test_acceptance.TemporalFlowAcceptance.test_r8_cli_composition_strict_json_and_atomic_error_preservation) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.016s
+
+OK
+
+issuer=controller
+mode=sandbox-exec
+revision=39de49a81ca79f9b59f8e8e8b41df8f64e661131
+exit=0
+command=python -I -S -B -c <unittest bootstrap>
+wall_limit_s=25
+cpu_limit_s=15

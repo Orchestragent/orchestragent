@@ -1,0 +1,5 @@
+[plan] run rd5d63100; usage: orch cost --run rd5d63100
+[plan] asking claude/claude-opus-5-5 for boundaries only (attempt 1)
+[plan] 4 test-design shards, at most 4 concurrent calls
+PlanError: plan failed lint
+{"output":"/Users/user/Orchestragent/.data/bench/boltons-project-prefix-20261030","status":"error","usage":{"cache_hit_rate":0.765454,"calls":5,"costs":{"cost_usd":{"known_sum":0,"reported_calls":0},"provider_estimate_usd":{"known_sum":0.166565,"reported_calls":1},"settled_cents":{"known_sum":10.0,"reported_calls":4}},"known_tokens":{"cache_read_tokens":31131,"cache_write_tokens":718,"input_tokens":40670,"output_tokens":13962,"reasoning_tokens":0,"total_tokens":54632},"legacy_calls":0,"pending_calls":0,"reported_calls":{"cache_read_tokens":5,"cache_write_tokens":5,"input_tokens":5,"output_tokens":5,"reasoning_tokens":0,"total_tokens":5}},"wall_s":102.881218}

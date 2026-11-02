@@ -1,0 +1,21 @@
+test_r1_normalized_snapshots_and_whole_model_validation (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r1_normalized_snapshots_and_whole_model_validation) ... ok
+test_r2_global_cost_capacity_and_failure_domain_constraints (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r2_global_cost_capacity_and_failure_domain_constraints) ... ok
+test_r3_minimum_cost_undirected_edge_disjoint_routing (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r3_minimum_cost_undirected_edge_disjoint_routing) ... ok
+test_r4_composed_batches_keep_dependencies_and_scan_past_nonfitting_work (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r4_composed_batches_keep_dependencies_and_scan_past_nonfitting_work) ... ok
+test_r5_atomic_cas_idempotence_corruption_and_concurrent_writers (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r5_atomic_cas_idempotence_corruption_and_concurrent_writers) ... ok
+test_r6_compiled_plan_joins_all_algorithms_and_fingerprints_full_payload (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r6_compiled_plan_joins_all_algorithms_and_fingerprints_full_payload) ... ok
+test_r7_durable_leases_fencing_retry_expiry_and_parallel_reconciliation (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r7_durable_leases_fencing_retry_expiry_and_parallel_reconciliation) ... ok
+test_r8_cli_uses_real_planner_and_durable_controller_without_losing_files (_orch_bench_acceptance.test_acceptance.DeploymentAcceptance.test_r8_cli_uses_real_planner_and_durable_controller_without_losing_files) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.025s
+
+OK
+
+issuer=controller
+mode=sandbox-exec
+revision=b62b69da7a782709a55f16eb7e44f79dcf2ab5a4
+exit=0
+command=python -I -S -B -c <unittest bootstrap>
+wall_limit_s=25
+cpu_limit_s=15

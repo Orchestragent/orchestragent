@@ -1,0 +1,133 @@
+......................................ssssss.s.s.ss..................... [  1%]
+................................................................ssssssss [  2%]
+ss....ss.........................................................sss.... [  3%]
+........................................................................ [  5%]
+ssssssss................................................................ [  6%]
+........................................................................ [  7%]
+.............................sssssssssss..sss........................... [  8%]
+..................................................s..................... [ 10%]
+...................sssssssss............................................ [ 11%]
+........................................................................ [ 12%]
+........................................................................ [ 13%]
+...................................sss......s........s...............s.. [ 15%]
+................................s....................................... [ 16%]
+........................................................................ [ 17%]
+........................................................................ [ 18%]
+........................................................................ [ 20%]
+........................................................................ [ 21%]
+........................................................................ [ 22%]
+........................................................................ [ 23%]
+..............s......................................................... [ 25%]
+........................................................................ [ 26%]
+...........sssssssssssssss............sssss............................. [ 27%]
+........................................................................ [ 28%]
+....ss.ss............................................................... [ 30%]
+........................................................................ [ 31%]
+........................................................................ [ 32%]
+........................................................................ [ 33%]
+........................................................................ [ 35%]
+........................................................................ [ 36%]
+........................................................................ [ 37%]
+........................................................................ [ 38%]
+........................................................................ [ 40%]
+......................ssssssssssssssssssssssssss....sssssssssss......... [ 41%]
+........................................................................ [ 42%]
+...........................................................s............ [ 43%]
+........................................................................ [ 45%]
+........................................................................ [ 46%]
+........................................................................ [ 47%]
+........................................................................ [ 48%]
+.................................sssssssssssssssssssssssssssssssssssssss [ 50%]
+ssssssssssssssssss...................................................... [ 51%]
+........................................................................ [ 52%]
+.....................s............................s..................... [ 53%]
+........................................................................ [ 55%]
+........................................................................ [ 56%]
+........................ssss...ssssssssssssssssss....................... [ 57%]
+........................................................................ [ 58%]
+........................................................................ [ 60%]
+........................................................................ [ 61%]
+........................................................................ [ 62%]
+........................................................................ [ 63%]
+........................................................................ [ 65%]
+........................................................................ [ 66%]
+........................................................................ [ 67%]
+........................................................................ [ 69%]
+........................................................................ [ 70%]
+........................................................................ [ 71%]
+........................................................................ [ 72%]
+........................................................................ [ 74%]
+........................................................................ [ 75%]
+........................................................................ [ 76%]
+........................................................................ [ 77%]
+........................................................................ [ 79%]
+........................................................................ [ 80%]
+........................................................................ [ 81%]
+...........................................................s...s........ [ 82%]
+...........s...s.......................................................s [ 84%]
+.s........................sssss.........sssssssssssss.......sss......... [ 85%]
+........................................................................ [ 86%]
+........................................................................ [ 87%]
+........................................................................ [ 89%]
+........................................................................ [ 90%]
+........................................................................ [ 91%]
+........................................................................ [ 92%]
+..............................s......................................... [ 94%]
+...........................................sssssssssssssssssssssssssssss [ 95%]
+ssssssssssss............................................................ [ 96%]
+...........................s............................................ [ 97%]
+............ssssss...................................................... [ 99%]
+.......................sssss..ssss.................                      [100%]
+=============================== warnings summary ===============================
+networkx/conftest.py:51
+  /Users/user/Orchestragent/.data/bench/networkx-timeflow-preflight-20261031-v2/project/.git/orch/preflight/work/project-3c9ae7/networkx/conftest.py:51: UserWarning: 
+  
+               WARNING: Mixed NetworkX configuration! 
+  
+          This environment has mixed configuration for networkx.
+          The test object nx_loopback is not configured correctly.
+          You should not be seeing this message.
+          Try `pip install -e .`, or change your PYTHONPATH
+          Make sure python finds the networkx repo you are testing
+  
+  
+    warnings.warn(
+
+networkx/algorithms/tests/test_graph_hashing.py: 10 warnings
+  /Users/user/Orchestragent/.data/bench/networkx-timeflow-preflight-20261031-v2/project/.git/orch/preflight/work/project-3c9ae7/networkx/algorithms/graph_hashing.py:211: UserWarning: The hashes produced for graphs without node or edge attributeschanged in v3.5 due to a bugfix (see documentation).
+    node_labels = _init_node_labels(G, edge_attr, node_attr)
+
+networkx/algorithms/tests/test_graph_hashing.py::test_directed
+networkx/algorithms/tests/test_graph_hashing.py::test_reversed
+networkx/algorithms/tests/test_graph_hashing.py::test_directed_bugs
+networkx/algorithms/tests/test_graph_hashing.py::test_trivial_labels_isomorphism_directed
+  /Users/user/Orchestragent/.data/bench/networkx-timeflow-preflight-20261031-v2/project/.git/orch/preflight/work/project-3c9ae7/networkx/utils/backends.py:535: UserWarning: The hashes produced for directed graphs changed in version v3.5 due to a bugfix to track in and out edges separately (see documentation).
+    return self.orig_func(*args, **kwargs)
+
+networkx/algorithms/tests/test_graph_hashing.py::test_empty_graph_subgraph_hash
+networkx/algorithms/tests/test_graph_hashing.py::test_directed_subgraph_hash
+networkx/algorithms/tests/test_graph_hashing.py::test_isomorphic_subgraph_hash
+networkx/algorithms/tests/test_graph_hashing.py::test_isomorphic_edge_attr_subgraph_hash
+networkx/algorithms/tests/test_graph_hashing.py::test_isomorphic_node_attr_subgraph_hash
+networkx/algorithms/tests/test_graph_hashing.py::test_isomorphic_edge_attr_and_node_attr_subgraph_hash
+networkx/algorithms/tests/test_graph_hashing.py::test_iteration_depth
+networkx/algorithms/tests/test_graph_hashing.py::test_digest_size_subgraph_hash
+  /Users/user/Orchestragent/.data/bench/networkx-timeflow-preflight-20261031-v2/project/.git/orch/preflight/work/project-3c9ae7/networkx/algorithms/graph_hashing.py:413: UserWarning: The hashes produced for graphs without node or edge attributeschanged in v3.5 due to a bugfix (see documentation).
+    node_labels = _init_node_labels(G, edge_attr, node_attr)
+
+networkx/algorithms/tests/test_graph_hashing.py::test_directed_subgraph_hash
+networkx/algorithms/tests/test_graph_hashing.py::test_reversed_subgraph_hash
+  /Users/user/Orchestragent/.data/bench/networkx-timeflow-preflight-20261031-v2/project/.git/orch/preflight/work/project-3c9ae7/networkx/utils/backends.py:535: UserWarning: The hashes produced for directed graphs changed in v3.5 due to a bugfix (see documentation).
+    return self.orig_func(*args, **kwargs)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+5446 passed, 335 skipped, 25 warnings in 38.18s
+
+issuer=controller
+mode=sandbox-exec
+revision=4fa222d2fb157e1b7f8c753c9f92e5907d1ddeb4
+exit=0
+command=python -I -S -B -c <pytest bootstrap>
+wall_limit_s=600
+cpu_limit_s=300
+environment=e46f1ae40f2e83c2f95b77b95e57332975d1bd9c4b0bc589900802d59f4a8751

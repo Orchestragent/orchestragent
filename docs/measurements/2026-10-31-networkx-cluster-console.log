@@ -1,0 +1,6 @@
+[plan] run r76b26c71; usage: orch cost --run r76b26c71
+[plan] asking dsh/deepseek-flash for boundaries only (attempt 1)
+[plan] asking dsh/deepseek-flash for boundaries only (attempt 2)
+[plan] asking dsh/deepseek-flash for boundaries only (attempt 3)
+PlanError: plan failed lint
+{"output":"/Users/user/Orchestragent/.data/bench/networkx-rollout-cluster-20261031","status":"error","usage":{"cache_hit_rate":0.343958,"calls":5,"costs":{"cost_usd":{"known_sum":0,"reported_calls":0},"provider_estimate_usd":{"known_sum":0.419211,"reported_calls":2},"settled_cents":{"known_sum":23.0,"reported_calls":3}},"known_tokens":{"cache_read_tokens":26233,"cache_write_tokens":31351,"input_tokens":76268,"output_tokens":24934,"reasoning_tokens":0,"total_tokens":101202},"legacy_calls":0,"pending_calls":0,"reported_calls":{"cache_read_tokens":5,"cache_write_tokens":5,"input_tokens":5,"output_tokens":5,"reasoning_tokens":0,"total_tokens":5}},"wall_s":199.749443}
