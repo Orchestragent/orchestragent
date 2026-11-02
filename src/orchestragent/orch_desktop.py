@@ -17,7 +17,10 @@ from pathlib import Path
 
 from orchestragent.platform import is_macos, source_root
 
-CLIENTS = ("claude-code", "cursor", "claude-desktop")
+CLIENTS = ("claude-code", "codex", "gemini", "cursor", "claude-desktop", "vscode", "windsurf",
+           "opencode")
+# `orch_wait` may block up to 600 s; hosts with short default tool timeouts get a longer one.
+TOOL_TIMEOUT_S = 660
 
 
 def server_entry() -> dict[str, object]:
@@ -33,35 +36,76 @@ def server_entry() -> dict[str, object]:
     return entry
 
 
+def _config_home(home: Path) -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or str(home / ".config"))
+
+
 def config_path(client: str, home: Path | None = None) -> Path:
     home = home or Path.home()
     if client == "cursor":
         return home / ".cursor" / "mcp.json"
+    if client == "gemini":
+        return home / ".gemini" / "settings.json"
+    if client == "windsurf":
+        return home / ".codeium" / "windsurf" / "mcp_config.json"
+    if client == "opencode":
+        return _config_home(home) / "opencode" / "opencode.json"
+    if client == "vscode":
+        if is_macos():
+            return home / "Library" / "Application Support" / "Code" / "User" / "mcp.json"
+        return _config_home(home) / "Code" / "User" / "mcp.json"
     if client == "claude-desktop":
         if is_macos():
             return home / "Library" / "Application Support" / "Claude" / \
                 "claude_desktop_config.json"
-        base = os.environ.get("XDG_CONFIG_HOME") or str(home / ".config")
-        return Path(base) / "Claude" / "claude_desktop_config.json"
+        return _config_home(home) / "Claude" / "claude_desktop_config.json"
     raise ValueError(f"{client} has no config file; use its CLI")
 
 
-def merge_config(path: Path, entry: dict[str, object]) -> str:
+def client_entry(client: str, entry: dict[str, object]) -> tuple[str, dict[str, object]]:
+    """The servers key and the entry in the shape this client's config file expects."""
+    args = entry["args"]
+    assert isinstance(args, list)
+    env = entry.get("env")
+    if client == "vscode":
+        shaped: dict[str, object] = {"type": "stdio", "command": entry["command"], "args": args}
+        if env:
+            shaped["env"] = env
+        return "servers", shaped
+    if client == "opencode":
+        shaped = {"type": "local", "command": [entry["command"], *args], "enabled": True,
+                  "timeout": TOOL_TIMEOUT_S * 1000}
+        if env:
+            shaped["environment"] = env
+        return "mcp", shaped
+    if client == "gemini":
+        shaped = {**entry, "timeout": TOOL_TIMEOUT_S * 1000}
+        path = env.get("PYTHONPATH") if isinstance(env, dict) else None
+        if path:  # Gemini CLI refuses PYTHONPATH overrides: put the source on sys.path itself
+            boot = (f"import sys, runpy; sys.path.insert(0, {path!r}); "
+                    "runpy.run_module('orchestragent.orch_cli', run_name='__main__')")
+            shaped["args"] = ["-c", boot, *args[2:]]  # args = ["-m", module, "mcp"]
+            del shaped["env"]
+        return "mcpServers", shaped
+    return "mcpServers", dict(entry)
+
+
+def merge_config(path: Path, entry: dict[str, object], key: str = "mcpServers") -> str:
     current: dict[str, object] = {}
     if path.exists():
         text = path.read_text()
         current = json.loads(text) if text.strip() else {}
         if not isinstance(current, dict):
             raise ValueError(f"{path} is not a JSON object; not touching it")
-    servers = current.get("mcpServers", {})
+    servers = current.get(key, {})
     if not isinstance(servers, dict):
-        raise ValueError(f"{path}: mcpServers is not an object; not touching it")
+        raise ValueError(f"{path}: {key} is not an object; not touching it")
     if servers.get("orch") == entry:
         return f"orch is already registered in {path}"
     if path.exists():
         shutil.copy2(path, path.with_name(path.name + ".orch-backup"))
     servers["orch"] = entry
-    current["mcpServers"] = servers
+    current[key] = servers
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n")
     return f"registered orch in {path} (restart the client to load it)"
@@ -88,7 +132,39 @@ def install(client: str, home: Path | None = None) -> str:
         if done.returncode and "already exists" not in output:
             raise ValueError(output or "claude mcp add failed")
         return output or "registered orch with Claude Code (user scope)"
-    return merge_config(config_path(client, home), entry)
+    if client == "codex":
+        return _install_codex(entry)
+    key, shaped = client_entry(client, entry)
+    return merge_config(config_path(client, home), shaped, key)
+
+
+def _install_codex(entry: dict[str, object]) -> str:
+    """`codex mcp add` writes ~/.codex/config.toml; then give orch_wait room to block."""
+    codex = shutil.which("codex")
+    if codex is None:
+        raise ValueError("Codex CLI not found on PATH (`codex`)")
+    args = entry["args"]
+    assert isinstance(args, list)
+    env = entry.get("env")
+    command = [codex, "mcp", "add", "orch"]
+    for key, value in (env.items() if isinstance(env, dict) else ()):
+        command += ["--env", f"{key}={value}"]
+    command += ["--", str(entry["command"]), *map(str, args)]
+    done = subprocess.run(command, capture_output=True, text=True, check=False)
+    output = "\n".join(line for line in (done.stdout + done.stderr).splitlines()
+                       if not line.startswith("WARNING")).strip()
+    if done.returncode:
+        raise ValueError(output or "codex mcp add failed")
+    config = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+    if config.is_file():
+        text = config.read_text()
+        header = "[mcp_servers.orch]\n"
+        start = text.find(header)
+        section = text[start:].split("\n[", 1)[0] if start >= 0 else ""
+        if start >= 0 and "tool_timeout_sec" not in section:
+            at = start + len(header)
+            config.write_text(text[:at] + f"tool_timeout_sec = {TOOL_TIMEOUT_S}\n" + text[at:])
+    return output or "registered orch with Codex"
 
 
 def notify(title: str, message: str) -> bool:

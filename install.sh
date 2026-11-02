@@ -92,6 +92,11 @@ if [ "$OS" = Darwin ] && [ -d "/Applications/Claude.app" ]; then
   run orch mcp --install claude-desktop || true
 fi
 if [ -d "$HOME/.cursor" ]; then run orch mcp --install cursor || true; fi
+if have codex; then run orch mcp --install codex || true; fi
+if have gemini || [ -d "$HOME/.gemini" ]; then run orch mcp --install gemini || true; fi
+if have opencode; then run orch mcp --install opencode || true; fi
+if [ -d "$HOME/.codeium/windsurf" ]; then run orch mcp --install windsurf || true; fi
+if have code; then run orch mcp --install vscode || true; fi
 
 # 5. macOS: a double-click dashboard in ~/Applications.
 if [ "$OS" = Darwin ] && ask "Add Orch.app to ~/Applications (choose a project, see it live)?"; then

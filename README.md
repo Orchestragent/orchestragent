@@ -28,8 +28,9 @@ test shards are being written in parallel, and builders wait for their frozen te
   Cursor) or your own API key (Anthropic, DeepSeek, OpenAI, Qwen, OpenRouter, a local
   Ollama — any OpenAI-compatible endpoint). Swap the model behind any role.
 - **Lives where you work.** A CLI with a live terminal view, a macOS app, and an
-  [MCP](https://modelcontextprotocol.io) server so Claude Code, Cursor or Claude Desktop can
-  hand a whole multi-module build to orch and keep going.
+  [MCP](https://modelcontextprotocol.io) server so Claude Code, Codex, Gemini CLI, Cursor,
+  VS Code, Windsurf, opencode or Claude Desktop can hand a whole multi-module build to orch
+  and keep going.
 
 ## How it works
 
@@ -57,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/Orchestragent/orchestragent/main/in
 
 The installer (macOS and Linux) checks git and the sandbox, installs
 [uv](https://astral.sh/uv) and orch as an isolated tool, offers to store your DeepSeek key,
-registers `orch mcp` with Claude Code / Claude Desktop / Cursor when present, offers
+registers `orch mcp` with every agent app it finds (list below), offers
 Orch.app on macOS, and ends with `orch doctor`. `sh install.sh --dry-run` shows every step.
 
 Other ways:
@@ -108,8 +109,22 @@ tests passed; two needed the failure ladder (`rung`), none needed a human.*
 orch, keeps working, and reviews the branch when it is done.
 
 ```sh
-orch mcp --install claude-code      # or: cursor, claude-desktop (config merged and backed up)
+orch mcp --install claude-code      # or any host below
 ```
+
+| host | `--install` | where orch is registered |
+|---|---|---|
+| Claude Code | `claude-code` | `claude mcp add` (user scope) |
+| Codex CLI | `codex` | `codex mcp add`, with a 660 s tool timeout for `orch_wait` |
+| Gemini CLI | `gemini` | `~/.gemini/settings.json` (Gemini only starts MCP servers in trusted folders) |
+| Cursor | `cursor` | `~/.cursor/mcp.json` |
+| VS Code (Copilot agent mode) | `vscode` | your user `mcp.json` |
+| Windsurf | `windsurf` | `~/.codeium/windsurf/mcp_config.json` |
+| opencode | `opencode` | `~/.config/opencode/opencode.json` |
+| Claude Desktop | `claude-desktop` | `claude_desktop_config.json` |
+
+Config files are merged, never replaced: other servers and settings stay, and the previous
+file is backed up next to it. Any other MCP host can run `orch mcp` as a stdio server.
 
 Tools: `orch_start` (plan and run in the background), `orch_wait`, `orch_status`,
 `orch_report` (outcome, branch, diff stat), `orch_cost`, `orch_cancel`, `orch_doctor`.

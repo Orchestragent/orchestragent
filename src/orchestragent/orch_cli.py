@@ -27,6 +27,7 @@ from orchestragent.orch_audit import audit
 from orchestragent.orch_baseline import baseline
 from orchestragent.orch_bench import Case, mock_caller, read_report, report_lines, run_suite
 from orchestragent.orch_build import parse_trailers
+from orchestragent.orch_desktop import CLIENTS as MCP_CLIENTS
 from orchestragent.orch_environment import PytestEnvironment
 from orchestragent.orch_index import Index, Symbol, backend
 from orchestragent.orch_ladder import RUNGS
@@ -758,7 +759,7 @@ def parser() -> argparse.ArgumentParser:
     completion.add_argument("shell", choices=("bash", "zsh", "fish"))
     mcp = commands.add_parser(
         "mcp", help="serve orch to other agent harnesses over MCP (stdio JSON-RPC)")
-    mcp.add_argument("--install", choices=("claude-code", "cursor", "claude-desktop"),
+    mcp.add_argument("--install", choices=MCP_CLIENTS,
                      help="register `orch mcp` with that client instead of serving")
     watch = commands.add_parser(
         "watch", help="live architecture view in the terminal (read-only; --web for a browser)")

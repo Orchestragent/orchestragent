@@ -140,3 +140,77 @@ def test_orch_app_bundle_is_valid_and_its_launcher_serves_the_dashboard(
     (tmp_path / "Other.app").mkdir()
     with pytest.raises(ValueError, match="not an app bundle"):
         install_app(tmp_path / "Other.app")
+
+
+SOURCE_ENTRY: dict[str, object] = {"command": "/py", "args": ["-m", "orchestragent.orch_cli", "mcp"],
+                                   "env": {"PYTHONPATH": "/src"}}
+
+
+def test_each_host_gets_its_own_config_shape(tmp_path: Path,
+                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(orch_desktop, "server_entry", lambda: SOURCE_ENTRY)
+    monkeypatch.setattr(orch_desktop, "is_macos", lambda: False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    for client in ("gemini", "windsurf", "vscode", "opencode"):
+        install(client, tmp_path)
+    vscode = json.loads((tmp_path / "cfg" / "Code" / "User" / "mcp.json").read_text())
+    assert vscode == {"servers": {"orch": {"type": "stdio", "command": "/py",
+                                           "args": ["-m", "orchestragent.orch_cli", "mcp"],
+                                           "env": {"PYTHONPATH": "/src"}}}}
+    opencode = json.loads((tmp_path / "cfg" / "opencode" / "opencode.json").read_text())
+    assert opencode["mcp"]["orch"] == {
+        "type": "local", "command": ["/py", "-m", "orchestragent.orch_cli", "mcp"],
+        "enabled": True, "timeout": 660000, "environment": {"PYTHONPATH": "/src"}}
+    windsurf = json.loads((tmp_path / ".codeium" / "windsurf" / "mcp_config.json").read_text())
+    assert windsurf["mcpServers"]["orch"] == SOURCE_ENTRY
+    gemini = json.loads((tmp_path / ".gemini" / "settings.json").read_text())["mcpServers"]["orch"]
+    # Gemini CLI refuses PYTHONPATH overrides, so the source path is put on sys.path in -c
+    assert "env" not in gemini and gemini["timeout"] == 660000
+    assert gemini["args"][0] == "-c" and "'/src'" in gemini["args"][1] and gemini["args"][2] == "mcp"
+    assert config_path("vscode", tmp_path) == tmp_path / "cfg" / "Code" / "User" / "mcp.json"
+    monkeypatch.setattr(orch_desktop, "is_macos", lambda: True)
+    assert config_path("vscode", tmp_path) == (
+        tmp_path / "Library" / "Application Support" / "Code" / "User" / "mcp.json")
+
+
+def test_gemini_bootstrap_runs_the_cli_from_the_source_path(tmp_path: Path) -> None:
+    import sys
+
+    root = Path(orch_desktop.__file__).resolve().parents[1]
+    _, shaped = orch_desktop.client_entry("gemini", {
+        "command": sys.executable, "args": ["-m", "orchestragent.orch_cli", "--help"],
+        "env": {"PYTHONPATH": str(root)}})
+    args = shaped["args"]
+    assert isinstance(args, list)
+    done = subprocess.run([sys.executable, *args], capture_output=True, text=True, timeout=60,
+                          cwd=tmp_path, env={"PATH": "/usr/bin:/bin"})
+    assert done.returncode == 0 and "usage: orch" in done.stdout
+
+
+def test_codex_install_uses_its_cli_and_raises_the_tool_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[list[str]] = []
+    config = tmp_path / "config.toml"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setattr("orchestragent.orch_desktop.shutil.which",
+                        lambda name: f"/opt/bin/{name}" if name == "codex" else None)
+    monkeypatch.setattr(orch_desktop, "server_entry", lambda: SOURCE_ENTRY)
+
+    def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        seen.append(command)
+        config.write_text('model = "x"\n\n[mcp_servers.orch]\ncommand = "/py"\n'
+                          '\n[mcp_servers.orch.env]\nPYTHONPATH = "/src"\n')
+        return subprocess.CompletedProcess(command, 0, "", "WARNING: noise\nAdded global MCP "
+                                                             "server 'orch'.\n")
+
+    monkeypatch.setattr("orchestragent.orch_desktop.subprocess.run", fake_run)
+    assert install("codex") == "Added global MCP server 'orch'."
+    assert seen == [["/opt/bin/codex", "mcp", "add", "orch", "--env", "PYTHONPATH=/src", "--",
+                     "/py", "-m", "orchestragent.orch_cli", "mcp"]]
+    assert "[mcp_servers.orch]\ntool_timeout_sec = 660\ncommand" in config.read_text()
+    install("codex")  # a second install keeps one timeout line
+    assert config.read_text().count("tool_timeout_sec") == 1
+    monkeypatch.setattr("orchestragent.orch_desktop.shutil.which", lambda name: None)
+    with pytest.raises(ValueError, match="Codex CLI not found"):
+        install("codex")

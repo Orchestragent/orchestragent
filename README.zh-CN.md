@@ -18,7 +18,7 @@
 - **只花单个前沿智能体的零头。** 昂贵的模型只做规划，测试和代码由便宜模型并行产出。实测成本约为 high 强度的原生 Claude Opus 5.5 智能体完成同一任务的 **½ 到 ⅕**（[数据见下](#基准测试)）。
 - **正确性靠构造，不靠运气。** 每个任务在实现之前就有独立的测试被冻结。只有测试在无网络的系统沙箱中通过，任务才会合并。你当前检出的分支永远不会被改动，你只需审阅一个结果分支。
 - **你的模型，你的账号。** 自带 CLI 订阅（Claude Code、Codex、Cursor），或自带 API key（Anthropic、DeepSeek、OpenAI、通义千问、OpenRouter、本地 Ollama，以及任何 OpenAI 兼容接口）。每个角色背后的模型都可以替换。
-- **在你工作的地方工作。** 带实时终端视图的 CLI、macOS 应用，以及 [MCP](https://modelcontextprotocol.io) 服务：Claude Code、Cursor、Claude Desktop 可以把整个多模块构建交给 orch，自己接着干别的。
+- **在你工作的地方工作。** 带实时终端视图的 CLI、macOS 应用，以及 [MCP](https://modelcontextprotocol.io) 服务：Claude Code、Codex、Gemini CLI、Cursor、VS Code、Windsurf、opencode、Claude Desktop 都可以把整个多模块构建交给 orch，自己接着干别的。
 
 ## 工作原理
 
@@ -35,7 +35,7 @@
 curl -fsSL https://raw.githubusercontent.com/Orchestragent/orchestragent/main/install.sh | sh
 ```
 
-安装脚本（macOS 和 Linux）会检查 git 和沙箱，安装 [uv](https://astral.sh/uv) 并把 orch 装成独立工具，询问是否保存 DeepSeek key，在检测到 Claude Code / Claude Desktop / Cursor 时注册 `orch mcp`，在 macOS 上提供安装 Orch.app，最后运行 `orch doctor`。`sh install.sh --dry-run` 可以先查看每一步。
+安装脚本（macOS 和 Linux）会检查 git 和沙箱，安装 [uv](https://astral.sh/uv) 并把 orch 装成独立工具，询问是否保存 DeepSeek key，为检测到的每个智能体应用注册 `orch mcp`（列表见下），在 macOS 上提供安装 Orch.app，最后运行 `orch doctor`。`sh install.sh --dry-run` 可以先查看每一步。
 
 其他方式：
 
@@ -79,8 +79,21 @@ git diff HEAD...orch/<run_id>    # 审阅结果分支，然后由你自己合并
 `orch mcp` 是一个 Model Context Protocol 服务：你的智能体写好需求，把构建交给 orch，自己继续工作，完成后再审阅分支。
 
 ```sh
-orch mcp --install claude-code      # 或 cursor、claude-desktop（合并配置并自动备份）
+orch mcp --install claude-code      # 或下表中任意一个
 ```
+
+| 宿主 | `--install` | 注册位置 |
+|---|---|---|
+| Claude Code | `claude-code` | `claude mcp add`（用户级） |
+| Codex CLI | `codex` | `codex mcp add`，并把工具超时设为 660 秒，供 `orch_wait` 使用 |
+| Gemini CLI | `gemini` | `~/.gemini/settings.json`（Gemini 只在受信任的文件夹里启动 MCP 服务） |
+| Cursor | `cursor` | `~/.cursor/mcp.json` |
+| VS Code（Copilot 智能体模式） | `vscode` | 用户级 `mcp.json` |
+| Windsurf | `windsurf` | `~/.codeium/windsurf/mcp_config.json` |
+| opencode | `opencode` | `~/.config/opencode/opencode.json` |
+| Claude Desktop | `claude-desktop` | `claude_desktop_config.json` |
+
+配置文件只合并、不覆盖：其他服务和设置都会保留，原文件会在旁边备份。其他任何 MCP 宿主都可以把 `orch mcp` 作为 stdio 服务来运行。
 
 工具：`orch_start`（后台规划并运行）、`orch_wait`、`orch_status`、`orch_report`（结果、分支、diff 统计）、`orch_cost`、`orch_cancel`、`orch_doctor`。
 
