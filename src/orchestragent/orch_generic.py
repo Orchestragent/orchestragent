@@ -11,16 +11,19 @@ from __future__ import annotations
 import re
 from typing import Any, cast
 
-from orchestragent.live import TEXT, object_schema
 from orchestragent.live_workspace import safe_relative
 from orchestragent.orch_plan import MAX_PLAN_BYTES, MAX_PLAN_FILES
 from orchestragent.orch_verify import Check
+from orchestragent.orch_verify import parse as parse_check
+from orchestragent.serialization import TEXT, object_schema
 
 TASK_ID = re.compile(r"T-[0-9]{3}")
 REQ_ID = re.compile(r"R[1-9][0-9]*")
 BOUNDARY_KEYS = {"summary", "requirements", "files", "tasks"}
-TASK_KEYS = {"id", "goal", "reqs", "files", "depends_on", "interface_depends_on", "contract",
-             "tests"}
+TASK_KEYS = {"id", "goal", "reqs", "files", "depends_on", "contract", "tests"}
+# OrchTask.entry() omits interface_depends_on when empty; `cases` are the planner's
+# worked examples, read by test design only.
+OPTIONAL_TASK_KEYS = {"interface_depends_on", "cases"}
 MAX_COMMAND = 2000
 GENERIC_TEST_SCHEMA = object_schema({
     "files": {"type": "array", "items": object_schema({"path": TEXT, "content": TEXT})},
@@ -43,6 +46,9 @@ def boundary_errors(value: object, existing: frozenset[str], *,
     rids = [r.get("id") if isinstance(r, dict) else None for r in requirements]
     if any(not isinstance(rid, str) or not REQ_ID.fullmatch(rid) for rid in rids):
         errors.append("every requirement needs an id R1, R2, ...")
+    if any(not isinstance(r, dict) or not isinstance(r.get("text"), str)
+           or not r["text"].strip() for r in requirements):
+        errors.append("every requirement needs its text")
     if len(set(rids)) != len(rids):
         errors.append("requirement ids must be unique")
     files = value["files"]
@@ -74,9 +80,18 @@ def boundary_errors(value: object, existing: frozenset[str], *,
     writers: dict[str, str] = {}
     ids: list[str] = []
     for task in tasks:
-        if not isinstance(task, dict) or not TASK_KEYS <= set(task):
-            errors.append(f"each task needs {sorted(TASK_KEYS)}")
+        if (not isinstance(task, dict) or not TASK_KEYS <= set(task)
+                or not set(task) <= TASK_KEYS | OPTIONAL_TASK_KEYS):
+            errors.append(f"each task has exactly {sorted(TASK_KEYS)}"
+                          f" (and optionally {sorted(OPTIONAL_TASK_KEYS)})")
             continue
+        for key in ("reqs", "files", "depends_on", "interface_depends_on", "cases"):
+            value = task.get(key, [])
+            if (not isinstance(value, list) or not all(isinstance(v, str) for v in value)
+                    or len(set(value)) != len(value)):
+                errors.append(f"{task['id']}: {key} must be a list of unique strings")
+        if task["id"] in task["depends_on"]:
+            errors.append(f"{task['id']}: a task cannot depend on itself")
         tid = str(task["id"])
         ids.append(tid)
         if not TASK_ID.fullmatch(tid):
@@ -118,8 +133,9 @@ def boundary_errors(value: object, existing: frozenset[str], *,
     if _cyclic(graph):
         errors.append("depends_on must be acyclic")
     for task in tasks:
-        if isinstance(task, dict) and isinstance(task.get("interface_depends_on"), list) \
-                and not set(task["interface_depends_on"]) <= set(task.get("depends_on") or []):
+        if isinstance(task, dict) and isinstance(task.get("interface_depends_on", []), list) \
+                and not set(task.get("interface_depends_on", [])) <= set(task.get("depends_on")
+                                                                          or []):
             errors.append(f"{task.get('id')}: interface_depends_on must be within depends_on")
     return errors
 
@@ -193,3 +209,28 @@ def assemble(boundary: dict[str, object], shards: list[tuple[str, list[dict[str,
         tasks[task_id]["tests"].append(check)
     return {**boundary, "files": [*stubs, *tests], "tasks": list(tasks.values()),
             "engine": "generic"}
+
+
+def plan_errors(plan: dict[str, object]) -> list[str]:
+    """Structural problems of a frozen plan (stubs, checks, tasks) in any language."""
+    tasks = cast(list[dict[str, Any]], plan.get("tasks", []))
+    files = cast(list[dict[str, str]], plan.get("files", []))
+    checks = [(task["id"], test) for task in tasks if isinstance(task, dict)
+              for test in task.get("tests", [])]
+    parsed = {test: parse_check(test) for _, test in checks}
+    errors = [f"{tid}: {test[:80]} is not a verification check" for tid, test in checks
+              if parsed[test] is None]
+    test_files = {f for check in parsed.values() if check is not None for f in check.files}
+    present = {f["path"] for f in files}
+    errors += [f"check file {path} is not in the plan" for path in sorted(test_files - present)]
+    boundary = {
+        "summary": plan.get("summary", ""), "requirements": plan.get("requirements", []),
+        "files": [f for f in files if f["path"] not in test_files],
+        "tasks": [{**task, "tests": []} for task in tasks],
+    }
+    errors += [f"{task['id']}: every task needs at least one verification check"
+               for task in tasks if isinstance(task, dict) and not task.get("tests")]
+    owned = {p for task in tasks for p in task.get("files", [])}
+    errors += [f"{path}: a test file is also owned by a task"
+               for path in sorted(test_files & owned)]
+    return errors + boundary_errors(boundary, frozenset(owned - present), existing_edits=True)

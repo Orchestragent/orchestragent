@@ -9,12 +9,11 @@ import math
 import re
 from typing import cast
 
-from orchestragent.live import TEXT, object_schema
 from orchestragent.native import ContextPrompt
 from orchestragent.orch_build import SPEC_AUTHORITY, render_files, spec_context
 from orchestragent.orch_plan import PLAN_SCHEMA
 from orchestragent.orch_state import OrchTask
-from orchestragent.serialization import dumps
+from orchestragent.serialization import TEXT, dumps, object_schema
 
 PARK = 6
 SAMPLING_FLOOR = 0.3  # below this pass rate, sampling is replaced by a thicker contract

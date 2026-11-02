@@ -67,6 +67,7 @@ class OrchTask:
     interface_depends_on: list[str] = field(default_factory=list)  # subset of integration edges
     input_revisions: list[str] = field(default_factory=list)  # bounded automatic contract refreshes
     pending_review: str = ""  # immutable input snapshot; resume it before another implementation
+    human_hint: str = ""  # guidance a person gave this task (`orch hint`); every later attempt
 
     def entry(self) -> dict[str, object]:
         """This task as a plan entry (the shape the planner and lint use)."""
@@ -507,6 +508,25 @@ class OrchState:
                 "status": "READY", "acknowledged_calls": unknown,
                 "discarded_candidate": discard_candidate,
             }, task_id)
+            return task
+
+    def hint(self, run_id: str, task_id: str, text: str) -> OrchTask:
+        """Add a person's guidance to a task; a parked task goes back to READY, fresh ladder."""
+        text = " ".join(text.split())
+        if not text:
+            raise Conflict("a hint needs text")
+        with self.store.transaction() as db:
+            task = self._task(db, run_id, task_id)
+            if task.status in {"DONE", "REPLANNED"}:
+                raise Conflict(f"{task_id} is {task.status}; a hint can no longer change it")
+            hints = f"{task.human_hint}\n- {text}" if task.human_hint else f"- {text}"
+            task = replace(task, human_hint=hints)
+            if task.status == "PARKED":
+                task = replace(task, status="READY", reason="", level=0, used_levels=[],
+                               rebases=0)
+            self._save_task(db, run_id, task)
+            self._event(db, run_id, "task.hint", {"hint": text, "status": task.status},
+                        task_id)
             return task
 
     def add_rule(self, text: str, source: str, kind: str = "builder") -> Rule | None:

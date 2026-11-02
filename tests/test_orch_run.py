@@ -13,7 +13,8 @@ import pytest
 from orchestragent.native import ContextPrompt, NativeResult
 from orchestragent.orch_audit import audit
 from orchestragent.orch_build import REQUIRED_TRAILERS, SPEC_AUTHORITY, EditError, parse_trailers
-from orchestragent.orch_plan import dependency_errors, lint, tasks_from
+from orchestragent.orch_generic import plan_errors
+from orchestragent.orch_plan import dependency_errors, tasks_from
 from orchestragent.orch_review import Review
 from orchestragent.orch_run import (
     DSF,
@@ -29,24 +30,48 @@ from orchestragent.orch_run import (
     Signal,
 )
 from orchestragent.orch_state import OrchEvent, OrchTask, Run, plan_hash
-from orchestragent.orch_synthetic import Shape, synthetic_plan
 from orchestragent.orch_usage import Call
 from orchestragent.store import Conflict
 from orchestragent.workspace import Workspace
 from tests.conftest import (
-    ADDER_STUB,
+    ADD_CHECK,
+    ADD_DESIGN,
+    ADD_TEST,
+    ADD_TESTS,
     BAD_ADD,
+    DOUBLE_DESIGN,
+    DOUBLE_TEST,
     EMPTY_REPLAN,
     GOOD_ADD,
     GOOD_DOUBLE,
-    MATH_TESTS,
     PARKING,
     THICK,
     Clock,
     ScriptedCaller,
+    design,
     edit_result,
     local_runner,
+    scripted,
 )
+
+PLANNING = 3  # the planner's boundary, then one test design per task
+
+
+def built(caller: ScriptedCaller) -> list[str]:
+    """Model calls after planning (whose two test designs may run in either order)."""
+    assert sorted(caller.keys()[:PLANNING]) == ["dsh:T-001", "dsh:T-002", "plan"]
+    return caller.keys()[PLANNING:]
+
+
+def prompts(caller: ScriptedCaller, key: str) -> list[str]:
+    """Prompts sent for `key` after planning."""
+    return [text for _, called, text in caller.calls[PLANNING:] if called == key]
+
+
+def builds(orchestrator: Orchestrator, run_id: str, task_id: str = "T-001") -> list[Call]:
+    """A task's builder receipts (its test design is a planning call)."""
+    return [c for c in orchestrator.state.usage.calls(run_id)
+            if c.task_id == task_id and c.purpose == "build"]
 
 
 def statuses(orchestrator: Orchestrator, run: Run) -> dict[str, str]:
@@ -56,49 +81,8 @@ def statuses(orchestrator: Orchestrator, run: Run) -> dict[str, str]:
 @pytest.fixture
 def context_read() -> NativeResult:
     return NativeResult("ok", {"status": "NEED_FILES", "edits": [],
-                               "need_files": ["doubler.py::double"]},
+                               "need_files": ["doubler.py"]},
                         usage={"input_tokens": 100, "output_tokens": 20, "settled_cents": 1})
-
-
-@pytest.fixture
-def large_owned_case(
-    orch_repo: Path, math_plan: dict[str, object], large_owned_source: str,
-) -> tuple[Orchestrator, ScriptedCaller]:
-    (orch_repo / "adder.py").write_text(large_owned_source)
-    Workspace.git(orch_repo, "add", "adder.py")
-    Workspace.git(orch_repo, "commit", "-m", "existing large module")
-    math_plan["files"] = [entry for entry in cast(list[dict[str, str]], math_plan["files"])
-                          if entry["path"] != "adder.py"]
-    caller = ScriptedCaller({"plan": [NativeResult("ok", math_plan)],
-                             "dsh:T-002": [GOOD_DOUBLE]})
-    return Orchestrator(orch_repo, caller, local_runner, notify=lambda _: None), caller
-
-
-@pytest.mark.parametrize("read_full", [False, True])
-def test_large_owned_context_edits_and_explicit_expansion_preserve_unseen_code(
-    large_owned_case: tuple[Orchestrator, ScriptedCaller], large_owned_source: str,
-    read_full: bool,
-) -> None:
-    orch, caller = large_owned_case
-    corrected = large_owned_source.replace("a - b", "a + b")
-    caller.responses["dsh:T-001"] = ([
-        NativeResult("ok", {"status": "NEED_FILES", "edits": [], "need_files": ["adder.py"]}),
-        edit_result("adder.py", corrected, search=""),
-    ] if read_full else [edit_result("adder.py", "return a + b + helper()",
-                                     search="return a - b + helper()")])
-    run = orch.execute(orch.plan("Correct add and implement double").id, jobs=1)
-    assert run.status == "done", run.message
-    actual = Workspace.git(orch.repo, "show", f"{run.verified_head}:adder.py", strip=False)
-    assert actual == corrected
-    prompts = [p for _, key, p in caller.calls if key == "dsh:T-001"]
-    assert "context ballast" not in prompts[0] and len(prompts[0]) < len(large_owned_source) // 2
-    assert len(prompts) == (2 if read_full else 1)
-    if read_full:
-        assert "context ballast" in prompts[-1]
-    evidence = [e.data["partial_owned"] for e in orch.state.events(run.id, "T-001")
-                if e.kind == "attempt.called"]
-    assert evidence == ([["adder.py"], []] if read_full else [["adder.py"]])
-    assert audit(orch, run.id, run_tests=False) == []
 
 
 def test_context_read_is_pinned_billed_and_does_not_spend_a_failure_rung(
@@ -109,38 +93,39 @@ def test_context_read_is_pinned_billed_and_does_not_spend_a_failure_rung(
                              "dsh:T-002": [GOOD_DOUBLE]})
     result = orchestrator.execute(planned.id)
     task = orchestrator.state.task(planned.id, "T-001")
-    receipts = [c for c in orchestrator.state.usage.calls(planned.id) if c.task_id == task.id]
+    receipts = builds(orchestrator, planned.id)
+    sent = prompts(caller, "dsh:T-001")
     assert (result.status, task.attempts, task.level, task.context_requests) == ("done", 1, 0, 1)
     assert len(receipts) == 2 and len({c.base_revision for c in receipts}) == 1
     assert sum(int(str(c.usage["settled_cents"])) for c in receipts) == 2
-    assert "doubler.py::double" in caller.calls[2][2]
-    assert "class DoubleTest" not in caller.calls[1][2].split("## FROZEN TESTS", 1)[1]
+    assert "--- doubler.py ---" in sent[1] and "--- doubler.py ---" not in sent[0]
+    assert "class DoubleTest" not in sent[0].split("## FROZEN TESTS", 1)[1]
     assert orchestrator.state.usage.calls(planned.id, limit=2) == (
         orchestrator.state.usage.calls(planned.id)[-2:])
 
 
-def test_oversized_file_read_refines_catalog_to_definition_without_restarting_task(
+def test_oversized_file_read_is_cut_to_a_marked_excerpt_without_restarting_task(
     orchestrator: Orchestrator, caller: ScriptedCaller,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("orchestragent.orch_run.DSF_BUDGET", 39919)
-    (orchestrator.repo / "helper.py").write_text(
-        "import inspect\nNOISE = '" + "x" * 45000 + "'\ndef useful():\n    return 7\n")
-    Workspace.git(orchestrator.repo, "add", "helper.py")
+    (orchestrator.repo / "helper.txt").write_text(
+        "NOISE " + "x" * 45000 + "\nuseful: 7\n")
+    Workspace.git(orchestrator.repo, "add", "helper.txt")
     Workspace.git(orchestrator.repo, "commit", "-m", "large read-only dependency")
     run = orchestrator.plan("Add and double")
-    reads = [NativeResult("ok", {"status": "NEED_FILES", "edits": [], "need_files": [s]})
-             for s in ("helper.py", "helper.py::useful")]
-    caller.responses.update({"dsh:T-001": [*reads, GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
+    caller.responses.update({
+        "dsh:T-001": [NativeResult("ok", {"status": "NEED_FILES", "edits": [],
+                                         "need_files": ["helper.txt"]}), GOOD_ADD],
+        "dsh:T-002": [GOOD_DOUBLE]})
     result = orchestrator.execute(run.id)
     task = orchestrator.state.task(run.id, "T-001")
-    prompts = [prompt for _, key, prompt in caller.calls if key == "dsh:T-001"]
-    assert result.status == "done" and task.attempts == 1 and task.context_requests == 2
-    assert "signatures only" in prompts[1] and "return 7" not in prompts[1]
-    assert "Exact definition" in prompts[2] and "return 7" in prompts[2]
-    assert all("x" * 100 not in prompt for prompt in prompts)
-    evidence = events(orchestrator, run.id, "context.request")
-    assert evidence[-1].data["partial_files"] == ["helper.py"]
+    sent = prompts(caller, "dsh:T-001")
+    assert result.status == "done" and task.attempts == 1 and task.context_requests == 1
+    assert "truncated by orch" in sent[1] and "useful: 7" not in sent[1]
+    assert "x" * 45000 not in sent[1]
+    evidence = events(orchestrator, run.id, "attempt.called", "T-001")
+    assert [e.data["partial_reads"] for e in evidence] == [[], ["helper.txt"]]
 
 
 def test_context_beyond_old_byte_limit_stays_on_dsf_and_remains_complete(
@@ -153,15 +138,15 @@ def test_context_beyond_old_byte_limit_stays_on_dsf_and_remains_complete(
     run = orchestrator.plan("Add and double")
     caller.responses.update({
         "dsh:T-001": [NativeResult("ok", {"status": "NEED_FILES", "edits": [],
-                                         "need_files": ["helper.py::useful"]}), GOOD_ADD],
+                                         "need_files": ["helper.py"]}), GOOD_ADD],
         "dsh:T-002": [GOOD_DOUBLE],
     })
     result = orchestrator.execute(run.id)
     task = orchestrator.state.task(run.id, "T-001")
-    prompts = [p for _, key, p in caller.calls if key == "dsh:T-001"]
+    sent = prompts(caller, "dsh:T-001")
     assert (result.status, task.attempts, task.level) == ("done", 1, 0)
-    assert len(prompts) == 2 and "claude:T-001" not in caller.keys()
-    assert source in prompts[1]
+    assert len(sent) == 2 and "claude:T-001" not in caller.keys()
+    assert source in sent[1]
     assert not events(orchestrator, run.id, "task.failed", "T-001")
 
 
@@ -179,7 +164,7 @@ def test_context_overflow_escalation_is_bounded_and_does_not_train_failure_rate(
     task = orchestrator.state.task(planned.id, "T-001")
     assert (task.status, task.level) == (
         ("PARKED", level) if expected == 6 else ("READY", expected))
-    assert caller.keys() == ["plan"]
+    assert built(caller) == []
     assert not events(orchestrator, planned.id, "attempt.outcome", "T-001")
 
 
@@ -194,7 +179,7 @@ def test_repeated_context_requests_spend_no_context_round_and_fail_only_the_atte
     # read, repeat (answered in the attempt), repeat (fails a1), then a2 on the next rung
     assert run.status == "done"
     assert (task.status, task.context_requests, task.attempts, task.level) == ("DONE", 1, 2, 1)
-    assert caller.keys()[:5] == ["plan", *["dsh:T-001"] * 4]
+    assert built(caller)[:4] == ["dsh:T-001"] * 4
 
 
 def test_context_read_honors_spend_cap_before_the_followup_call(
@@ -203,7 +188,7 @@ def test_context_read_honors_spend_cap_before_the_followup_call(
 ) -> None:
     caller.responses["dsh:T-001"] = [context_read]
     run = orchestrator.execute(planned.id, max_cents=1)
-    assert run.status == "paused" and caller.keys() == ["plan", "dsh:T-001"]
+    assert run.status == "paused" and built(caller) == ["dsh:T-001"]
     assert orchestrator.state.task(run.id, "T-001").context_requests == 1
 
 
@@ -286,7 +271,7 @@ def test_recovery_preserves_unknown_calls_and_requires_explicit_retry(
     orchestrator: Orchestrator, caller: ScriptedCaller, planned: Run, unfinished_call: Call,
 ) -> None:
     result = orchestrator.execute(planned.id)
-    assert result.status == "parked" and caller.keys() == ["plan"]
+    assert result.status == "parked" and built(caller) == []
     assert orchestrator.state.task(planned.id, "T-001").status == "PARKED"
     assert any(call.id == unfinished_call.id and call.finished_at is None
                for call in orchestrator.state.usage.calls(planned.id))
@@ -331,7 +316,7 @@ def test_invalid_saved_graph_stops_before_model_dispatch(
                                   depends_on=[dependency])
     result = orchestrator.execute(planned.id)
     assert result.status == "parked" and "Invalid dependency graph" in result.message
-    assert caller.keys() == ["plan"]
+    assert built(caller) == []
 
 
 @pytest.mark.parametrize("outcome", ["timeout", "failed"])
@@ -344,7 +329,7 @@ def test_unknown_provider_exposure_stops_the_ladder(
     result = orchestrator.execute(planned.id)
     task = orchestrator.state.task(planned.id, "T-001")
     assert (result.status, task.status, task.level) == ("paused", "PARKED", 0)
-    assert caller.keys() == ["plan", "dsh:T-001"]
+    assert built(caller) == ["dsh:T-001"]
 
 
 def test_cancellation_after_dispatch_cannot_silently_repeat_the_unknown_call(
@@ -376,7 +361,7 @@ def test_scheduler_fault_cancels_dispatch_and_resumes_without_ghost_slots(
     monkeypatch.setattr(orchestrator, "_attempt", broken)
     paused = orchestrator.execute(planned.id, jobs=1)
     assert paused.status == "paused" and paused.message == "scheduler fault: OSError"
-    assert caller.keys() == ["plan"]
+    assert built(caller) == []
     monkeypatch.setattr(orchestrator, "_attempt", original)
     caller.responses.update({"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
     assert orchestrator.execute(planned.id, jobs=1).status == "done"
@@ -389,7 +374,7 @@ def test_unusable_saved_candidates_park_without_model_calls(
     orchestrator.state.transition(planned.id, "T-001", "READY", "task.ready", {},
         pending_candidate="f" * 40 if fault == "missing" else planned.checkpoint)
     result = orchestrator.execute(planned.id)
-    assert result.status == "parked" and caller.keys() == ["plan"]
+    assert result.status == "parked" and built(caller) == []
     assert orchestrator.state.task(planned.id, "T-001").reason
 
 
@@ -399,11 +384,10 @@ def test_builder_route_is_pinned_to_deepseek_flash() -> None:
 
 @pytest.fixture
 def interface_case(
-    orch_repo: Path, math_plan: dict[str, object],
+    orch_repo: Path, math_plan: dict[str, object], unsandboxed: None,
 ) -> tuple[Orchestrator, ScriptedCaller]:
     cast(list[dict[str, object]], math_plan["tasks"])[1]["interface_depends_on"] = ["T-001"]
-    caller = ScriptedCaller({"plan": [NativeResult("ok", math_plan)],
-                             "dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
+    caller = scripted(math_plan, {"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
     orch = Orchestrator(orch_repo, caller, local_runner, notify=lambda _: None)
     orch.early_interface_start = True  # these tests exercise the opt-in early build
     return orch, caller
@@ -415,7 +399,7 @@ def test_candidate_binds_dependency_contracts_and_checks_them_at_merge(
     changes: int,
 ) -> None:
     orch, caller = interface_case
-    caller.responses["dsh:T-002"] = [GOOD_DOUBLE] * min(changes + 1, 4)
+    caller.responses["dsh:T-002"] = [DOUBLE_DESIGN, *[GOOD_DOUBLE] * min(changes + 1, 4)]
     merge = orch._merge
 
     def change_contract(run: Run, task: OrchTask, candidate: Candidate, route: Route) -> None:
@@ -430,8 +414,8 @@ def test_candidate_binds_dependency_contracts_and_checks_them_at_merge(
     run = orch.execute(orch.plan("Add and double").id)
     downstream = orch.state.task(run.id, "T-002")
     assert run.status == ("parked" if changes > 3 else "done")
-    assert caller.keys().count("dsh:T-001") == 1
-    assert caller.keys().count("dsh:T-002") == min(changes + 1, 4)
+    assert built(caller).count("dsh:T-001") == 1
+    assert built(caller).count("dsh:T-002") == min(changes + 1, 4)
     revisions = events(orch, run.id, "task.inputs_changed", "T-002")
     assert len(revisions) == min(changes, 3)
     assert all(item.data["dependencies"] == ["T-001"] for item in revisions)
@@ -490,7 +474,7 @@ def test_interface_pipeline_overlaps_generation_then_replays_once_after_dependen
     monkeypatch.setattr(orch.state, "wait_for", signal_handoff)
     run = orch.execute(orch.plan("Add and double").id, jobs=2)
     assert run.status == "done" and waiting.is_set()
-    assert caller.keys().count("dsh:T-001") == caller.keys().count("dsh:T-002") == 1
+    assert built(caller).count("dsh:T-001") == built(caller).count("dsh:T-002") == 1
     assert orch.state.task(run.id, "T-002").attempts == 1
     trace = orch.state.events(run.id)
     parked_code = next(e for e in trace if e.kind == "task.waits")
@@ -524,38 +508,9 @@ def test_early_candidate_survives_restart_and_parked_upstream_without_more_gener
         resumed.state.retry(run.id, "T-001")
         finished = resumed.execute(run.id)
     assert finished.status == "done"
-    assert caller.keys().count("dsh:T-001") == caller.keys().count("dsh:T-002") == 1
+    assert built(caller).count("dsh:T-001") == built(caller).count("dsh:T-002") == 1
     assert len(events(resumed, run.id, "task.candidate_reused", "T-002")) == 1
     assert audit(resumed, run.id, run_tests=False) == []
-
-
-@pytest.mark.parametrize("proposal", [2, 99, 0])
-def test_structure_gate_rejects_shadowed_code_before_sandbox_or_sampling(
-    orchestrator: Orchestrator, caller: ScriptedCaller, planned: Run,
-    monkeypatch: pytest.MonkeyPatch, proposal: int,
-) -> None:
-    duplicate = ADDER_STUB.replace("raise NotImplementedError", "return a + b") + ADDER_STUB
-    caller.responses.update({"dsh:T-001": [edit_result("adder.py", duplicate, search=""), GOOD_ADD],
-                             "dsh:T-002": [GOOD_DOUBLE]})
-    verified: list[str] = []
-    runner = orchestrator.runner
-
-    def verify(cwd: Path, scratch: Path, revision: str, names: list[str], *,
-               timeout: float = 120) -> tuple[bool, str]:
-        verified.append(revision)
-        return runner(cwd, scratch, revision, names, timeout=timeout)
-
-    monkeypatch.setattr(orchestrator, "runner", verify)
-    # Even an external classifier proposing sampling cannot bypass the eligibility gate.
-    monkeypatch.setattr(orchestrator, "_triage", lambda *args: proposal)
-    run = orchestrator.execute(planned.id, jobs=1)
-    failed = events(orchestrator, run.id, "task.failed", "T-001")[0].data
-    assert run.status == "done" and failed["category"] == "structure"
-    assert failed["next"] == 1 and failed["sampleable"] is False
-    assert failed["candidate"] not in verified
-    assert caller.keys() == ["plan", "dsh:T-001", "dsh:T-001", "dsh:T-002"]
-    assert events(orchestrator, run.id, "recovery.rejected", "T-001")
-    assert audit(orchestrator, run.id, run_tests=False) == []
 
 
 def test_discard_candidate_clears_pending_and_failed_artifacts(
@@ -592,7 +547,7 @@ def test_happy_path_merges_tasks_in_dependency_order_with_trailers(
     assert (finished.status, statuses(orchestrator, finished)) == (
         "done", {"T-001": "DONE", "T-002": "DONE"},
     )
-    assert caller.keys() == ["plan", "dsh:T-001", "dsh:T-002"]
+    assert built(caller) == ["dsh:T-001", "dsh:T-002"]
     assert [parse_trailers(m)["Orch-Task"] for m in messages] == ["T-002", "T-001"]
     assert all(set(parse_trailers(m)) == set(REQUIRED_TRAILERS) for m in messages)
     assert Workspace.git(orch_repo, "rev-parse", f"orch/{finished.id}/done") == log[0]
@@ -626,12 +581,12 @@ SPLIT = NativeResult(
         "tasks": [
             {
                 "id": "T-003", "goal": "add", "reqs": ["R1"], "files": ["adder.py"],
-                "depends_on": [], "tests": ["test_mathops.AddTest.test_r1_adds"],
+                "depends_on": [], "interface_depends_on": [], "tests": [ADD_TEST],
                 "contract": "a + b",
             },
             {
                 "id": "T-004", "goal": "double", "reqs": ["R2"], "files": ["doubler.py"],
-                "depends_on": ["T-003"], "tests": ["test_mathops.DoubleTest.test_r2_doubles"],
+                "depends_on": ["T-003"], "interface_depends_on": [], "tests": [DOUBLE_TEST],
                 "contract": "add(a, a)",
             },
         ],
@@ -660,7 +615,7 @@ SPLIT = NativeResult(
         ),
         (PARKING, ("PARKED", "PLANNED", "parked"), ["dsh", "dsh", "claude", "claude", "dsh",
                                                     "claude"]),
-        (
+        pytest.param(
             {
                 "dsh:T-001": [edit_result("adder.py", "", "BLOCKED")],
                 "claude:T-001": [SPLIT],
@@ -696,7 +651,7 @@ def test_failure_ladder(
     run = orchestrator.execute(planned.id)
     tasks = statuses(orchestrator, run)
     assert (tasks["T-001"], tasks["T-002"], run.status) == expected
-    assert [key.split(":")[0] for key in caller.keys()[1:]] == routes
+    assert [key.split(":")[0] for key in built(caller)] == routes
     unused = {key: queue for key, queue in caller.responses.items() if queue}
     assert unused in ({}, {"dsh:T-002": [GOOD_DOUBLE]})  # replans retire T-002 unbuilt
 
@@ -710,29 +665,27 @@ BROKEN_JSON = NativeResult(
 CUT_JSON = replace(BROKEN_JSON, usage={**SETTLED, "turn_end": "max-tokens"})
 UNSETTLED_JSON = NativeResult("failed", {}, usage={"forwarded": 1, "reserved_cents": 300},
                               message="Invalid DSH JSON result: Expecting ',' delimiter")
-UNTERMINATED = edit_result("adder.py", 'return "a + b')
 
 
 @pytest.mark.parametrize(("answers", "repairs", "first_attempt_calls", "evidence"), [
     ([BROKEN_JSON, GOOD_ADD], ["json"], 2, "error_char="),
-    ([UNTERMINATED, GOOD_ADD], ["edit"], 2, "resulting line: '    return \"a + b'"),
     ([BROKEN_JSON, BROKEN_JSON, GOOD_ADD], ["json"], 2, "not valid JSON"),
     ([UNSETTLED_JSON, GOOD_ADD], [], 1, ""),
-], ids=["json", "syntax", "repair-once-then-ladder", "unknown-never-repaired"])
+], ids=["json", "repair-once-then-ladder", "unknown-never-repaired"])
 def test_dsf_repairs_its_own_settled_answer_within_the_attempt(
     orchestrator: Orchestrator, caller: ScriptedCaller, planned: Run,
     answers: list[NativeResult], repairs: list[str], first_attempt_calls: int, evidence: str,
 ) -> None:
     caller.responses.update({"dsh:T-001": list(answers), "dsh:T-002": [GOOD_DOUBLE]})
     run = orchestrator.execute(planned.id)
-    calls = [c for c in orchestrator.state.usage.calls(run.id) if c.task_id == "T-001"]
+    calls = builds(orchestrator, run.id)
     first = [c for c in calls if c.attempt == 1]
-    prompts = [text for _, key, text in caller.calls if key == "dsh:T-001"]
+    sent = prompts(caller, "dsh:T-001")
     sidecars = sorted((orchestrator.run_dir(run.id) / "responses").glob("*.json"))
     repaired = events(orchestrator, run.id, "attempt.format_repair")
     assert [e.data["kind"] for e in repaired] == repairs
     assert len(first) == first_attempt_calls and all(c.provider == "dsh" for c in calls)
-    assert all(evidence in prompts[1] for _ in repairs)
+    assert all(evidence in sent[1] for _ in repairs)
     assert len(sidecars) == sum(a not in (GOOD_ADD, UNSETTLED_JSON) for a in answers)
     if answers[0] is UNSETTLED_JSON:
         assert not sidecars and caller.responses["dsh:T-001"] == [GOOD_ADD]
@@ -746,12 +699,12 @@ def test_a_persistently_unparseable_builder_repairs_once_per_attempt_and_parks(
     caller.responses.update({"dsh:T-001": [BROKEN_JSON] * 40, "dsh:T-002": [GOOD_DOUBLE],
                              "claude:T-001": [BAD_ADD, THICK, EMPTY_REPLAN]})
     run = orchestrator.execute(planned.id)
-    builds = Counter((c.attempt, c.sample) for c in orchestrator.state.usage.calls(run.id)
-                     if c.task_id == "T-001" and c.provider == "dsh")
+    attempts = Counter((c.attempt, c.sample) for c in builds(orchestrator, run.id)
+                       if c.provider == "dsh")
     task = orchestrator.state.task(run.id, "T-001")
     assert (task.status, task.reason) == ("PARKED", "replan returned no tasks")
-    assert set(builds.values()) == {2} and len(caller.responses["dsh:T-001"]) > 0
-    assert len(events(orchestrator, run.id, "attempt.format_repair")) == len(builds)
+    assert set(attempts.values()) == {2} and len(caller.responses["dsh:T-001"]) > 0
+    assert len(events(orchestrator, run.id, "attempt.format_repair")) == len(attempts)
 
 
 UNSETTLED_CUT = replace(UNSETTLED_JSON, usage={**UNSETTLED_JSON.usage, "turn_end": "max-tokens"})
@@ -783,7 +736,7 @@ def test_dsf_starts_at_the_widest_covered_budget_and_a_confirmed_cut_stops_durab
     orchestrator.execute(run.id)  # execute again: a stopped task is not redispatched
     resumed = Orchestrator(orchestrator.repo, caller, local_runner, notify=lambda _: None)
     resumed.execute(run.id)
-    calls = [c for c in resumed.state.usage.calls(run.id) if c.task_id == "T-001"]
+    calls = builds(resumed, run.id)
     task = resumed.state.task(run.id, "T-001")
     assert [(c.attempt, c.effort) for c in calls] == efforts
     assert {kind: len(events(resumed, run.id, kind)) for kind in events_seen} == events_seen
@@ -797,9 +750,7 @@ def test_dsf_starts_at_the_widest_covered_budget_and_a_confirmed_cut_stops_durab
 @pytest.fixture
 def untested_split() -> NativeResult:
     proposal = copy.deepcopy(SPLIT)
-    tasks = cast(list[dict[str, Any]], proposal.data["tasks"])
-    tasks[1]["tests"] += tasks[0]["tests"]
-    tasks[0]["tests"] = []
+    cast(list[dict[str, Any]], proposal.data["tasks"])[0]["tests"] = []
     return proposal
 
 
@@ -817,9 +768,9 @@ def test_rejected_replan_gets_one_revision_with_the_controller_errors(
     replans = [text for _, key, text in caller.calls if key == "claude:T-001"]
     rejected = events(orchestrator, run.id, "task.replan_rejected", "T-001")
     assert len(replans) == 2 and len(rejected) == (1 if revised else 2)
-    assert "T-003: needs reqs, files and tests (missing tests)" in cast(
+    assert "replacement tests differ from the replaced tasks" in cast(
         list[str], rejected[0].data["errors"])
-    assert "(missing tests)" in replans[1] and "PREVIOUS REPLAN REJECTED" in replans[1]
+    assert "replacement tests differ" in replans[1] and "PREVIOUS REPLAN REJECTED" in replans[1]
     assert "at least one of the replaced frozen tests" in replans[0]
     assert (run.status, orchestrator.state.task(run.id, "T-001").status) == (
         ("done", "REPLANNED") if revised else ("parked", "PARKED"))
@@ -863,24 +814,25 @@ def test_samples_run_in_parallel_and_the_passing_one_merges(
     assert len({c.id for c in samples}) == 4  # losing candidates also consumed tokens
 
 
-@pytest.mark.parametrize("oracle", ["wrong", "correct", "duplicate_candidates", "already_reviewed"])
+@pytest.mark.parametrize("oracle", ["wrong", "correct",
+                                    "duplicate_candidates", "already_reviewed"])
 def test_failed_candidate_agreement_reviews_tests_once_and_preserves_code_evidence(
-    orchestrator: Orchestrator, caller: ScriptedCaller, math_plan: dict[str, object], oracle: str,
+    orchestrator: Orchestrator, caller: ScriptedCaller, oracle: str,
 ) -> None:
-    if oracle == "wrong":
-        cast(list[dict[str, str]], math_plan["files"])[2]["content"] = MATH_TESTS.replace(
-            "add(2, 3), 5", "add(2, 3), 6")
+    tests = design("test_add.py", ADD_TESTS.replace("add(2, 3), 5", "add(2, 3), 6"),
+                   ADD_CHECK.command) if oracle == "wrong" else ADD_DESIGN
     variations = ([GOOD_ADD, edit_result("adder.py", "return b + a")] * 2 if oracle == "wrong" else
                   [BAD_ADD] * 4 if oracle == "duplicate_candidates" else
                   [BAD_ADD, edit_result("adder.py", "return 0")] * 2)
     reviews = [NativeResult("ok", {
         "verdict": "tests_wrong" if oracle == "wrong" else "tests_correct", "contract": "",
         "explanation": "Check arithmetic against the original requirement.",
-        "edits": [{"path": "test_mathops.py", "search": "add(2, 3), 6",
+        "edits": [{"path": "test_add.py", "search": "add(2, 3), 6",
                    "replace": "add(2, 3), 5"}] if oracle == "wrong" else [],
     })] if oracle in {"wrong", "correct"} else []
     caller.responses.update({
-        "dsh:T-001": [EDIT_MISS, EDIT_MISS, BAD_ADD, *variations], "dsh:T-002": [GOOD_DOUBLE],
+        "dsh:T-001": [tests, EDIT_MISS, EDIT_MISS, BAD_ADD, *variations],
+        "dsh:T-002": [DOUBLE_DESIGN, GOOD_DOUBLE],
         "claude:T-001": [*reviews, *([] if oracle == "wrong" else [GOOD_ADD])],
     })
     run = orchestrator.plan("add and double")
@@ -888,7 +840,7 @@ def test_failed_candidate_agreement_reviews_tests_once_and_preserves_code_eviden
         orchestrator.state.transition(run.id, "T-001", "READY", "fixture.reviewed", {}, disputes=1)
     run = orchestrator.execute(run.id)
     recorded = orchestrator.state.events(run.id, "T-001")
-    assert run.status == "done" and caller.keys().count("dsh:T-001") == 7  # 1 edit repair
+    assert run.status == "done" and built(caller).count("dsh:T-001") == 7  # 1 edit repair
     assert sum(e.kind == "task.failure_agreement" for e in recorded) == int(
         oracle != "duplicate_candidates")
     purposes = [c.purpose for c in orchestrator.state.usage.calls(run.id)
@@ -898,7 +850,7 @@ def test_failed_candidate_agreement_reviews_tests_once_and_preserves_code_eviden
     if oracle == "wrong":
         assert sum(e.kind == "task.candidate_reused" for e in recorded) == 1
     elif oracle == "correct":
-        patch = [prompt for _, key, prompt in caller.calls if key == "claude:T-001"][-1]
+        patch = prompts(caller, "claude:T-001")[-1]
         assert "AssertionError" in patch
         # Parallel responses may be assigned to either candidate label.
         assert any(f"+    {body}" in patch for body in ("return a - b", "return 0"))
@@ -906,62 +858,37 @@ def test_failed_candidate_agreement_reviews_tests_once_and_preserves_code_eviden
 
 @pytest.mark.parametrize("corrections", [1, 2, 3])
 def test_wrong_frozen_test_is_corrected_by_claude_and_refrozen(
-    orch_repo: Path, math_plan: dict[str, object], corrections: int,
+    orch_repo: Path, math_plan: dict[str, object], unsandboxed: None, corrections: int,
 ) -> None:
-    files = cast(list[dict[str, str]], math_plan["files"])
     cases = [("2, 3", 5), ("0, 0", 0), ("-1, 1", 0)][:corrections]
     assertions = "\n".join(f"        self.assertEqual(add({args}), {expected + 1})"
                            for args, expected in cases)
-    files[2] = {"path": "test_mathops.py", "content": MATH_TESTS.replace(
-        "        self.assertEqual(add(2, 3), 5)", assertions)}
+    wrong = design("test_add.py", ADD_TESTS.replace(
+        "        self.assertEqual(add(2, 3), 5)", assertions), ADD_CHECK.command)
     fixes = [NativeResult(
         "ok",
         {
             "verdict": "tests_wrong",
             "explanation": f"add({args}) is {expected}",
-            "edits": [{"path": "test_mathops.py", "search": f"add({args}), {expected + 1}",
+            "edits": [{"path": "test_add.py", "search": f"add({args}), {expected + 1}",
                        "replace": f"add({args}), {expected}"}],
         },
     ) for args, expected in cases]
-    caller = ScriptedCaller(
-        {
-            "plan": [NativeResult("ok", math_plan)],
-            "dsh:T-001": [*[DISPUTE] * corrections, GOOD_ADD],
-            "claude:T-001": fixes,
-            "dsh:T-002": [GOOD_DOUBLE],
-        }
-    )
+    caller = scripted(math_plan, {
+        "dsh:T-001": [wrong, *[DISPUTE] * corrections, GOOD_ADD],
+        "claude:T-001": fixes,
+        "dsh:T-002": [DOUBLE_DESIGN, GOOD_DOUBLE],
+    }, designs={})
     orchestrator = Orchestrator(orch_repo, caller, local_runner, notify=lambda line: None)
     run = orchestrator.execute(orchestrator.plan("spec").id)
     log = Workspace.git(orch_repo, "log", "--format=%s", run.branch).splitlines()
     assert run.status == "done"
     assert sum(line.startswith("orch tests T-001:") for line in log) == corrections
-    assert "3), 5" in Workspace.git(orch_repo, "show", f"{run.branch}:test_mathops.py")
+    assert "3), 5" in Workspace.git(orch_repo, "show", f"{run.branch}:test_add.py")
     assert run.plan_hash != orchestrator.state.events(run.id)[0].data["plan"]
     review = next(prompt for provider, _, prompt in caller.calls if provider == "claude"
                   and "Independently review" in prompt)
     assert isinstance(review, ContextPrompt) and run.spec in review.shared
-
-
-@pytest.mark.parametrize("defect", ["constant", "capture"])
-def test_test_correction_with_bad_fixture_rolls_back_without_state_or_source_change(
-    orchestrator: Orchestrator, planned: Run, defect: str,
-) -> None:
-    state = orchestrator.state
-    state.transition(planned.id, "T-001", "READY", "task.ready", {})
-    task = state.transition(planned.id, "T-001", "RUNNING", "task.started", {}, attempts=1)
-    path = orchestrator.integration(planned.id) / "test_mathops.py"
-    original = path.read_text()
-    before = (state.run(planned.id), state.tasks(planned.id), state.events(planned.id))
-    search = "self.assertEqual(add(2, 3), 5)"
-    replacement = ("self.assertEqual(1, 1)" if defect == "constant" else
-                   search + "\n        callbacks = [lambda: n for n in (1, 2)]")
-    with pytest.raises(AttemptFailed, match="test correction fails lint"):
-        orchestrator._fix_tests(planned, task, [path.name], [{
-            "path": path.name, "search": search, "replace": replacement}], "invalid fixture")
-    assert (state.run(planned.id), state.tasks(planned.id), state.events(planned.id)) == before
-    assert path.read_text() == original
-    assert Workspace.git(path.parent, "status", "--porcelain") == ""
 
 
 @pytest.mark.parametrize(("disputes", "corrected"), [(1, 0), (2, 1), (3, 3)])
@@ -974,7 +901,7 @@ def test_unchanged_or_exhausted_test_reviews_do_not_make_more_calls(
     task = replace(orchestrator.state.task(planned.id, "T-001"), disputes=disputes)
     with pytest.raises(AttemptFailed, match="dispute"):
         orchestrator._signal(planned.id, task, Signal("TEST_DISPUTE", "another claim"))
-    assert caller.keys() == ["plan"]
+    assert built(caller) == []
 
 
 @pytest.mark.parametrize("stage", ["RUNNING", "VERIFYING"])
@@ -995,65 +922,28 @@ def test_upheld_review_preserves_stage_then_uses_the_normal_failure_transition(
     orchestrator._failed(planned.id, task.id, 1, 0, caught.value)
     current = state.task(planned.id, task.id)
     assert current.status == "READY" and current.disputes == 1
-    assert caller.keys() == ["plan", "claude:T-001"]
-
-
-@pytest.mark.parametrize(("corrections", "producer"), [(1, "dsh"), (2, "dsh"), (1, "claude")])
-def test_fixture_error_reviews_directly_and_rechecks_saved_code_without_regeneration(
-    orch_repo: Path, math_plan: dict[str, object], corrections: int, producer: str,
-) -> None:
-    cases = [("2, 3", 5), ("0, 0", 0)][:corrections]
-    assertions = "\n".join(f"        self.assertEqual(add({args}), expected_{index})"
-                           for index, (args, _) in enumerate(cases))
-    cast(list[dict[str, str]], math_plan["files"])[2]["content"] = MATH_TESTS.replace(
-        "        self.assertEqual(add(2, 3), 5)", assertions)
-    caller = ScriptedCaller({
-        "plan": [NativeResult("ok", math_plan)],
-        "dsh:T-001": [GOOD_ADD] if producer == "dsh" else [], "dsh:T-002": [GOOD_DOUBLE],
-        "claude:T-001": [*([GOOD_ADD] if producer == "claude" else []), *[NativeResult("ok", {
-            "verdict": "tests_wrong", "explanation": "expected value was never defined",
-            "contract": "", "edits": [{"path": "test_mathops.py",
-                                        "search": f"expected_{index}",
-                                        "replace": str(expected)}],
-        }) for index, (_, expected) in enumerate(cases)]],
-    })
-    orch = Orchestrator(orch_repo, caller, local_runner, notify=lambda _: None)
-    run = orch.plan("Add and double")
-    if producer == "claude":
-        orch.state.transition(run.id, "T-001", "READY", "task.ready", {}, level=3)
-    run = orch.execute(run.id)
-    recorded = orch.state.events(run.id, "T-001")
-    assert run.status == "done"
-    assert caller.keys().count(f"{producer}:T-001") == (
-        1 + (corrections if producer == "claude" else 0))
-    assert sum(e.kind == "task.fixture_dispute" for e in recorded) == corrections
-    assert sum(e.kind == "task.candidate_reused" for e in recorded) == corrections
-    assert not any(e.kind == "task.failed" for e in recorded)
-    assert [c.purpose for c in orch.state.usage.calls(run.id)
-            if c.provider == "claude"] == ["plan", *(["patch"] if producer == "claude" else []),
-                                          *["review"] * corrections]
+    assert built(caller) == ["claude:T-001"]
 
 
 @pytest.mark.parametrize(("producer", "missing"), [("dsh", False), ("claude", False),
                                                    ("dsh", True)])
 def test_semantic_test_correction_reuses_durable_failed_code_or_discards_invalid_artifact(
     orch_repo: Path, math_plan: dict[str, object], monkeypatch: pytest.MonkeyPatch,
-    producer: str, missing: bool,
+    unsandboxed: None, producer: str, missing: bool,
 ) -> None:
-    cast(list[dict[str, str]], math_plan["files"])[2]["content"] = MATH_TESTS.replace(
-        "add(2, 3), 5", "add(2, 3), 6")
+    wrong = design("test_add.py", ADD_TESTS.replace("add(2, 3), 5", "add(2, 3), 6"),
+                   ADD_CHECK.command)
     correction = NativeResult("ok", {
         "verdict": "tests_wrong", "explanation": "2 + 3 is 5", "contract": "",
-        "edits": [{"path": "test_mathops.py", "search": "add(2, 3), 6",
+        "edits": [{"path": "test_add.py", "search": "add(2, 3), 6",
                    "replace": "add(2, 3), 5"}],
     })
-    caller = ScriptedCaller({
-        "plan": [NativeResult("ok", math_plan)],
-        "dsh:T-001": [*([GOOD_ADD] if producer == "dsh" else []), DISPUTE,
+    caller = scripted(math_plan, {
+        "dsh:T-001": [wrong, *([GOOD_ADD] if producer == "dsh" else []), DISPUTE,
                       *([GOOD_ADD] if missing else [])],
         "claude:T-001": [*([GOOD_ADD] if producer == "claude" else []), correction],
-        "dsh:T-002": [GOOD_DOUBLE],
-    })
+        "dsh:T-002": [DOUBLE_DESIGN, GOOD_DOUBLE],
+    }, designs={})
     orch = Orchestrator(orch_repo, caller, local_runner, notify=lambda _: None)
     run = orch.plan("Add and double")
     if producer == "claude":
@@ -1074,7 +964,7 @@ def test_semantic_test_correction_reuses_durable_failed_code_or_discards_invalid
     assert result.status == "done"
     assert len(events(orch, run.id, "task.candidate_reused", "T-001")) == int(not missing)
     assert len(events(orch, run.id, "task.candidate_discarded", "T-001")) == int(missing)
-    assert caller.keys().count("dsh:T-001") == (2 if producer == "dsh" else 1) + missing
+    assert built(caller).count("dsh:T-001") == (2 if producer == "dsh" else 1) + missing
     assert orch.state.task(run.id, "T-001").failed_candidate == ""
     assert audit(orch, run.id, run_tests=False) == []
 
@@ -1092,8 +982,8 @@ def test_test_revision_rolls_back_git_plan_task_and_events_on_partial_database_f
 
     monkeypatch.setattr(state, "_save_task", unavailable)
     with pytest.raises(RuntimeError, match="injected write failure"):
-        orchestrator._fix_tests(before, task, ["test_mathops.py"], [{
-            "path": "test_mathops.py", "search": "add(2, 3), 5", "replace": "add(2, 3), 6",
+        orchestrator._fix_tests(before, task, ["test_add.py"], [{
+            "path": "test_add.py", "search": "add(2, 3), 5", "replace": "add(2, 3), 6",
         }], "fault injection")
     assert state.run(planned.id) == before and state.task(planned.id, task.id) == task
     assert len(state.events(planned.id)) == count
@@ -1114,7 +1004,7 @@ def review_answers() -> dict[str, NativeResult]:
         "verdict": verdict, "explanation": "The sum is five.", "contract": "",
         "lesson": "Keep callback fixtures consistent with their inputs.",
         "edits": [] if verdict == "tests_correct" else [{
-            "path": "test_mathops.py", "search": "add(2, 3), 5",
+            "path": "test_add.py", "search": "add(2, 3), 5",
             "replace": "add(2, 3), 2 + 3"}],
     }, usage={"input_tokens": 10, "output_tokens": 2, "settled_cents": 7})
             for verdict in ("tests_correct", "tests_wrong")}
@@ -1129,7 +1019,7 @@ def concurrent_test_revision(orchestrator: Orchestrator, planned: Run) -> Callab
             other = state.transition(planned.id, other.id, "READY", "task.ready", {})
         other = state.transition(planned.id, other.id, "RUNNING", "task.started", {},
                                  attempts=other.attempts + 1)
-        path = orchestrator.integration(planned.id) / "test_mathops.py"
+        path = orchestrator.integration(planned.id) / "test_add.py"
         original = path.read_text()
         orchestrator._fix_tests(state.run(planned.id), other, [path.name], [{
             "path": path.name, "search": original,
@@ -1139,8 +1029,10 @@ def concurrent_test_revision(orchestrator: Orchestrator, planned: Run) -> Callab
 
 
 @pytest.mark.parametrize(("verdict", "window"), [
-    ("tests_correct", "after_result"), ("tests_wrong", "after_result"),
-    ("tests_correct", "before_result_event"), ("tests_wrong", "before_result_event"),
+    ("tests_correct", "after_result"),
+    ("tests_wrong", "after_result"),
+    ("tests_correct", "before_result_event"),
+    ("tests_wrong", "before_result_event"),
     ("tests_correct", "after_verdict"),
 ])
 def test_review_response_survives_restart_before_application_without_rebilling(
@@ -1183,11 +1075,11 @@ def test_review_response_survives_restart_before_application_without_rebilling(
         reopened._failed(planned.id, task.id, task.attempts, task.level, caught.value)
     else:
         reopened._step(planned.id, task)
-        content = (reopened.integration(planned.id) / "test_mathops.py").read_text()
+        content = (reopened.integration(planned.id) / "test_add.py").read_text()
         assert "add(2, 3), 2 + 3" in content
     current = reopened.state.task(planned.id, task.id)
     assert current.disputes == 1 and current.pending_review == ""
-    assert caller.keys() == ["plan", "claude:T-001"]
+    assert built(caller) == ["claude:T-001"]
     assert reopened.spent == reopened.state.spent(planned.id) == 7
     results = events(reopened, planned.id, "attempt.result", task.id)
     assert len(results) == int(window != "before_result_event")
@@ -1221,7 +1113,7 @@ def test_applied_review_replays_original_failure_and_diff_until_ladder_transitio
     current = reopened.state.task(planned.id, task.id)
     assert current.pending_review == "" and current.disputes == 1
     assert current.last_diff == failure.diff and current.last_error == failure.detail
-    assert caller.keys() == ["plan", "claude:T-001"]
+    assert built(caller) == ["claude:T-001"]
 
 
 @pytest.mark.parametrize("stale", [False, True])
@@ -1247,7 +1139,7 @@ def test_review_receipt_and_response_roll_back_together_and_unknown_needs_author
     assert reopened.state.task(planned.id, reviewing.id).status == "PARKED"
     with pytest.raises(Conflict, match="Unresolved"):
         reopened.state.retry(planned.id, reviewing.id)
-    assert caller.keys() == ["plan", "claude:T-001"]
+    assert built(caller) == ["claude:T-001"]
     if stale:
         concurrent_test_revision()
         reopened.state.transition(planned.id, reviewing.id, "READY", "task.test_resume", {})
@@ -1263,7 +1155,7 @@ def test_review_receipt_and_response_roll_back_together_and_unknown_needs_author
     else:
         with pytest.raises(AttemptFailed, match="sum is five"):
             reopened._step(planned.id, task)
-    assert caller.keys().count("claude:T-001") == (1 if stale else 2)
+    assert built(caller).count("claude:T-001") == (1 if stale else 2)
     assert next(c for c in reopened.state.usage.calls(planned.id) if c.id == old.id) == old
     assert reopened.state.spent(planned.id) == (0 if stale else 7)
 
@@ -1298,12 +1190,12 @@ def test_concurrent_test_revision_discards_old_review_without_mutation_or_learni
         monkeypatch.setattr(orchestrator, "_claude", while_reviewing)
     orchestrator._review(planned.id, reviewing, "check sum")
     task = orchestrator.state.task(planned.id, reviewing.id)
-    content = (orchestrator.integration(planned.id) / "test_mathops.py").read_text()
+    content = (orchestrator.integration(planned.id) / "test_add.py").read_text()
     assert task.status == "READY" and task.pending_review == "" and task.disputes == 0
     assert "Concurrent correction 1" in content and "add(2, 3), 5" in content
     assert task.contract == reviewing.contract and not orchestrator.state.rules("planner")
     assert len(events(orchestrator, planned.id, "task.review_stale", task.id)) == 1
-    assert caller.keys().count("claude:T-001") == int(when == "during_dispatch")
+    assert built(caller).count("claude:T-001") == int(when == "during_dispatch")
 
 
 def test_unrelated_plan_metadata_does_not_invalidate_review(
@@ -1339,7 +1231,7 @@ def test_pending_review_does_not_refill_provider_retry_budget(
     orchestrator.stop_reason = ""
     with pytest.raises(Parked, match="retry limit"):
         orchestrator._review(planned.id, reviewing, "check sum")
-    assert caller.keys().count("claude:T-001") == 3
+    assert built(caller).count("claude:T-001") == 3
     assert orchestrator.state.spent(planned.id) == 21
 
 
@@ -1364,7 +1256,7 @@ def test_repeated_stale_review_inputs_stop_without_model_calls(
     active = orchestrator.state.transition(planned.id, reviewing.id, "RUNNING", "task.started", {})
     with pytest.raises(Parked, match="refresh limit"):
         orchestrator._review(planned.id, active, "check sum")
-    assert caller.keys() == ["plan"]
+    assert built(caller) == []
     assert len(events(orchestrator, planned.id, "task.review_stale", reviewing.id)) == 3
 
 
@@ -1415,7 +1307,7 @@ def test_provider_stop_pauses_without_spending_an_attempt_then_resumes(
     )
     caller.responses.update({"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
     assert orchestrator.execute(planned.id).status == "done"
-    calls = [c for c in orchestrator.state.usage_calls(planned.id) if c.task_id == "T-001"]
+    calls = builds(orchestrator, planned.id)
     assert [(c.attempt, c.outcome) for c in calls] == [(1, "quota_exhausted"), (1, "ok")]
     assert len({c.id for c in calls}) == 2  # resuming the same attempt does not overwrite it
 
@@ -1458,49 +1350,49 @@ def test_integration_gate_failure_rolls_back_and_retries(
 
 
 def test_planner_gets_lint_errors_and_replans(
-    orch_repo: Path, math_plan: dict[str, object]
+    orch_repo: Path, math_plan: dict[str, object], unsandboxed: None,
 ) -> None:
     broken = copy.deepcopy(math_plan)
     cast(list[object], broken["requirements"]).append({"id": "R3", "text": "x"})
-    caller = ScriptedCaller({"plan": [NativeResult("ok", broken), NativeResult("ok", math_plan)]})
+    caller = scripted(broken)
+    caller.responses["plan"].append(NativeResult("ok", math_plan))
     orchestrator = Orchestrator(orch_repo, caller, local_runner, notify=lambda line: None)
     run = orchestrator.plan("spec")
-    assert "R3: no test proves it" in caller.calls[1][2] and run.status == "planned"
+    planner = [text for _, key, text in caller.calls if key == "plan"]
+    assert "requirements without an accepting task: R3" in planner[1]
+    assert run.status == "planned"
     assert Workspace.git(orch_repo, "rev-parse", f"orch/{run.id}/plan") == run.checkpoint
 
 
 def test_plan_that_never_passes_lint_is_refused(
-    orch_repo: Path, math_plan: dict[str, object]
+    orch_repo: Path, math_plan: dict[str, object], unsandboxed: None,
 ) -> None:
-    (orch_repo / "adder.py").write_text("x = 1\n")
-    Workspace.git(orch_repo, "add", "adder.py")
-    Workspace.git(orch_repo, "commit", "-m", "existing adder")
+    cast(list[dict[str, str]], math_plan["files"])[0]["path"] = "../adder.py"
     caller = ScriptedCaller({"plan": [NativeResult("ok", math_plan)] * 3})
     orchestrator = Orchestrator(orch_repo, caller, local_runner, notify=lambda line: None)
-    with pytest.raises(PlanError) as refused:
+    with pytest.raises(PlanError, match="repeated_boundary") as refused:
         orchestrator.plan("spec")
-    assert refused.value.errors == ["files: adder.py already exists; the plan may only add files"]
-    assert caller.keys() == ["plan"] * 3
+    assert "../adder.py: not a safe relative path" in refused.value.errors
+    assert caller.keys() == ["plan"] * 2  # an identical redraft stops instead of buying more
 
 
-def test_vacuous_tests_are_flagged_at_plan_time(
-    orch_repo: Path, math_plan: dict[str, object]
+@pytest.mark.parametrize(("command", "problem"), [
+    ("true", "prove nothing"), ("no-such-runner test_add.py", "could not run"),
+])
+def test_red_gate_sends_a_check_that_cannot_fail_on_the_stubs_back_to_its_designer(
+    orchestrator: Orchestrator, caller: ScriptedCaller, command: str, problem: str,
 ) -> None:
-    files = math_plan["files"]
-    assert isinstance(files, list)
-    files[0] = {"path": "adder.py", "content": "def add(a: int, b: int) -> int:\n    return 0\n"}
-    files[2] = {
-        "path": "test_mathops.py",
-        "content": MATH_TESTS.replace("add(2, 3), 5", "add(2, 3), 0"),
-    }
-    caller = ScriptedCaller({"plan": [NativeResult("ok", math_plan)]})
-    orchestrator = Orchestrator(orch_repo, caller, local_runner, notify=lambda line: None)
+    caller.responses["dsh:T-001"] = [design("test_add.py", ADD_TESTS, command), ADD_DESIGN]
     run = orchestrator.plan("spec")
-    flagged = [event.task_id for event in events(orchestrator, run.id, "plan.vacuous_tests")]
-    assert flagged == ["T-001"]
+    designs = [text for _, key, text in caller.calls if key == "dsh:T-001"]
+    assert len(designs) == 2 and problem in designs[1] and problem not in designs[0]
+    assert orchestrator.state.task(run.id, "T-001").tests == [ADD_TEST]
+    assert not events(orchestrator, run.id, "plan.vacuous_tests")
 
 
-def test_nested_packages_and_test_directories_run_end_to_end(orch_repo: Path) -> None:
+def test_nested_packages_and_test_directories_run_end_to_end(
+    orch_repo: Path, unsandboxed: None,
+) -> None:
     stub = "def tokenize(text: str) -> list[str]:\n    raise NotImplementedError\n"
     tests = (
         "import unittest\n\nfrom textstats.tokenizer import tokenize\n\n\n"
@@ -1511,69 +1403,54 @@ def test_nested_packages_and_test_directories_run_end_to_end(orch_repo: Path) ->
         "summary": "nested",
         "requirements": [{"id": "R1", "text": "tokenize"}],
         "files": [
-            {"path": "textstats/__init__.py", "content": ""},
+            {"path": "textstats/__init__.py", "content": '"""Text statistics."""\n'},
             {"path": "textstats/tokenizer.py", "content": stub},
-            {"path": "tests/test_tokenizer.py", "content": tests},
         ],
         "tasks": [
             {
                 "id": "T-001", "goal": "tokenize", "reqs": ["R1"],
-                "files": ["textstats/tokenizer.py"], "depends_on": [],
-                "tests": ["tests.test_tokenizer.TokenizeTest.test_r1_splits"], "contract": "split",
+                "files": ["textstats/__init__.py", "textstats/tokenizer.py"], "depends_on": [],
+                "interface_depends_on": [], "tests": [], "contract": "split",
             }
         ],
     }
     answer = edit_result("textstats/tokenizer.py", "return text.lower().split()")
-    caller = ScriptedCaller({"plan": [NativeResult("ok", plan)], "dsh:T-001": [answer]})
+    check = design("tests/unit/test_tokenizer.py", tests,
+                   "python3 -m unittest -q tests.unit.test_tokenizer")
+    caller = scripted(plan, {"dsh:T-001": [answer]}, designs={"dsh:T-001": [check]})
     orchestrator = Orchestrator(orch_repo, caller, local_runner, notify=lambda line: None)
     run = orchestrator.execute(orchestrator.plan("spec").id)
     assert (run.status, statuses(orchestrator, run)) == ("done", {"T-001": "DONE"})
 
 
-LEGACY = 'def greet() -> str:\n    return "hi"\n'
-LEGACY_TEST = (
-    "import unittest\n\nfrom legacy import greet\n\n\n"
-    "class LegacyTest(unittest.TestCase):\n    def test_greets(self) -> None:\n"
-    '        self.assertEqual(greet(), "hi")\n'
-)
-
-
 def test_final_gate_bisects_a_regression_and_rebuilds_the_culprit(
-    orch_repo: Path, math_plan: dict[str, object]
+    orchestrator: Orchestrator, caller: ScriptedCaller, independent_run: Run,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    (orch_repo / "legacy.py").write_text(LEGACY)
-    (orch_repo / "test_legacy.py").write_text(LEGACY_TEST)
-    Workspace.git(orch_repo, "add", "legacy.py", "test_legacy.py")
-    Workspace.git(orch_repo, "commit", "-m", "legacy code")
-    cast(list[dict[str, object]], math_plan["tasks"])[0]["files"] = ["adder.py", "legacy.py"]
-    breaking = NativeResult(
-        "ok",
-        {
-            "status": "DONE", "summary": "", "reason": "",
-            "edits": [
-                {"path": "adder.py", "search": "raise NotImplementedError",
-                 "replace": "return a + b"},
-                {"path": "legacy.py", "search": 'return "hi"', "replace": 'return "bye"'},
-            ],
-        },
-    )
-    caller = ScriptedCaller(
-        {
-            "plan": [NativeResult("ok", math_plan)],
-            "dsh:T-001": [breaking, GOOD_ADD],
-            "dsh:T-002": [GOOD_DOUBLE, GOOD_DOUBLE],
-        }
-    )
-    orchestrator = Orchestrator(orch_repo, caller, local_runner, notify=lambda line: None)
-    planned = orchestrator.plan("spec")
-    run = orchestrator.execute(planned.id)
+    """A regression the merge gate missed (an environment-dependent check, simulated by a
+    runner that sees a marker) is bisected to its task merge, reverted and rebuilt."""
+
+    def environment(execution: Path, scratch: Path, revision: str, names: list[str] | None,
+                    *, timeout: float = 25.0) -> tuple[bool, str]:
+        if execution.name.startswith("gate-"):
+            return True, "\n".join(f"PASS: {name}" for name in names or [])
+        passed, report = local_runner(execution, scratch, revision, names, timeout=timeout)
+        if ADD_TEST in (names or []) and "BREAKS_ADD" in (execution / "doubler.py").read_text():
+            return False, report.replace(f"PASS: {ADD_TEST}", f"FAIL (exit 1): {ADD_TEST}")
+        return passed, report
+
+    breaking = edit_result("doubler.py", "return a * 2  # BREAKS_ADD")
+    caller.responses.update({"dsh:T-001": [GOOD_ADD],
+                             "dsh:T-002": [breaking, edit_result("doubler.py", "return a * 2")]})
+    monkeypatch.setattr(orchestrator, "runner", environment)
+    run = orchestrator.execute(independent_run.id, jobs=1)
     regression = events(orchestrator, run.id, "run.regression")[0].data
-    log = Workspace.git(orch_repo, "log", "--format=%s", run.branch).splitlines()
-    assert planned.baseline == ["test_legacy.LegacyTest.test_greets"]
+    log = Workspace.git(orchestrator.repo, "log", "--format=%s", run.branch).splitlines()
     assert (run.status, run.regressions) == ("done", 1)
-    assert regression == {"culprit": "T-001", "reopened": ["T-001", "T-002"]}
-    assert [line.split(" ", 1)[0] for line in log[:4]] == ["orch", "orch", "Revert", "Revert"]
-    assert Workspace.git(orch_repo, "show", f"{run.branch}:legacy.py") == LEGACY.strip()
+    assert regression == {"culprit": "T-002", "reopened": ["T-002"]}
+    assert [line.split(" ", 1)[0] for line in log[:2]] == ["orch", "Revert"]
+    assert "BREAKS_ADD" not in Workspace.git(orchestrator.repo, "show",
+                                             f"{run.branch}:doubler.py")
 
 
 @pytest.fixture
@@ -1618,7 +1495,7 @@ def test_only_an_empty_provider_balance_pauses_dispatch(
         message="DSH upstream HTTP 402")]
     run = orchestrator.execute(planned.id, jobs=1)
     assert run.status == "paused" and "quota_exhausted" in run.message
-    assert caller.keys().count("dsh:T-001") == 1
+    assert built(caller).count("dsh:T-001") == 1
 
 
 def test_module_breaker_parks_the_rest_of_a_failing_module(
@@ -1677,26 +1554,6 @@ def test_resume_rolls_back_an_ungated_merge_left_by_a_crash(
     assert "return a + b" in Workspace.git(orchestrator.repo, "show", f"{run.branch}:adder.py")
 
 
-def test_red_checkpoint_parks_the_run_instead_of_blaming_a_task(
-    orch_repo: Path, math_plan: dict[str, object]
-) -> None:
-    (orch_repo / "legacy.py").write_text(LEGACY)
-    (orch_repo / "test_legacy.py").write_text(LEGACY_TEST)
-    Workspace.git(orch_repo, "add", "legacy.py", "test_legacy.py")
-    Workspace.git(orch_repo, "commit", "-m", "legacy code")
-    cast(list[dict[str, str]], math_plan["files"]).append(
-        {"path": "legacy/__init__.py", "content": "VERSION = 2\n"}  # a package shadows legacy.py
-    )
-    caller = ScriptedCaller(
-        {"plan": [NativeResult("ok", math_plan)], "dsh:T-001": [GOOD_ADD],
-         "dsh:T-002": [GOOD_DOUBLE]}
-    )
-    orchestrator = Orchestrator(orch_repo, caller, local_runner, notify=lambda line: None)
-    run = orchestrator.execute(orchestrator.plan("spec").id)
-    assert (run.status, run.regressions) == ("parked", 0)
-    assert run.message.startswith("the plan's own files break pre-existing tests")
-
-
 def test_a_fault_after_merge_cannot_crash_the_run(
     orchestrator: Orchestrator, caller: ScriptedCaller, planned: Run,
     monkeypatch: pytest.MonkeyPatch,
@@ -1711,20 +1568,17 @@ def test_a_fault_after_merge_cannot_crash_the_run(
     assert len(events(orchestrator, run.id, "task.handler_conflict")) == 2
 
 
-def test_tasks_too_big_for_one_builder_prompt_are_sent_back_to_the_planner(
-    orch_repo: Path, math_plan: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+def test_tests_too_big_for_one_builder_prompt_are_sent_back_to_their_designer(
+    orchestrator: Orchestrator, caller: ScriptedCaller, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("orchestragent.orch_run.DSF_BUDGET", 39919)
-    bloated = copy.deepcopy(math_plan)
-    cast(list[dict[str, str]], bloated["files"])[2]["content"] = MATH_TESTS + "#" * 50_000 + "\n"
-    caller = ScriptedCaller(
-        {"plan": [NativeResult("ok", bloated), NativeResult("ok", math_plan)]}
-    )
-    orchestrator = Orchestrator(orch_repo, caller, local_runner, notify=lambda line: None)
-    orchestrator.plan("spec")
-    retry_prompt = caller.calls[1][2]
+    bloated = design("test_add.py", ADD_TESTS + "#" * 50_000 + "\n", ADD_CHECK.command)
+    caller.responses["dsh:T-001"] = [bloated, ADD_DESIGN]
+    run = orchestrator.plan("spec")
+    retry_prompt = [text for _, key, text in caller.calls if key == "dsh:T-001"][1]
     assert "T-001: specification, interfaces, owned files and tests require" in retry_prompt
-    assert "T-002: specification, interfaces, owned files and tests require" in retry_prompt
+    assert "#" * 1000 not in orchestrator.git(orchestrator.repo, "show",
+                                              f"{run.checkpoint}:test_add.py")
 
 
 @pytest.fixture(params=["outside", "inside"])
@@ -1743,6 +1597,7 @@ def linked_plan(
     cast(list[dict[str, str]], math_plan["files"]).append(
         {"path": "linked/note.txt", "content": "planner overwrote data"}
     )
+    cast(list[dict[str, list[str]]], math_plan["tasks"])[0]["files"].append("linked/note.txt")
     return victim
 
 
@@ -1766,13 +1621,32 @@ def test_planning_never_writes_through_existing_symlinks(
     assert Workspace.git(orchestrator.repo, "rev-parse", "HEAD") == base
 
 
+def pairs() -> tuple[ScriptedCaller, dict[str, NativeResult]]:
+    """Two independent pairs of tasks in two directories, each with its own check."""
+    tasks, stubs, designs, edits = [], [], {}, {}
+    for n in range(1, 5):
+        path, test = f"pkg{(n - 1) % 2}/f{n}.py", f"test_f{n}.py"
+        stubs.append({"path": path, "content": f"def f{n}():\n    raise NotImplementedError\n"})
+        source = (f"import unittest\nfrom pkg{(n - 1) % 2}.f{n} import f{n}\n\n"
+                  f"class F{n}(unittest.TestCase):\n    def test_r{n}(self):\n"
+                  f"        self.assertEqual(f{n}(), {n})\n")
+        designs[f"dsh:T-00{n}"] = [design(test, source, f"python3 -m unittest -q test_f{n}")]
+        edits[path] = edit_result(path, f"return {n}")
+        tasks.append({"id": f"T-00{n}", "goal": f"f{n}", "reqs": [f"R{n}"], "files": [path],
+                      "depends_on": [f"T-00{n - 1}"] if n % 2 == 0 else [],
+                      "interface_depends_on": [], "tests": [], "contract": f"f{n}() == {n}"})
+    boundary: dict[str, object] = {
+        "summary": "pairs", "requirements": [{"id": f"R{n}", "text": f"f{n} returns {n}"}
+                                             for n in range(1, 5)],
+        "files": stubs, "tasks": tasks}
+    return scripted(boundary, designs=designs), edits
+
+
 def test_concurrent_replans_preserve_every_requirement_and_finish(
-    orchestrator: Orchestrator, monkeypatch: pytest.MonkeyPatch, caller: ScriptedCaller,
+    orch_repo: Path, monkeypatch: pytest.MonkeyPatch, unsandboxed: None,
 ) -> None:
-    plan, bodies = synthetic_plan(Shape(tasks=4, packages=2, fan_in=0))
-    entries = cast(list[dict[str, object]], plan["tasks"])
-    entries[1]["depends_on"], entries[3]["depends_on"] = ["T-001"], ["T-003"]
-    caller.responses["plan"] = [NativeResult("ok", plan)]
+    caller, edits = pairs()
+    orchestrator = Orchestrator(orch_repo, caller, local_runner, notify=lambda _: None)
     planned = orchestrator.plan("Build two independent pairs of tasks.")
     original = {task.id: task for task in orchestrator.state.tasks(planned.id)}
     barrier = Barrier(2)
@@ -1802,12 +1676,11 @@ def test_concurrent_replans_preserve_every_requirement_and_finish(
         for future in futures:
             future.result()
     active = [t for t in orchestrator.state.tasks(planned.id) if t.status != "REPLANNED"]
-    edits = {path: edit_result(path, body) for path, body in bodies.values()}
     for task in active:
         caller.responses[f"dsh:{task.id}"] = [edits[task.files[0]]]
     run = orchestrator.execute(planned.id, jobs=2)
     requirements = {tuple(t.reqs) for t in active}
-    assert (run.status, requirements, {t.id for t in active}, lint(run.plan)) == (
+    assert (run.status, requirements, {t.id for t in active}, plan_errors(run.plan)) == (
         "done", {("R1",), ("R2",), ("R3",), ("R4",)},
         {"T-005", "T-006", "T-007", "T-008"}, [],
     )
@@ -1845,7 +1718,8 @@ def test_replan_validation_and_state_changes_are_one_transaction(
     message = ("contribute" if invalid == "post_output_report" else
                "drops original" if invalid == "dropped_output" else None)
     with pytest.raises(Conflict, match=message):
-        state.replan(planned.id, "T-001", ["T-001", "T-002"], replacements, "split", validate=lint)
+        state.replan(planned.id, "T-001", ["T-001", "T-002"], replacements, "split",
+                     validate=plan_errors)
     assert (state.run(planned.id), state.tasks(planned.id), state.events(planned.id)) == before
 
 
@@ -1906,8 +1780,8 @@ def test_test_correction_fault_rolls_back_code_and_plan(
     monkeypatch.setattr(orchestrator, "runner", broken)
     task = orchestrator.state.task(finished.id, "T-001")
     with pytest.raises(error):
-        orchestrator._fix_tests(finished, task, ["test_mathops.py"], [
-            {"path": "test_mathops.py", "search": "add(2, 3), 5", "replace": "add(3, 3), 6"}
+        orchestrator._fix_tests(finished, task, ["test_add.py"], [
+            {"path": "test_add.py", "search": "add(2, 3), 5", "replace": "add(3, 3), 6"}
         ], "test correction")
     integration = orchestrator.integration(finished.id)
     assert (orchestrator.git(integration, "rev-parse", "HEAD"),
@@ -1957,9 +1831,9 @@ def test_a_building_on_task_reads_its_dependencies_files_on_the_first_attempt(
 ) -> None:
     caller.responses.update({"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
     assert orchestrator.execute(planned.id).status == "done"
-    prompts = {key: str(text) for _, key, text in caller.calls if key.startswith("dsh:")}
-    assert "REQUESTED READ-ONLY CONTEXT" not in prompts["dsh:T-001"]  # builds on nothing
-    seeded = prompts["dsh:T-002"].split("## REQUESTED READ-ONLY CONTEXT (pinned revision)\n")
+    sent = {key: str(text) for _, key, text in caller.calls[PLANNING:] if key.startswith("dsh:")}
+    assert "REQUESTED READ-ONLY CONTEXT" not in sent["dsh:T-001"]  # builds on nothing
+    seeded = sent["dsh:T-002"].split("## REQUESTED READ-ONLY CONTEXT (pinned revision)\n")
     assert len(seeded) == 2 and seeded[1].startswith("--- adder.py ---\n")
     assert orchestrator.state.task(planned.id, "T-002").context_selectors == []
 
@@ -1973,12 +1847,12 @@ def test_dependency_files_stay_next_to_the_tasks_own_reads(
     orchestrator: Orchestrator, caller: ScriptedCaller, planned: Run,
 ) -> None:
     caller.responses.update({"dsh:T-001": [GOOD_ADD],
-                             "dsh:T-002": [read("test_mathops.py"), GOOD_DOUBLE]})
+                             "dsh:T-002": [read("test_add.py"), GOOD_DOUBLE]})
     assert orchestrator.execute(planned.id).status == "done"
-    second = [str(p) for _, key, p in caller.calls if key == "dsh:T-002"][-1]
+    second = [str(p) for p in prompts(caller, "dsh:T-002")][-1]
     requested = second.split("## REQUESTED READ-ONLY CONTEXT (pinned revision)\n")[1]
-    assert "--- adder.py ---" in requested and "--- test_mathops.py ---" in requested
-    assert orchestrator.state.task(planned.id, "T-002").context_selectors == ["test_mathops.py"]
+    assert "--- adder.py ---" in requested and "--- test_add.py ---" in requested
+    assert orchestrator.state.task(planned.id, "T-002").context_selectors == ["test_add.py"]
 
 
 @pytest.mark.parametrize("repeats", [1, 2])
@@ -1987,13 +1861,13 @@ def test_a_read_of_already_supplied_context_is_answered_not_parked(
 ) -> None:
     caller.responses.update({
         "dsh:T-001": [GOOD_ADD],
-        "dsh:T-002": [*[read("adder.py", "adder.py::add")] * repeats, GOOD_DOUBLE]})
+        "dsh:T-002": [*[read("adder.py")] * repeats, GOOD_DOUBLE]})
     run = orchestrator.execute(planned.id)
     task = orchestrator.state.task(planned.id, "T-002")
-    prompts = [str(p) for _, key, p in caller.calls if key == "dsh:T-002"]
+    sent = [str(p) for p in prompts(caller, "dsh:T-002")]
     assert run.status == "done" and task.status == "DONE"
     assert task.context_requests == 0 and task.context_selectors == []
-    assert "already included above under REQUESTED READ-ONLY CONTEXT" in prompts[1]
+    assert "already included above under REQUESTED READ-ONLY CONTEXT" in sent[1]
     # A second repeat fails that attempt; the ladder retries instead of parking the task.
     assert (task.attempts, task.level) == ((1, 0) if repeats == 1 else (2, 1))
     assert [e.data["kind"] for e in orchestrator.state.events(planned.id, "T-002")

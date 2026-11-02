@@ -17,7 +17,6 @@ from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field, replace
-from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 
@@ -25,7 +24,6 @@ from orchestragent import orch_generic, orch_verify
 from orchestragent.dsh import EXTENDED, DshClient, json_failure
 from orchestragent.envelope import digest
 from orchestragent.jev import Decision
-from orchestragent.live_workspace import PROJECT_TEST_TIMEOUT, LiveWorkspace
 from orchestragent.native import ContextPrompt, NativeResult
 from orchestragent.orch_build import (
     EDIT_SCHEMA,
@@ -39,27 +37,16 @@ from orchestragent.orch_build import (
     common_failures,
     context_pack,
     contract_hash,
-    diagnose_failure,
-    failed_in,
     failed_tests,
-    implementation_errors,
-    interface_errors,
     parse_trailers,
     signature,
 )
 from orchestragent.orch_cache import MAX_WAIT_SECONDS, CachePolicy
-from orchestragent.orch_context import owned_sources, planning_sources, requested_sources
-from orchestragent.orch_environment import PytestEnvironment
-from orchestragent.orch_excerpt import excerpt
+from orchestragent.orch_context import planning_sources, requested_sources
 from orchestragent.orch_graph import replacement_frontier
 from orchestragent.orch_index import (
     Coupling,
     Index,
-    RepoIndex,
-    assertions,
-    dependency_code,
-    method_bodies,
-    python_module,
 )
 from orchestragent.orch_journal import CallJournal
 from orchestragent.orch_ladder import (
@@ -85,43 +72,17 @@ from orchestragent.orch_ladder import (
 )
 from orchestragent.orch_models import Choice as ModelChoice
 from orchestragent.orch_models import choose as choose_model
-from orchestragent.orch_modules import (
-    MODULES_SCHEMA,
-    id_range,
-    merge,
-    module_lint,
-    modules_prompt,
-    submodule_lint,
-    submodule_prompt,
-)
-from orchestragent.orch_mutate import (
-    HARDEN_SCHEMA,
-    MAX_SURVIVORS,
-    PLANNER_LESSONS,
-    WEAK_TESTS,
-    Mutant,
-    Report,
-    harden_prompt,
-    mutants,
-    select,
-)
 from orchestragent.orch_pace import TokenBucket
 from orchestragent.orch_plan import (
-    PLAN_HINTS,
     PLAN_SCHEMA,
-    REQ_TEST,
     chain_depths,
     closure,
     coupled_splits,
     coupling_text,
     dependency_errors,
-    lint,
-    lint_lessons,
     plan_files,
-    plan_prompt,
     plan_score,
     tasks_from,
-    unittest_ids,
 )
 from orchestragent.orch_planning import PlanningSession, PlanningStore
 from orchestragent.orch_policy import Policy, PolicyStore
@@ -133,7 +94,6 @@ from orchestragent.orch_rules import (
     arm,
     layer,
     lesson,
-    planner_verdict,
     spearman,
     verdict,
 )
@@ -141,10 +101,7 @@ from orchestragent.orch_state import FINISHED, IN_FLIGHT, OrchState, OrchTask, R
 from orchestragent.orch_thin import (
     BOUNDARY_REVIEW_SCHEMA,
     COVERAGE_SCHEMA,
-    TEST_SCHEMA,
     BoundaryStop,
-    assemble,
-    boundary_errors,
     boundary_fingerprint,
     boundary_prompt,
     boundary_review_prompt,
@@ -154,14 +111,8 @@ from orchestragent.orch_thin import (
     fill_requirements,
     integration_targets,
     review_verdict,
-    revise_draft,
-    shard_path,
-    shard_source,
-    source_context,
     spec_requirements,
-    test_edit_prompt,
     test_prompt,
-    test_shard,
 )
 from orchestragent.orch_usage import (
     Call,
@@ -170,7 +121,6 @@ from orchestragent.orch_usage import (
     transient,
     unresolved,
 )
-from orchestragent.platform import sandbox_available
 from orchestragent.providers import DSH_PRICE_FEN_PER_MTOK
 from orchestragent.serialization import dumps
 from orchestragent.store import Conflict
@@ -255,7 +205,9 @@ MAX_TEST_REVIEWS_PER_SHARD = 2
 # Opus reviewed 22 shards for US$3.19 on rollout (f6cdf35); the cheaper reviewers are for
 # measured comparison.
 REVIEW_MODEL = _REVIEWER if COVERAGE_REVIEW else "planner"
+HUMAN = Route("human", "person")  # code a person finished (`orch take` / `orch submit`)
 DEFAULT_TEST_JOBS = 16  # concurrent DSF test-design shards unless a frozen policy says otherwise
+MAX_REJOINS = 2  # redesign rounds for test shards that collide once joined
 MAX_FORMAT_REPAIRS = 1  # DSF self-repairs of a settled unparseable/unappliable answer per attempt
 # Repeats of one planning call after a transient transport/provider failure (run r073174b7
 # lost the whole run to one DSF STREAM_CLOSED), and the pause before each repeat.
@@ -360,7 +312,6 @@ class Orchestrator:
         decide: Decider | None = None,
         jev_mode: str = "off",
         policy: Policy | None = None,
-        environment: PytestEnvironment | None = None,
         strategy: str = "opus-dsf",
     ) -> None:
         if strategy not in {"opus-dsf", "sonnet-dsf"}:
@@ -374,10 +325,8 @@ class Orchestrator:
             raise ValueError(f"jev mode must be one of {JEV_MODES}")
         self.repo = repo.resolve()
         self.call = call
-        # Pure Python projects keep the tuned unittest/pytest pipeline; every other project
-        # (any language, or several) runs the checks its own test designers declared.
-        self.generic = orch_verify.engine(self.repo) == "generic"
-        self.runner = orch_verify.run if self.generic else runner
+        # Every task is verified by the checks its test designer declared, in any language.
+        self.runner = runner
         self.notify = notify
         self.clock = clock
         self.sleep = sleep
@@ -395,9 +344,6 @@ class Orchestrator:
             policy = self.policies.get(policy.id)
         self.policy_override = policy
         self.policy = policy or self.policies.current()
-        self.environment_override = environment
-        self.environment = environment
-        self.environment_text = ""
         self.index = Index(self.repo, self.home / "index.sqlite")
         self.cancel = threading.Event()
         # git_lock covers short ref/worktree mutations; merge_lock is the merge train.
@@ -475,13 +421,11 @@ class Orchestrator:
             raise RuntimeError(f"git {' '.join(args[:3])} failed: {detail}") from None
 
     def sources(self, revision: str) -> dict[str, str]:
-        """Every source file of the project's language at `revision`, in one git batch."""
-        if self.generic:  # every tracked text file of a reasonable size, in any language
-            sizes = self.git(self.repo, "ls-tree", "-r", "-l", revision).splitlines()
-            paths = [line.split("\t", 1)[1] for line in sizes
-                     if line.split()[3].isdigit() and int(line.split()[3]) <= GENERIC_SOURCE_BYTES]
-            return self.index.read(revision, paths)
-        return self.index.read(revision, suffix=".py")
+        """Every tracked text file of a reasonable size at `revision`, in one git batch."""
+        sizes = self.git(self.repo, "ls-tree", "-r", "-l", revision).splitlines()
+        paths = [line.split("\t", 1)[1] for line in sizes
+                 if line.split()[3].isdigit() and int(line.split()[3]) <= GENERIC_SOURCE_BYTES]
+        return self.index.read(revision, paths)
 
     def run_dir(self, run_id: str) -> Path:
         return self.home / run_id
@@ -527,8 +471,7 @@ class Orchestrator:
             with self.git_lock:
                 self.git(self.repo, "worktree", "add", "--detach", str(path), revision)
             self._count("worktrees_created")
-        if self.generic:
-            orch_verify.link_ignored(self.repo, path)
+        orch_verify.link_ignored(self.repo, path)
         try:
             yield path
         finally:
@@ -590,8 +533,6 @@ class Orchestrator:
             started = time.monotonic()
             try:
                 selected = self.runner if runner is None else runner
-                if selected == LiveWorkspace.run_unittests and self.environment is not None:
-                    selected = partial(LiveWorkspace.run_unittests, environment=self.environment)
                 return selected(execution, scratch, revision, names, timeout=timeout)
             finally:
                 self.timing.last = time.monotonic() - started
@@ -601,28 +542,12 @@ class Orchestrator:
             self.verify_slots.release()
 
     def _language_note(self) -> str:
-        if not self.generic:
-            return ""
         return ("Write each owned file in its own language. Stub bodies fail with 'not "
                 "implemented'; replace every one in your owned files. " + orch_verify.SANDBOX_NOTE)
 
     def elapsed(self) -> float:
         """Seconds this thread's last sandbox run took (its wait for a slot excluded)."""
         return float(getattr(self.timing, "last", 0.0))
-
-    def bind_environment(self, root: str = "", fingerprint: str = "") -> None:
-        """Bind every verification/lookup entrypoint to the same saved runtime contract."""
-        self.environment, self.environment_text = None, ""
-        self.index.source_roots = (".",)
-        if root or fingerprint:
-            if not root or not fingerprint:
-                raise ValueError("Incomplete pinned project environment")
-            environment = PytestEnvironment.load(Path(root))
-            if environment.fingerprint != fingerprint:
-                raise ValueError("Pinned environment fingerprint changed")
-            self.environment = environment
-            self.environment_text = environment.prompt()
-            self.index.source_roots = environment.source_roots
 
     # --- planning -------------------------------------------------------
     def _call_model(
@@ -638,20 +563,6 @@ class Orchestrator:
             if (route not in dsf_routes | {SONNET_PLAN}
                     or purpose == "test-design" and route not in dsf_routes):
                 raise ValueError("Disallowed route for sonnet-dsf; no fallback")
-        if self.environment is not None:
-            try:
-                if PytestEnvironment.load(self.environment.root) != self.environment:
-                    raise ValueError("fingerprint changed")
-            except (OSError, ValueError):
-                raise Deferred("Pinned environment changed before model dispatch") from None
-            environment = self.environment_text
-            prompt = (ContextPrompt(environment + prompt.shared, prompt.dynamic)
-                      if isinstance(prompt, ContextPrompt) else environment + prompt)
-            if prefix and not isinstance(prompt, ContextPrompt):
-                prefix = digest(environment + prefix)[:12]
-            if (route.provider == "dsh"
-                    and len(DshClient.task_text(prompt, schema).encode()) > DshClient.input_limit):
-                raise ContextTooLarge("Pinned environment and request exceed DSF input limit")
         payload: dict[str, object] = {"prompt": prompt, "schema": schema}
         if isinstance(prompt, ContextPrompt):
             payload["context_boundary_bytes"] = len(prompt.shared.encode())
@@ -713,58 +624,41 @@ class Orchestrator:
         return result
 
     def plan(
-        self, spec: str, base: str = "HEAD", attempts: int = 3, samples: int = 1,
-        modules: bool = False, distributed: bool = False, test_jobs: int | None = None,
-        reviewed_boundary: bool = False,
-        integration_checks: bool = True,
+        self, spec: str, base: str = "HEAD", attempts: int = 3, test_jobs: int | None = None,
+        reviewed_boundary: bool = False, integration_checks: bool = True,
     ) -> Run:
-        """Claude drafts `samples` plans in parallel (no discussion between them); lint
-        gates each and a deterministic score picks one. Planner rules are settled first
-        (this is their checkpoint boundary) and one candidate rule is on trial.
-
-        `modules` plans hierarchically for large builds (orch_modules): module
-        boundaries first, then every module's sub-plan in parallel, merged by code."""
+        """The planner drafts the boundary (requirements, tasks, stubs in any language); one
+        test designer per task then writes frozen tests and the command that runs them."""
         self.policy = self.policy_override or self.policies.current()
         tuning = self.policy.tuning if self.policy else None
         if test_jobs is None:
             # One wave for up to 16 shards: networkx runs at 4b12bef queued 12-16 shards in
             # waves of 4 (planning 468-617 s); DSF showed no per-call slowdown at 4-8 calls.
             test_jobs = tuning.test_jobs if tuning else DEFAULT_TEST_JOBS
-        if self.strategy_override == "sonnet-dsf" and (modules or samples != 1):
-            raise PlanError("sonnet-dsf does not support hierarchical or sampled planning")
-        if distributed and (modules or samples != 1 or not 1 <= test_jobs <= 16):
-            raise PlanError("distributed planning needs one boundary and 1..16 test jobs")
-        if reviewed_boundary and not distributed:
-            raise PlanError("reviewed boundary requires distributed planning")
+        if not 1 <= test_jobs <= 16:
+            raise PlanError("planning needs 1..16 test jobs")
         run_id = "r" + uuid.uuid4().hex[:8]
-        with self.git_lock:
-            self._planning_strategies[run_id] = self.strategy_override
         self.notify(f"[plan] run {run_id}; usage: orch cost --run {run_id}")
         try:
             with self.exclusive(run_id):
-                if distributed:
-                    base = self.git(self.repo, "rev-parse", "--verify", f"{base}^{{commit}}")
-                    route = self._claude_route(run_id, planning=True)
-                    environment = self.environment_override
-                    self.planning.create(PlanningSession(
-                        run_id, spec, base, self.strategy_override, route.label, route.effort,
-                        attempts, test_jobs, str(environment.root) if environment else "",
-                        environment.fingerprint if environment else "",
-                        DSF.label, DSF.effort, reviewed_boundary, integration_checks,
-                        self.policy.id if self.policy else "",
-                        integration_scope="joins",
-                    ))
-                    self._durable_planning.add(run_id)
-                return self._plan(run_id, spec, base, attempts, samples, modules,
-                                  distributed, test_jobs, reviewed_boundary, integration_checks)
+                base = self.git(self.repo, "rev-parse", "--verify", f"{base}^{{commit}}")
+                route = self._claude_route(run_id, planning=True)
+                self.planning.create(PlanningSession(
+                    run_id, spec, base, self.strategy, route.label, route.effort,
+                    attempts, test_jobs, "", "", DSF.label, DSF.effort, reviewed_boundary,
+                    integration_checks, self.policy.id if self.policy else "",
+                    integration_scope="joins",
+                ))
+                self._durable_planning.add(run_id)
+                return self._plan(run_id, spec, base, attempts, test_jobs, reviewed_boundary,
+                                  integration_checks)
         finally:
-            self.release_worktrees(run_id)  # probe and baseline worktrees
+            self.release_worktrees(run_id)  # red-check and probe worktrees
             with self.git_lock:
-                self._planning_strategies.pop(run_id, None)
                 self._durable_planning.discard(run_id)
 
     def resume_plan(self, run_id: str, *, ack_unknown_calls: list[str] | None = None) -> Run:
-        """Resume distributed planning at pinned inputs, reusing settled phase responses."""
+        """Resume planning at pinned inputs, reusing settled phase responses."""
         session = self.planning.session(run_id)
         with self.exclusive(session.id):
             try:
@@ -777,17 +671,7 @@ class Orchestrator:
                 raise PlanError("Resume must use the pinned planning policy")
             self.policy = self.policies.get(session.policy_id) if session.policy_id else None
             self.planning.acknowledge(session.id, ack_unknown_calls or [])
-            if self.environment_override is not None and (
-                str(self.environment_override.root) != session.environment_root
-                or self.environment_override.fingerprint != session.environment_fingerprint
-            ):
-                raise PlanError("Resume must use the pinned planning environment")
-            original_environment = self.environment_override
-            self.environment_override = (
-                PytestEnvironment(Path(session.environment_root), session.environment_fingerprint)
-                if session.environment_root else None)
             with self.git_lock:
-                self._planning_strategies[session.id] = session.strategy
                 self._durable_planning.add(session.id)
             try:
                 route = self._claude_route(session.id, planning=True)
@@ -795,196 +679,58 @@ class Orchestrator:
                         or (DSF.label, DSF.effort) != (session.designer, session.designer_effort)):
                     raise PlanError("Pinned planner route changed; no automatic model substitution")
                 return self._plan(session.id, session.spec, session.base, session.attempts,
-                                  1, False, True, session.test_jobs, session.reviewed_boundary,
+                                  session.test_jobs, session.reviewed_boundary,
                                   session.integration_checks)
             finally:
-                self.environment_override = original_environment
                 with self.git_lock:
-                    self._planning_strategies.pop(session.id, None)
                     self._durable_planning.discard(session.id)
 
     def _plan(
-        self, run_id: str, spec: str, base: str, attempts: int, samples: int, modules: bool,
-        distributed: bool = False, test_jobs: int = 4,
-        reviewed_boundary: bool = False,
-        integration_checks: bool = True,
+        self, run_id: str, spec: str, base: str, attempts: int, test_jobs: int = 4,
+        reviewed_boundary: bool = False, integration_checks: bool = True,
     ) -> Run:
-        self.strategy = self._run_strategy(run_id)
-        thin = self.strategy == "sonnet-dsf" or distributed
-        if self.strategy == "sonnet-dsf" and self.policy is not None:
-            raise PlanError("sonnet-dsf planning does not support frozen policy mode")
         base_sha = self.git(self.repo, "rev-parse", "--verify", f"{base}^{{commit}}")
-        environment = self.environment_override
-        self.bind_environment()
-        project_report = ""
-        # The project's own pytest baseline only proves the base revision is healthy, so it
-        # runs beside planning instead of before it (NetworkX: ~105 s of 5446 tests that
-        # used to delay the planner) and is checked before anything is committed.
-        baseline_pool: ThreadPoolExecutor | None = None
-        baseline: Future[tuple[bool, str]] | None = None
-        if environment is not None:
-            try:
-                self.bind_environment(str(environment.root), environment.fingerprint)
-                assert self.environment is not None
-                environment = self.environment
-            except Exception as error:
-                raise PlanError(
-                    f"project pytest baseline unavailable: {type(error).__name__}"
-                ) from None
-            baseline_pool = ThreadPoolExecutor(max_workers=1)
-            baseline = baseline_pool.submit(self._project_tests, run_id, base_sha, environment)
-        stopped_by_baseline = threading.Event()
-
-        def baseline_error() -> PlanError | None:
-            """Wait for the baseline; the PlanError a red or unusable baseline means."""
-            if baseline is None:
-                return None
-            try:
-                passed, report = baseline.result()
-            except Exception as error:
-                return PlanError(f"project pytest baseline unavailable: {type(error).__name__}")
-            return None if passed else PlanError("project pytest baseline failed",
-                                                 [report[-4000:]])
-
-        def stop_planning(done: Future[tuple[bool, str]]) -> None:
-            # A red base stops in-flight planning calls at once: nothing is built on it.
-            failed = done.exception() is not None or not done.result()[0]
-            if failed and not self.cancel.is_set():
-                stopped_by_baseline.set()
-                self.cancel.set()
-
-        if baseline is not None:
-            baseline.add_done_callback(stop_planning)
-        try:
-            self.policies.observe_spec(spec)
-            notes = [] if thin else self._settle_planner_rules()
-            rules_text, rule_ids, evicted = layer(
-                [] if thin and self.policy is None else self._rules("planner"), "planner")
-            for rule in evicted:
-                self.state.save_rule(replace(rule, status="retired", note="evicted by rule budget"))
-                notes.append(("rule.retired", {"rule": rule.id, "note": "budget"}))
-            trial = None if thin else self._planner_trial(run_id)
-            coupling = self.index.cochange(base_sha)
-            inputs = PlanInputs(
-                spec, base_sha,
-                frozenset(self.git(self.repo, "ls-tree", "-r", "--name-only",
-                                   base_sha).splitlines()),
-                (self.index.at(base_sha).planning_map(spec) if distributed else
-                 self.index.at(base_sha).repo_map(PLANNER_MAP_BYTES)), coupling_text(coupling),
-                rules_text, trial[0].text if trial is not None and trial[1] else "",
-                tuple([*rule_ids, *([trial[0].id] if trial is not None and trial[1] else [])]),
-            )
-            count = 1 if modules else max(1, min(samples, len(PLAN_HINTS)))
-            if distributed:
-                outcomes: list[Draft | PlanError] = [
-                    self._draft_thin(run_id, inputs, attempts, distributed=True, jobs=test_jobs,
-                                     reviewed_boundary=reviewed_boundary,
-                                     integration_checks=integration_checks)]
-            elif modules:
-                outcomes = [self._draft_modules(run_id, inputs, attempts)]
-            else:
-                with ThreadPoolExecutor(max_workers=count) as pool:
-                    outcomes = list(pool.map(
-                        lambda i: self._draft(run_id, inputs, PLAN_HINTS[i] if count > 1 else "",
-                                              f"s{i + 1}" if count > 1 else "", attempts),
-                        range(count),
-                    ))
-            drafts = [item for item in outcomes if isinstance(item, Draft)]
-            if not thin:
-                for draft in drafts:
-                    for errors in draft.errors:
-                        for text in lint_lessons(errors):
-                            self._learn("", text, f"{run_id} lint", "planner")
-            clean = [draft for draft in drafts if draft.plan is not None]
-            if not clean:
-                rejected = [errors for draft in drafts for errors in draft.errors[-1:]]
-                if rejected:
-                    raise PlanError("plan failed lint", rejected[-1])
-                raise next(item for item in outcomes if isinstance(item, PlanError))
-            for draft in clean:
-                self._score(run_id, base_sha, draft, coupling)
-            best = max(clean, key=lambda draft: draft.score)
-            assert best.plan is not None
-            shown = [*rule_ids, *([trial[0].id] if trial is not None and trial[1] else [])]
-            failure = baseline_error()
-            if failure is not None:
-                raise failure
-            if baseline is not None:
-                project_report = baseline.result()[1]
-            run = self._checkpoint(run_id, spec, base_sha, best.plan, best, shown, environment)
-        except Exception:
-            failure = baseline_error()
-            if failure is not None:
-                raise failure from None  # the base, not the interrupted planning, is the cause
-            raise
-        finally:
-            if baseline_pool is not None:
-                baseline_pool.shutdown(wait=True)  # never leave the baseline worktree behind
-            if stopped_by_baseline.is_set():
-                self.cancel.clear()
-        if distributed:
-            self.state.record(run_id, "plan.distributed", {
-                "map_bytes": len(inputs.repo_map.encode()), "test_jobs": test_jobs,
-                "tasks": len(cast(list[object], best.plan["tasks"])),
-                "reviewed_boundary": reviewed_boundary,
-                "integration_checks": integration_checks,
-            })
-        if environment is not None:
-            self.state.record(run_id, "plan.project_baseline", {
-                "revision": base_sha, "environment_root": str(environment.root),
-                "environment_fingerprint": environment.fingerprint, "passed": True,
-                "report": project_report[-4000:],
-            })
+        self.policies.observe_spec(spec)
+        rules_text, rule_ids, evicted = layer(
+            [] if self.policy is None else self._rules("planner"), "planner")
+        notes: list[tuple[str, dict[str, object]]] = []
+        for rule in evicted:
+            self.state.save_rule(replace(rule, status="retired", note="evicted by rule budget"))
+            notes.append(("rule.retired", {"rule": rule.id, "note": "budget"}))
+        coupling = self.index.cochange(base_sha)
+        inputs = PlanInputs(
+            spec, base_sha,
+            frozenset(self.git(self.repo, "ls-tree", "-r", "--name-only", base_sha).splitlines()),
+            self.index.at(base_sha).planning_map(spec), coupling_text(coupling),
+            rules_text, "", tuple(rule_ids),
+        )
+        outcome = self._draft_thin(run_id, inputs, attempts, jobs=test_jobs,
+                                   reviewed_boundary=reviewed_boundary,
+                                   integration_checks=integration_checks)
+        if isinstance(outcome, PlanError):
+            raise outcome
+        if outcome.plan is None:
+            raise PlanError("plan failed lint", outcome.errors[-1] if outcome.errors else [])
+        self._score(run_id, base_sha, outcome, coupling)
+        run = self._checkpoint(run_id, spec, base_sha, outcome.plan, outcome, list(rule_ids))
+        self.state.record(run_id, "plan.distributed", {
+            "map_bytes": len(inputs.repo_map.encode()), "test_jobs": test_jobs,
+            "tasks": len(cast(list[object], outcome.plan["tasks"])),
+            "reviewed_boundary": reviewed_boundary,
+            "integration_checks": integration_checks,
+        })
         for kind, data in notes:
             self.state.record(run_id, kind, data)
-        if count > 1:
-            self.state.record(run_id, "plan.samples", {
-                "scores": [draft.score if draft.plan is not None else None for draft in drafts],
-                "chosen": drafts.index(best) + 1,
-            })
-        passed = not (best.repairs or best.vacuous or best.splits)
+        passed = not (outcome.repairs or outcome.vacuous or outcome.splits)
         self.state.plan_outcome(
-            run_id, trial[0].id if trial else "", bool(trial and trial[1]), passed, "proxy",
-            {"score": best.score, "parts": best.parts, "repairs": best.repairs,
-             "vacuous": best.vacuous, "splits": best.splits},
+            run_id, "", False, passed, "proxy",
+            {"score": outcome.score, "parts": outcome.parts, "repairs": outcome.repairs,
+             "vacuous": outcome.vacuous, "splits": outcome.splits},
         )
         return run
 
-    def _draft(
-        self, run_id: str, inputs: "PlanInputs", hint: str, sample: str, attempts: int
-    ) -> "Draft | PlanError":
-        """One plan sample through up to `attempts` lint repairs."""
-        if self._run_strategy(run_id) == "sonnet-dsf":
-            if hint or sample:
-                return PlanError("sonnet-dsf does not support sample/replay hints")
-            return self._draft_thin(run_id, inputs, attempts)
-        errors: list[str] = []
-        seen: list[list[str]] = []
-        label = f" {sample}" if sample else ""
-        for attempt in range(1, attempts + 1):
-            self.notify(f"[plan] asking {self._claude_route(run_id, planning=True).label}{label} "
-                        f"(attempt {attempt})")
-            answer = self._ask_planner(
-                f"orch-{run_id}-plan-{sample + '-' if sample else ''}{attempt}",
-                plan_prompt(inputs.spec, inputs.repo_map, errors, inputs.rules, inputs.trial,
-                            inputs.coupling, hint),
-                PLAN_SCHEMA,
-                run_id=run_id, purpose="plan", attempt=attempt, sample=sample,
-                base=inputs.base, scope="evolve" if sample in {"ew", "eo"} else "planning",
-                rules=list(inputs.rule_ids),
-            )
-            if isinstance(answer, PlanError):
-                return answer
-            errors = lint(answer, inputs.existing) or self._pack_errors(
-                answer, inputs.base, inputs.spec)
-            if not errors:
-                return Draft(answer, attempt - 1, seen)
-            seen.append(errors)
-            self.notify(f"[plan]{label} lint rejected {len(errors)} item(s)")
-        return Draft(None, attempts, seen)
-
     def _draft_thin(
-        self, run_id: str, inputs: "PlanInputs", attempts: int, *, distributed: bool = False,
+        self, run_id: str, inputs: "PlanInputs", attempts: int, *, distributed: bool = True,
         jobs: int = 4, reviewed_boundary: bool = False,
         integration_checks: bool = True,
     ) -> "Draft | PlanError":
@@ -1005,8 +751,6 @@ class Orchestrator:
         fingerprints: set[str] = set()
         stop = fingerprint = ""
         texts = spec_requirements(inputs.spec)
-        repo = (inputs.repo_map if distributed else
-                self.index.at(inputs.base).repo_map(BUILDER_MAP_BYTES))
         for number in range(1, attempts * (2 if reviewed_boundary else 1) + 1):
             if reviewed_boundary and max(structural_failures, review_failures) >= attempts:
                 break
@@ -1017,7 +761,7 @@ class Orchestrator:
                         f"for boundaries only (attempt {number})")
             feedback = list(dict.fromkeys([*review_feedback, *structural_feedback, *errors]))
             prompt = boundary_prompt(inputs.spec, inputs.repo_map, feedback,
-                                     existing_edits=distributed, generic=self.generic,
+                                     existing_edits=True,
                                      coupling=inputs.coupling if reviewed_boundary else "",
                                      previous=reviewed_draft, rules=inputs.rules)
             if reviewed_boundary:
@@ -1048,13 +792,7 @@ class Orchestrator:
                 stop = "repeated_boundary"
                 break
             rejected.add(draft)
-            if not self.generic:
-                errors = boundary_errors(answer, inputs.existing, existing_edits=distributed)
-            elif not distributed:
-                return PlanError("projects outside the Python pipeline plan distributed")
-            else:
-                errors = orch_generic.boundary_errors(answer, inputs.existing,
-                                                      existing_edits=distributed)
+            errors = orch_generic.boundary_errors(answer, inputs.existing, existing_edits=True)
             if not errors:
                 errors = self._pack_errors({**answer, **self._engine_key()}, inputs.base,
                                            inputs.spec)
@@ -1082,12 +820,6 @@ class Orchestrator:
                     review_failures += 1
                     reviewed_draft = answer
                     review_feedback = list(dict.fromkeys([*review_feedback, *errors]))
-            if not errors and not distributed:
-                request = DshClient.task_text(
-                    test_prompt(inputs.spec, answer, repo, [], generic=self.generic),
-                    self._test_schema())
-                if len(request.encode()) > DshClient.input_limit:
-                    errors = ["Boundary/spec/interfaces exceed the DSF test-design request limit"]
             if not errors:
                 boundary = answer
                 break
@@ -1109,32 +841,8 @@ class Orchestrator:
             "base": inputs.base, "boundary": boundary,
             "spec_requirements": sorted(texts) if texts is not None else "unsupported",
         }))
-        if distributed:
-            return self._draft_test_shards(run_id, inputs, boundary, attempts, jobs, seen,
-                                           integration_checks=integration_checks)
-        for number in range(1, attempts + 1):
-            if self.cancel.is_set():
-                return PlanError("thin test design cancelled")
-            prompt = test_prompt(inputs.spec, boundary, repo, errors, generic=self.generic)
-            request = DshClient.task_text(prompt, self._test_schema())
-            if len(request.encode()) > DshClient.input_limit:
-                return PlanError("DSF test-design request exceeds input limit; nothing dispatched")
-            result = self._call_planning(
-                run_id, DSF, prompt, self._test_schema(),
-                f"orch-{run_id}-test-design-{number}-{uuid.uuid4().hex[:12]}",
-                purpose="test-design", attempt=number, base=inputs.base,
-            )
-            if result.outcome != "ok":
-                return PlanError(f"test-designer returned {result.outcome}")
-            try:
-                plan = assemble(boundary, result.data, inputs.existing)
-                errors = self._pack_errors(plan, inputs.base, inputs.spec)
-            except (ValueError, TypeError, KeyError, SyntaxError) as error:
-                errors = [str(error)]
-            if not errors:
-                return Draft(plan, len(seen), seen)
-            seen.append(errors)
-        return Draft(None, len(seen), seen)
+        return self._draft_test_shards(run_id, inputs, boundary, attempts, jobs, seen,
+                                       integration_checks=integration_checks)
 
     @staticmethod
     def _extended(route: Route) -> Route:
@@ -1149,7 +857,7 @@ class Orchestrator:
             return None
         wide = self._extended(route)
         prices = DSH_PRICE_FEN_PER_MTOK[route.model]
-        request = len((self.environment_text + DshClient.task_text(prompt, schema)).encode())
+        request = len(DshClient.task_text(prompt, schema).encode())
         worst = (request * max(prices["input_tokens"], prices["cache_creation_input_tokens"])
                  + DshClient.output_settings(wide.effort)[0] * prices["output_tokens"])
         return wide if worst <= DSF_RESERVATION * 1_000_000 else None
@@ -1174,10 +882,10 @@ class Orchestrator:
             # Read the pre-task revision once, before any builders exist. New modules also
             # receive their declared dependencies' old implementations; never candidate code.
             shard_sources[task["id"]] = planning_sources(self.index, inputs.base, paths,
-                                                           any_file=self.generic)
+                                                           any_file=True)
         for task, integration in assignments:
             prompt = test_prompt(inputs.spec, boundary, inputs.repo_map, [],
-                                 generic=self.generic, task_id=task["id"],
+                                 task_id=task["id"],
                                  sources=shard_sources[task["id"]], integration=integration)
             request = DshClient.task_text(prompt, self._test_schema())
             if len(request.encode()) > DshClient.input_limit:
@@ -1187,12 +895,14 @@ class Orchestrator:
                     f"at most {jobs} concurrent calls")
         stopped = threading.Event()
 
-        def design(item: tuple[dict[str, Any], bool]) -> tuple[
+        def design(item: tuple[dict[str, Any], bool], seed: list[str] | None = None) -> tuple[
             list[dict[str, str]], list[list[str]],
         ]:
             task, integration = item
             purpose = "integration-test-design" if integration else "test-design"
-            errors: list[str] = []
+            if seed:  # a redesign after the joined tests interfered: its own phases
+                purpose += "-rejoin"
+            errors: list[str] = list(seed or [])
             rejected: list[list[str]] = []
             # A settled unparseable answer is a protocol slip: it gets MAX_FORMAT_REPAIRS of
             # its own, separate from the `attempts` lint revisions. Every physical call has
@@ -1201,10 +911,6 @@ class Orchestrator:
             marks: set[str] = set()
             code = "lint_budget"
             tid = task["id"]
-            path = shard_path(tid, integration)
-            # A complete, well-formed draft whose Python does not compile is revised in
-            # place with EDIT_SCHEMA edits, not regenerated; it still uses a lint revision.
-            draft = ""
             # Up to two reviews: the first may add tests for missing behaviour; the second
             # checks the revised draft and acts only on wrong tests, so added tests are
             # validated before freezing and missing items cannot ping-pong.
@@ -1213,23 +919,18 @@ class Orchestrator:
             # fails, this draft is frozen instead of redesigning the shard (timeflow at
             # 5588d86 spent 144 s regenerating one after a failed review repair).
             fallback: list[dict[str, str]] | None = None
+            fallback_check = ""  # the check frozen with `fallback`, not a later repair's
             for number in range(1, attempts + MAX_FORMAT_REPAIRS + 2
                                 + MAX_TEST_REVIEWS_PER_SHARD):
                 if revisions >= attempts:
                     break
                 if self.cancel.is_set() or stopped.is_set():
                     raise PlanError("distributed test design cancelled")
-                local, draft = draft, ""
-                schema = EDIT_SCHEMA if local else self._test_schema()
-                stage = purpose.removesuffix("-design") + "-repair" if local else purpose
-                prompt = (test_edit_prompt(
-                    test_prompt(inputs.spec, boundary, inputs.repo_map, [], generic=self.generic,
-                                task_id=tid,
-                                sources=shard_sources[tid], integration=integration),
-                    path, local, errors) if local else
-                    test_prompt(inputs.spec, boundary, inputs.repo_map, errors,
-                                generic=self.generic, task_id=tid,
-                                sources=shard_sources[tid], integration=integration))
+                schema = self._test_schema()
+                stage = purpose
+                prompt = test_prompt(inputs.spec, boundary, inputs.repo_map, errors,
+                                     task_id=tid, sources=shard_sources[tid],
+                                     integration=integration)
                 if len(DshClient.task_text(prompt, schema).encode()) > DshClient.input_limit:
                     stopped.set()
                     raise PlanError("Distributed test repair exceeds input limit")
@@ -1249,6 +950,7 @@ class Orchestrator:
                 if result.outcome != "ok" and fallback is not None:
                     self.notify(f"[plan] {tid} test-design {number}: review repair "
                                 f"{result.outcome}; keep the reviewed draft")
+                    checks[(tid, integration)] = fallback_check
                     return fallback, rejected
                 if result.outcome != "ok":
                     if output_cut(result.usage) and not unresolved(result.outcome, result.usage):
@@ -1272,12 +974,6 @@ class Orchestrator:
                         self.notify(f"[plan] {tid} test-design {number}: settled invalid JSON; "
                                     "retry only this shard")
                         rejected.append([note])
-                        if local and repairs < MAX_FORMAT_REPAIRS:
-                            # A malformed patch answer keeps the same draft and its original
-                            # compile feedback for the one format self-repair.
-                            repairs += 1
-                            draft, errors = local, [*errors, note]
-                            continue
                         errors = [note]
                         if repairs < MAX_FORMAT_REPAIRS:
                             repairs += 1
@@ -1288,22 +984,13 @@ class Orchestrator:
                     raise PlanError(f"test-designer {tid} returned {result.outcome}")
                 design_data: object = result.data
                 try:
-                    if local:
-                        if result.data.get("status") != "DONE":
-                            raise EditError("a local draft repair must return DONE with edits")
-                        design_data = revise_draft(path, local, result.data.get("edits"))
-                    if not self.generic:
-                        files = test_shard(boundary, tid, design_data, integration=integration)
-                        tests = [name for file in files
-                                 for name in unittest_ids(file["path"], file["content"])]
-                    else:
-                        files, check = orch_generic.test_shard(boundary, tid, design_data,
-                                                               existing=inputs.existing)
-                        problem = self._red_problem(run_id, inputs.base, boundary, files, check)
-                        if problem:
-                            raise ValueError(problem)
-                        tests = [check.id]
-                        checks[(tid, integration)] = check.id
+                    files, check = orch_generic.test_shard(boundary, tid, design_data,
+                                                           existing=inputs.existing)
+                    problem = self._red_problem(run_id, inputs.base, boundary, files, check)
+                    if problem:
+                        raise ValueError(problem)
+                    tests = [check.id]
+                    checks[(tid, integration)] = check.id
                     candidate = {
                         **boundary, **self._engine_key(),
                         "files": [*cast(list[dict[str, str]], boundary["files"]), *files],
@@ -1320,20 +1007,20 @@ class Orchestrator:
                         "source_bytes": sum(len(text.encode())
                                             for text in shard_sources[tid].values()),
                     }))
-                    if not errors and reviews < MAX_TEST_REVIEWS_PER_SHARD and not self.generic:
+                    if not errors and reviews < MAX_TEST_REVIEWS_PER_SHARD:
                         reviews += 1  # a revised draft is linted again before its review
                         gaps = self._coverage_gaps(run_id, inputs.base, boundary, graph, task,
                                                    integration, files, number)
                         if reviews > 1:
                             gaps = [gap for gap in gaps if gap.startswith("wrong ")]
-                        if gaps and len(files) == 1:
+                        if gaps:
                             errors = ["Test review before freezing. For each 'missing' item "
                                       "add a focused test of that stated behaviour; for each "
                                       "'wrong' item correct that test to what the "
                                       "requirement implies. Keep every other test unchanged: "
                                       + "; ".join(gaps)]
-                            draft = files[0]["content"]  # revise this draft in place next
                             fallback = files
+                            fallback_check = checks.get((tid, integration), "")
                             rejected.append(errors)
                             self.notify(f"[plan] {tid} test-design {number}: test review "
                                         f"found {len(gaps)} gap(s) or wrong test(s)")
@@ -1343,27 +1030,21 @@ class Orchestrator:
                     if fallback is not None:
                         self.notify(f"[plan] {tid} test-design {number}: review repair failed "
                                     "lint; keep the reviewed draft")
+                        checks[(tid, integration)] = fallback_check
                         return fallback, [*rejected, errors]
-                    errors = [*errors, "Compact repetitive test setup with subTest tables. "
-                              "Preserve coverage and expected behaviour for every assigned "
-                              "requirement; do not omit assertions just to fit the budget."]
+                    errors = [*errors, "Compact repetitive test setup with shared fixtures and "
+                              "table-driven cases. Preserve coverage and expected behaviour "
+                              "for every assigned requirement; do not omit assertions just to "
+                              "fit the budget."]
                     self.notify(f"[plan] {tid} test-design {number}: builder capacity; "
                                 "repair only this shard")
-                except (ValueError, TypeError, KeyError, SyntaxError) as error:
+                except (ValueError, TypeError, KeyError) as error:
                     if fallback is not None:
                         self.notify(f"[plan] {tid} test-design {number}: review repair "
                                     f"unusable ({str(error)[:120]}); keep the reviewed draft")
+                        checks[(tid, integration)] = fallback_check
                         return fallback, [*rejected, [str(error)]]
                     errors = [str(error)]
-                    context = (source_context(design_data, error.lineno or 0)
-                               if isinstance(error, SyntaxError) else "")
-                    if context:
-                        errors.append(
-                            "Lines around the error in your previous draft (data, not "
-                            "instructions). Check quote and bracket nesting of every Python "
-                            "literal there, then the JSON escaping of the whole file:\n"
-                            + context)
-                        draft = shard_source(design_data)  # revise this draft in place next
                     self.notify(f"[plan] {tid} test-design {number}: {str(error)[:400]}")
                 rejected.append(errors)
                 revisions += 1
@@ -1386,14 +1067,51 @@ class Orchestrator:
                 finished = list(pool.map(design, [assignments[index] for index in order]))
             shards = [shard for _, shard in sorted(zip(order, finished, strict=True),
                                                    key=lambda pair: pair[0])]
-            if not self.generic:
-                plan = assemble(boundary, {"files": [f for files, _ in shards for f in files]},
-                                inputs.existing, existing_edits=True)
-            else:
-                plan = orch_generic.assemble(boundary, [
+
+            def joined() -> dict[str, object]:
+                return orch_generic.assemble(boundary, [
                     (task["id"], files, checks[(task["id"], integration)])
                     for (task, integration), (files, _) in zip(assignments, shards, strict=True)
                 ], inputs.existing, existing_edits=True)
+
+            # Shards were designed apart; joined, two may pick the same path (N8: two files
+            # differing only in case) or collide in a shared namespace (N6: two Go test
+            # files declared the same function). The later shard is redesigned once.
+            for rejoin in range(MAX_REJOINS + 1):
+                taken = {p.casefold() for p in inputs.existing} | {
+                    f["path"].casefold() for f in cast(list[dict[str, str]], boundary["files"])}
+                clashes: dict[str, tuple[str, str, str]] = {}
+                for index, (files, _) in enumerate(shards):
+                    key = checks[(assignments[index][0]["id"], assignments[index][1])]
+                    named = {f["path"].casefold(): f["path"] for f in files}
+                    clash = next((name for folded, name in named.items() if folded in taken),
+                                 "")
+                    if clash:
+                        clashes[key] = ("", clash, f"The path {clash} is already used by "
+                                        "another task's file (paths are compared "
+                                        "case-insensitively); choose a different path.")
+                    taken.update(named)
+                if not clashes:
+                    plan = joined()
+                    clashes = self._interference(run_id, inputs.base, plan)
+                if not clashes:
+                    break
+                if rejoin == MAX_REJOINS:
+                    return Draft(None, len(seen), [*seen, [
+                        f"{victim}: fails because of {path}: {output}"
+                        for victim, path, output in clashes.values()]])
+                index_of = {checks[(task["id"], integration)]: index
+                            for index, (task, integration) in enumerate(assignments)}
+                for offender, (victim, path, output) in clashes.items():
+                    index = index_of[offender]
+                    self.notify(f"[plan] {assignments[index][0]['id']}: its tests collide "
+                                f"with another task's when joined; redesigning")
+                    shards[index] = design(assignments[index], [output] if not victim else [
+                        f"Your test file {path} breaks another task's frozen check when all "
+                        "tests are present together (independent designers share the "
+                        "project's namespaces). Rename what you declare with your task id "
+                        f"prefix. The other check's output:\n{output}"])
+            plan = joined()
             problems = self._pack_errors(plan, inputs.base, inputs.spec)
         except PlanError as error:
             return error
@@ -1449,7 +1167,9 @@ class Orchestrator:
         assigned = {req: texts[req] for req in reqs if req in texts}
         if not assigned or len(files) != 1:
             return []
-        prompt = coverage_prompt(assigned, files[0]["path"], files[0]["content"], integration)
+        prompt = coverage_prompt(assigned, ", ".join(f["path"] for f in files),
+                                 "\n\n".join(f"--- {f['path']} ---\n{f['content']}"
+                                              for f in files), integration)
         purpose = "integration-coverage-review" if integration else "coverage-review"
         route = {"planner": self._claude_route(run_id, planning=True),
                  "opus-low": replace(CLAUDE_PLAN, effort="low"), "sonnet": SONNET_PLAN,
@@ -1491,77 +1211,6 @@ class Orchestrator:
             return PlanError(f"planner returned {result.outcome}: {result.message}")
         return result.data
 
-    def _draft_modules(
-        self, run_id: str, inputs: "PlanInputs", attempts: int
-    ) -> "Draft | PlanError":
-        """Module boundaries, then every module's sub-plan in parallel, then one merge."""
-        active = {rule.id for rule in self._rules("planner") if rule.status == "active"}
-        rule_ids = [rule_id for rule_id in inputs.rule_ids if rule_id in active]
-        seen: list[list[str]] = []
-        errors: list[str] = []
-        top: dict[str, object] = {}
-        for attempt in range(1, attempts + 1):
-            self.notify(f"[plan] asking {self._claude_route(run_id, planning=True).label} "
-                        f"for module boundaries ({attempt})")
-            answer = self._ask_planner(
-                f"orch-{run_id}-modules-{attempt}",
-                modules_prompt(inputs.spec, inputs.repo_map, errors, inputs.rules),
-                MODULES_SCHEMA,
-                run_id=run_id, purpose="modules", attempt=attempt, base=inputs.base,
-                rules=rule_ids,
-            )
-            if isinstance(answer, PlanError):
-                return answer
-            top, errors = answer, module_lint(answer, inputs.existing)
-            if not errors:
-                break
-            seen.append(errors)
-        if errors:
-            return Draft(None, attempts, seen)
-        listed = cast(list[dict[str, object]], top["modules"])
-        self.notify(f"[plan] {len(listed)} module(s); planning each in parallel")
-
-        def plan_module(position: int) -> tuple[dict[str, object] | None, int, list[list[str]]]:
-            module = listed[position]
-            first, last = id_range(position, len(listed))
-            problems: list[str] = []
-            rejected: list[list[str]] = []
-            for attempt in range(1, attempts + 1):
-                sub = self._ask_planner(
-                    f"orch-{run_id}-module-{module['name']}-{attempt}",
-                    submodule_prompt(top, module, first, last, problems, inputs.rules,
-                                     original_spec=inputs.spec),
-                    PLAN_SCHEMA,
-                    run_id=run_id, purpose="module", attempt=attempt,
-                    sample=str(module["name"]), base=inputs.base,
-                    rules=rule_ids,
-                )
-                if isinstance(sub, PlanError):
-                    raise sub
-                problems = submodule_lint(top, module, first, last, sub) or lint(
-                    sub, inputs.existing
-                )
-                if not problems:
-                    return sub, attempt - 1, rejected
-                rejected.append([f"{module['name']}: {item}" for item in problems])
-            return None, attempts, rejected
-
-        try:
-            with ThreadPoolExecutor(max_workers=min(4, len(listed))) as pool:
-                planned = list(pool.map(plan_module, range(len(listed))))
-        except PlanError as error:
-            return error
-        repairs = len(seen) + sum(fixes for _, fixes, _ in planned)
-        seen += [errors for _, _, rejected in planned for errors in rejected]
-        if any(sub is None for sub, _, _ in planned):
-            return Draft(None, repairs, seen)
-        merged = merge(top, [sub for sub, _, _ in planned if sub is not None])
-        problems = lint(merged, inputs.existing) or self._pack_errors(
-            merged, inputs.base, inputs.spec)
-        if problems:
-            return Draft(None, repairs, [*seen, problems])
-        return Draft(merged, repairs, seen)
-
     def _score(self, run_id: str, base: str, draft: "Draft", coupling: list[Coupling]) -> None:
         assert draft.plan is not None
         draft.vacuous, draft.probe_note = self._probe_plan(run_id, base, draft.plan)
@@ -1571,10 +1220,37 @@ class Orchestrator:
         )
 
     def _engine_key(self) -> dict[str, str]:
-        return {"engine": "generic"} if self.generic else {}
+        return {"engine": "generic"}
 
     def _test_schema(self) -> dict[str, object]:
-        return orch_generic.GENERIC_TEST_SCHEMA if self.generic else TEST_SCHEMA
+        return orch_generic.GENERIC_TEST_SCHEMA
+
+    def _interference(self, run_id: str, base: str,
+                      plan: dict[str, object]) -> dict[str, tuple[str, str, str]]:
+        """Checks that fail on the stubs because of another task's test file, when all
+        frozen tests are present: {offending check: (victim check, file, output tail)}."""
+        files = plan_files(plan)
+        owner = {check: task.id for task in tasks_from(plan) for test in task.tests
+                 if (check := orch_verify.parse(test)) is not None}
+        checks = list(owner)
+        clashes: dict[str, tuple[str, str, str]] = {}
+        with self.worktree(run_id, "join", base) as path:
+            apply_edits(path, list(files), [
+                {"path": name, "search": "", "replace": content}
+                for name, content in files.items()])
+            for check in checks:
+                output = orch_verify.run_command(path, check.command,
+                                                 orch_verify.MIN_TIMEOUT).output
+                for other in checks:
+                    # A task's unit and integration checks may run each other's tests:
+                    # the task must pass both anyway. Only another task's file interferes.
+                    if owner[other] == owner[check] or other.id in clashes:
+                        continue
+                    mentioned = [f for f in other.files
+                                 if f not in check.files and PurePosixPath(f).name in output]
+                    if mentioned:
+                        clashes[other.id] = (check.command, mentioned[0], output[-2500:])
+        return clashes
 
     def _red_problem(self, run_id: str, base: str, boundary: dict[str, object],
                      files: list[dict[str, str]], check: "orch_verify.Check") -> str:
@@ -1616,20 +1292,6 @@ class Orchestrator:
                 return [], str(error)[:200]
         return [task.id for task, flag in zip(tasks, flags, strict=True) if flag], ""
 
-    def _settle_planner_rules(self) -> list[tuple[str, dict[str, object]]]:
-        if self.policy is not None:
-            return []
-        trusted, rho, runs = self.proxy_trust()
-        notes: list[tuple[str, dict[str, object]]] = []
-        for rule in self.state.rules("planner"):
-            status, note = planner_verdict(rule, trusted)
-            if status != rule.status:
-                self.state.save_rule(replace(rule, status=status, note=note))
-                notes.append((f"rule.{status}", {"rule": rule.id, "note": note,
-                                                  "proxy_trusted": trusted, "rho": rho}))
-                self.notify(f"[rules] planner {rule.id} {status}: {note}")
-        return notes
-
     def proxy_trust(self) -> tuple[bool, float | None, int]:
         """(proxy trusted, Spearman rho of proxy score vs. real success, runs compared).
 
@@ -1640,98 +1302,6 @@ class Orchestrator:
         rho = spearman([score for _, score, _ in history],
                        [1 - blocked for _, _, blocked in history])
         return rho >= PROXY_RHO, round(rho, 3), len(history)
-
-    def evolve(self, rule_id: str = "", replays: int = 3, attempts: int = 2) -> list[str]:
-        """Offline replay for a planner candidate: re-plan recent specs at their bases
-        with and without it (paired) and judge each draft on the proxy only (lint
-        repairs, vacuous tests, split coupling). Nothing is built; status changes wait
-        for the next plan, the planner rules' checkpoint boundary."""
-        if self.strategy_override == "sonnet-dsf":
-            raise ValueError("sonnet-dsf does not support evolve")
-        candidates = [
-            rule for rule in self.state.rules("planner")
-            if rule.status == "candidate" and (not rule_id or rule.id == rule_id)
-        ]
-        if rule_id and not candidates:
-            raise KeyError(f"{rule_id} is not a planner candidate")
-        history = self.state.runs()[:replays]
-        if any(run.strategy == "sonnet-dsf" for run in history):
-            raise ValueError("sonnet-dsf replay/evolve is not supported")
-        if not candidates or not history:
-            return ["nothing to replay: " + ("no planner candidates" if not candidates
-                                             else "no past runs")]
-        rule = min(candidates, key=lambda r: (r.proxy_with_total + r.proxy_without_total,
-                                              int(r.id[1:])))
-        rules_text, active_ids, _ = layer(self.state.rules("planner"), "planner")
-        lines = [f"replaying {len(history)} spec(s) with and without {rule.id}: {rule.text}"]
-        for past in history:
-            try:
-                # Probes use the past run's work dir: never while that run executes.
-                with self.exclusive(past.id):
-                    row = self._replay(past, rule, rules_text, attempts, active_ids)
-            except RuntimeError as error:
-                lines.append(f"  {past.id}: skipped ({error})")
-                continue
-            if isinstance(row, PlanError):
-                return [*lines, f"  {past.id}: stopped: {row}"]
-            lines.append(f"  {past.id}: {row}")
-        judged = next(r for r in self.state.rules("planner") if r.id == rule.id)
-        trusted, _, _ = self.proxy_trust()
-        status, note = planner_verdict(judged, trusted)
-        decision = ("snapshot and held-out evaluation required; active policy stays frozen"
-                    if self.policy is not None else
-                    (f"becomes {status} at the next plan ({note})" if status != judged.status
-                     else "not decided yet"))
-        lines.append(
-            f"{judged.id} proxy with {judged.proxy_with_passed}/{judged.proxy_with_total}, "
-            f"without {judged.proxy_without_passed}/{judged.proxy_without_total}: "
-            + decision
-            + ("" if trusted else " [proxy untrusted: judged on real outcomes]")
-        )
-        return lines
-
-    def _replay(
-        self, past: Run, rule: Rule, rules_text: str, attempts: int, active_ids: list[str],
-    ) -> str | PlanError:
-        """One paired replay of a past spec: with and without the candidate rule."""
-        coupling = self.index.cochange(past.base)
-        existing = frozenset(
-            self.git(self.repo, "ls-tree", "-r", "--name-only", past.base).splitlines()
-        )
-        planner_map = self.index.at(past.base).repo_map(PLANNER_MAP_BYTES)
-        row = []
-        for shown in (True, False):
-            inputs = PlanInputs(past.spec, past.base, existing, planner_map,
-                                coupling_text(coupling), rules_text, rule.text if shown else "",
-                                tuple([*active_ids, *([rule.id] if shown else [])]))
-            outcome = self._draft(past.id, inputs, "", "ew" if shown else "eo", attempts)
-            if isinstance(outcome, PlanError):
-                return outcome
-            if outcome.plan is not None:
-                self._score(past.id, past.base, outcome, coupling)
-            passed = outcome.plan is not None and not (
-                outcome.repairs or outcome.vacuous or outcome.splits
-            )
-            self.state.plan_outcome(
-                past.id, rule.id, shown, passed, "replay",
-                {"score": outcome.score, "repairs": outcome.repairs,
-                 "vacuous": outcome.vacuous, "splits": outcome.splits},
-            )
-            row.append(f"{'with' if shown else 'without'} {'ok' if passed else 'fail'} "
-                       f"{outcome.score:.2f}")
-        return ", ".join(row)
-
-    def _planner_trial(self, run_id: str) -> tuple[Rule, bool] | None:
-        if self.policy is not None:
-            return None
-        candidates = [r for r in self.state.rules("planner") if r.status == "candidate"]
-        if not candidates:
-            return None
-        rule = min(candidates, key=lambda r: (
-            r.proxy_with_total + r.proxy_without_total + r.with_total + r.without_total,
-            int(r.id[1:]),
-        ))
-        return rule, arm(rule.id, run_id, 0)
 
     def _learn(
         self, run_id: str, text: str, source: str, kind: str, task_id: str = ""
@@ -1752,21 +1322,15 @@ class Orchestrator:
     ) -> list[str]:
         """Tasks whose owned files and frozen tests cannot fit one DSF prompt."""
         context = RunContext.of_plan(plan)
-        sources = self.sources(base)
-        tasks = tasks_from(plan)
-        index = RepoIndex.from_sources({**sources, **context.files}, self.index.source_roots)
-        controls = self._project_controls(
-            [*context.files, *(p for task in tasks for p in task.files)])
-        errors = [f"project pytest collection control is frozen: {path}" for path in controls]
+        tasks = [task for task in tasks_from(plan) if not only_task or task.id == only_task]
+        sources = self.index.read(base, [p for task in tasks for p in task.files])
+        errors: list[str] = []
         for task in tasks:
-            if only_task and task.id != only_task:
-                continue
             owned = {p: context.files.get(p, sources.get(p, "")) for p in task.files}
-            owned = owned_sources(index, owned, task.tests)
             try:
-                context_pack(task, context.requirements, "", context.interfaces_for(task, index),
-                             owned, context.tests_for(task, sliced=True),
-                             DSF_BUDGET - len(self.environment_text.encode()),
+                context_pack(task, context.requirements, "", context.interfaces_for(task),
+                             owned, context.tests_for(task),
+                             DSF_BUDGET,
                              original_spec=spec,
                              dependency_contracts=context.dependency_contracts(task, base))
             except ContextTooLarge as error:
@@ -1778,7 +1342,7 @@ class Orchestrator:
 
     def _checkpoint(
         self, run_id: str, spec: str, base_sha: str, plan: dict[str, object],
-        draft: "Draft", rules: list[str], environment: PytestEnvironment | None = None,
+        draft: "Draft", rules: list[str],
     ) -> Run:
         """Commit stubs and frozen tests on a fresh integration branch and tag it."""
         hashed = plan_hash(plan)
@@ -1793,8 +1357,7 @@ class Orchestrator:
                 raise PlanError("Planning branch already exists; preserve it for inspection")
             elif not integration.exists():
                 self.git(self.repo, "worktree", "add", str(integration), branch)
-        if self.generic:
-            orch_verify.link_ignored(self.repo, integration)
+        orch_verify.link_ignored(self.repo, integration)
         if integration.is_symlink() or any(
             (integration / path).is_symlink()
             or not (integration / path).resolve().is_relative_to(integration.resolve())
@@ -1859,8 +1422,7 @@ class Orchestrator:
             baseline=baseline,
             verified_head=checkpoint,
             policy_id=self.policy.id if self.policy else "",
-            environment_root=str(environment.root) if environment else "",
-            environment_fingerprint=environment.fingerprint if environment else "",
+            environment_root="", environment_fingerprint="",
             strategy=self._run_strategy(run_id),
         )
         tasks = tasks_from(plan)
@@ -1877,65 +1439,8 @@ class Orchestrator:
         return run
 
     def _baseline(self, run_id: str, base: str) -> tuple[list[str], str]:
-        """Pre-existing unittest ids that pass at the base; the final gate keeps them green."""
-        if self.generic:  # project-wide checks come from the plan's own test designers
-            return [], "no pre-existing checks declared"
-        ids: list[str] = []
-        for path, source in sorted(self.sources(base).items()):
-            if LiveWorkspace.is_test_file(path):
-                try:
-                    ids += unittest_ids(path, source)
-                except SyntaxError:
-                    continue
-        if not ids:
-            return [], "no pre-existing tests"
-        with self.worktree(run_id, "baseline", base) as tree:
-            try:
-                passed, _ = self.verify(tree, self.scratch(run_id), base, ids)
-            except Exception as error:  # noqa: BLE001 - the gate is skipped, not the run
-                return [], f"baseline not runnable: {str(error)[:120]}"
-        return (ids, "green") if passed else ([], "pre-existing tests already fail; gate off")
-
-    def _project_controls(self, paths: Iterable[str]) -> list[str]:
-        """Project collection hooks stay frozen throughout generation and repairs."""
-        if self.environment is None:
-            return []
-        return sorted({path for path in paths
-                       if PurePosixPath(path).name.casefold() == "conftest.py"})
-
-    def _project_tests(
-        self, run_id: str, revision: str, environment: PytestEnvironment,
-    ) -> tuple[bool, str]:
-        """All project pytest tests, at pinned bytes, through the existing verification pool.
-
-        A large suite runs as size-balanced shards of test files in parallel sandboxes
-        (NetworkX: ~5400 tests, ~105 s in one process, on the critical path at the end of
-        every run). Only an all-green sharded run is accepted as green; any red shard is
-        confirmed by the original single full run, whose verdict stands.
-        """
-        groups = project_test_shards(
-            self.git(self.repo, "ls-tree", "-r", "-l", revision),
-            min(PROJECT_TEST_SHARDS, self.max_verify_jobs))
-        if len(groups) < 2:
-            return self._project_tests_once(run_id, revision, environment, None, "project")
-        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
-            results = list(pool.map(
-                lambda item: self._project_tests_once(
-                    run_id, revision, environment, item[1], f"project-{item[0]}"),
-                enumerate(groups)))
-        if all(passed for passed, _ in results):
-            return True, "\n".join(f"[shard {index + 1}/{len(groups)}] {report.strip()[-1500:]}"
-                                   for index, (_, report) in enumerate(results))
-        return self._project_tests_once(run_id, revision, environment, None, "project")
-
-    def _project_tests_once(
-        self, run_id: str, revision: str, environment: PytestEnvironment,
-        names: list[str] | None, label: str,
-    ) -> tuple[bool, str]:
-        with self.worktree(run_id, label, revision) as tree:
-            return self.verify(tree, self.scratch(run_id), revision, names,
-                               runner=partial(LiveWorkspace.run_pytest, environment=environment),
-                               timeout=PROJECT_TEST_TIMEOUT)
+        """Checks that must stay green; none until the planner declares project checks."""
+        return [], "no pre-existing checks declared"
 
     def scratch(self, run_id: str) -> Path:
         path = self.run_dir(run_id) / "tmp"
@@ -1958,7 +1463,7 @@ class Orchestrator:
                 self.release_worktrees(run_id)
 
     def execute(
-        self, run_id: str, jobs: int | None = None, mutants: int = 0,
+        self, run_id: str, jobs: int | None = None,
         verify_jobs: int | None = None,
         rpm: float = 0, max_cents: int = 0, cache_mode: str | None = None,
     ) -> Run:
@@ -1967,8 +1472,7 @@ class Orchestrator:
         `jobs` caps concurrent model calls (AIMD starts there), `verify_jobs` concurrent
         sandbox runs (default: CPU count), `rpm` builder calls started per minute across
         the run, `max_cents` this run's model spend (a kill switch on top of the DSH
-        budget). `mutants` > 0 then scores each merged task's tests with that many AST
-        mutants (advisory: it never fails the run).
+        budget).
         """
         if cache_mode not in {None, "auto", "off"}:
             raise ValueError("cache_mode must be auto or off")
@@ -1988,44 +1492,6 @@ class Orchestrator:
                            tuning.verify_jobs if tuning else 0)
             cache_mode = cache_mode or (tuning.cache_mode if tuning else "auto")
             self.cache_mode = cache_mode
-            # Resume follows the persisted checkpoint, including legacy environment-off runs.
-            self.bind_environment()
-            if saved.environment_root or saved.environment_fingerprint:
-                stage = "environment validation"
-                try:
-                    if (not sandbox_available() or not saved.environment_root
-                            or not saved.environment_fingerprint):
-                        raise ValueError("Missing or unsupported pinned project environment")
-                    self.bind_environment(saved.environment_root, saved.environment_fingerprint)
-                    assert self.environment is not None
-                    stage = "collection contract validation"
-                    stored_tasks = [*tasks_from(saved.plan), *self.state.tasks(run_id)]
-                    paths = [*plan_files(saved.plan),
-                             *(p for task in stored_tasks for p in task.files)]
-                    if self._project_controls(paths):
-                        raise ValueError("Project collection control is frozen")
-                    stage = "baseline evidence recovery"
-                    identity = {"revision": saved.base, "environment_root": saved.environment_root,
-                                "environment_fingerprint": saved.environment_fingerprint}
-                    if not any(event.kind == "plan.project_baseline"
-                               and event.data.get("passed") is True
-                               and all(event.data.get(key) == value
-                                       for key, value in identity.items())
-                               for event in self.state.events(run_id)):
-                        passed, report = self._project_tests(run_id, saved.base, self.environment)
-                        self.state.record(run_id, "plan.project_baseline", {
-                            **identity, "passed": passed, "report": report[-4000:],
-                            "recovered": True,
-                        })
-                        if not passed:
-                            raise ValueError("Pinned project baseline could not be re-proven")
-                except Exception as error:
-                    return self.state.update_run(run_id, "run.environment_invalid", {
-                        "environment_root": saved.environment_root,
-                        "environment_fingerprint": saved.environment_fingerprint,
-                        "error": type(error).__name__, "stage": stage,
-                    }, status="paused",
-                        message="Pinned project pytest environment/contract is invalid")
             for task_id in self.state.recover(run_id):
                 status = self.state.task(run_id, task_id).status
                 self.notify(f"[run] {task_id} was interrupted; recovered as {status}")
@@ -2074,8 +1540,6 @@ class Orchestrator:
                     break
                 if self._final_gate(run_id):
                     break
-            if mutants and not (self.stop_reason or self.gate_failure):
-                self.mutation(run_id, mutants, jobs=jobs)
             if self.bucket is not None:
                 self.metrics["paced_seconds"] = round(self.bucket.waited)
             self.state.record(run_id, "run.metrics", dict(self.metrics))
@@ -2302,7 +1766,7 @@ class Orchestrator:
         run = self.state.run(run_id)
         done = [task for task in self.state.tasks(run_id) if task.status == "DONE"]
         merged = [test for task in done for test in task.tests]
-        if not run.baseline and not merged and not run.environment_root:
+        if not run.baseline and not merged:
             return True
         integration = self.integration(run_id)
         head = self.git(integration, "rev-parse", "HEAD")
@@ -2317,27 +1781,6 @@ class Orchestrator:
                                        "tests": len(run.baseline) + len(merged)},
         )
         if passed:
-            if run.environment_root:
-                try:
-                    controls = self._project_controls(self.git(
-                        self.repo, "diff", "--name-only", run.base, head).splitlines())
-                    if controls:
-                        passed = False
-                        report = "Frozen project collection control changed: " + ", ".join(controls)
-                    else:
-                        environment = PytestEnvironment.load(Path(run.environment_root))
-                        if environment.fingerprint != run.environment_fingerprint:
-                            raise ValueError("Pinned environment fingerprint changed")
-                        passed, report = self._project_tests(run_id, head, environment)
-                except Exception as error:
-                    passed, report = False, f"{type(error).__name__} during project pytest gate"
-                self.state.record(run_id, "run.project_final", {
-                    "revision": head, "environment_root": run.environment_root,
-                    "environment_fingerprint": run.environment_fingerprint,
-                    "passed": passed, "report": report[-4000:],
-                })
-                if not passed:
-                    self.gate_failure = "project pytest gate failed: " + report[-200:]
             return True
         if run.regressions >= MAX_REGRESSIONS:
             self.gate_failure = f"tests still fail after {run.regressions} rounds: {report[-200:]}"
@@ -2354,8 +1797,7 @@ class Orchestrator:
                 return True
             tests, good = run.baseline, -1  # checkpoint is green: stubs touch no old code
         else:
-            failing = (failed_in(report, merged) if not self.generic
-                       else orch_verify.failed(report, merged)) or []
+            failing = orch_verify.failed(report, merged)
             start = self._proven(run_id, done, commits).get(failing[0], "") if failing else ""
             if start not in commits:
                 self.gate_failure = f"merged tests fail at the end: {report.strip()[-200:]}"
@@ -2382,16 +1824,11 @@ class Orchestrator:
     def _proven(
         self, run_id: str, done: list[OrchTask], commits: list[str]
     ) -> dict[str, str]:
-        """test id -> the latest commit whose gate proved it green: its owner's merge, or
-        the harden commit that added it (a hardened test does not exist before that)."""
+        """check id -> the latest commit whose gate proved it green: its owner's merge."""
         seen: dict[str, list[str]] = {}
         for task in done:
             for test in task.tests:
                 seen.setdefault(test, []).append(task.commit)
-        for event in self.state.events(run_id):
-            if event.kind == "plan.tests_hardened":
-                for test in cast(list[str], event.data["tests"]):
-                    seen.setdefault(test, []).append(str(event.data["commit"]))
         return {
             test: max(known, key=commits.index)
             for test, candidates in seen.items()
@@ -2468,246 +1905,13 @@ class Orchestrator:
                 except (ValueError, OSError):
                     continue  # no prediction is safer than affinity for the wrong prefix
                 self.ready_cache_keys[task.id] = (
-                    DSF.provider, DSF.model, digest(self.environment_text + pack.shared)[:12])
+                    DSF.provider, DSF.model, digest(pack.shared)[:12])
         return sorted(ready, key=lambda task: (
             -depth[task.id],
             -self.cache_policy.affinity(self.ready_cache_keys[task.id])
             if task.id in self.ready_cache_keys else 0,
             task.id,
         ))
-
-    # --- mutation testing and harden -------------------------------------
-    def mutation(
-        self, run_id: str, cap: int, only: list[str] | None = None, jobs: int = 4
-    ) -> list[Report]:
-        """Score merged tasks' frozen tests with AST mutants of their code at the
-        integration HEAD. Without `only`, tasks already scored at their commit are skipped."""
-        run = self.state.run(run_id)
-        self.bind_environment(run.environment_root, run.environment_fingerprint)
-        head = self.git(self.integration(run_id), "rev-parse", "HEAD")
-        tasks = [
-            task for task in self.state.tasks(run_id)
-            if task.status == "DONE"
-            and (task.id in only if only is not None else task.mutated_at != task.commit)
-        ]
-        if not tasks:
-            return []
-        self.notify(f"[mutate] scoring {len(tasks)} task(s), up to {cap} mutants each")
-        with ThreadPoolExecutor(max_workers=max(1, min(jobs, len(tasks)))) as pool:
-            found = list(pool.map(lambda task: self._mutate(run_id, task, head, cap), tasks))
-        return [report for report in found if report is not None]
-
-    def _mutants(self, task: OrchTask, revision: str) -> tuple[dict[str, str], list[Mutant]]:
-        """The task's Python sources at `revision` and every mutant of them."""
-        sources = self.index.read(revision, [p for p in task.files if p.endswith(".py")])
-        return sources, [m for path, text in sources.items() for m in mutants(path, text)]
-
-    def _kills(
-        self, run_id: str, tree: Path, revision: str, sources: dict[str, str],
-        chosen: list[Mutant], tests: list[str], limit: float,
-    ) -> tuple[list[Mutant], int] | None:
-        """(survivors, timeouts) of `chosen` against `tests`; None when interrupted."""
-        survivors: list[Mutant] = []
-        timeouts = 0
-        for mutant in chosen:
-            if self.cancel.is_set():
-                return None
-            target = tree / mutant.path
-            target.write_text(mutant.source)
-            try:
-                passed, _ = self.verify(tree, self.scratch(run_id), revision, tests,
-                                        timeout=limit)
-            finally:
-                target.write_text(sources[mutant.path])
-            if passed:
-                survivors.append(mutant)
-            elif self.elapsed() >= limit * 0.95:
-                timeouts += 1  # an infinite loop the tests would also have caught
-        return survivors, timeouts
-
-    def _mutate(self, run_id: str, task: OrchTask, head: str, cap: int) -> Report | None:
-        sources, found = self._mutants(task, head)
-        chosen = select(found, cap, task.id)
-        with self.worktree(run_id, f"mutate-{task.id}", head) as tree:
-            green, output = self.verify(tree, self.scratch(run_id), head, task.tests)
-            if not green:
-                self.state.record(run_id, "task.mutation_skipped",
-                                  {"reason": output.strip()[-300:]}, task.id)
-                return None
-            limit = mutant_limit(self.elapsed())
-            outcome = self._kills(run_id, tree, head, sources, chosen, task.tests, limit)
-        if outcome is None:
-            return None
-        survivors, timeouts = outcome
-        report = Report(task.id, len(chosen), len(chosen) - len(survivors), timeouts,
-                        [m.brief() for m in survivors][:MAX_SURVIVORS])
-        self.state.transition(
-            run_id, task.id, "DONE", "task.mutation",
-            {"total": report.total, "killed": report.killed, "timeouts": timeouts,
-             "score": round(report.score, 3), "survivors": report.survivors,
-             "gaps": report.gaps(), "commit": task.commit},
-            mutation=round(report.score, 3), mutated_at=task.commit,
-        )
-        if report.total and report.score < WEAK_TESTS:
-            touched = self.state.discount(run_id, task.id, f"mutation score {report.score:.2f}")
-            # Weak tests are a planning gap: the planner wrote them (see orch evolve).
-            self.state.record(run_id, "plan.weak_tests",
-                              {"score": round(report.score, 3), "gaps": report.gaps(),
-                               "rules": touched}, task.id)
-            for operator in report.operators()[:2]:
-                self._learn(run_id, PLANNER_LESSONS[operator], f"{run_id}/{task.id} mutation",
-                            "planner", task.id)
-        self.notify(f"[mutate] {task.id} {report.killed}/{report.total} killed"
-                    + (f"; gaps: {'; '.join(report.gaps()[:2])}" if report.survivors else ""))
-        return report
-
-    def harden(self, run_id: str, only: list[str] | None = None, cap: int = 12) -> list[str]:
-        """Claude adds tests that kill a task's surviving mutants; each new test must
-        pass on the merged code and kill at least one survivor before it is frozen."""
-        saved = self.state.run(run_id)
-        if saved.environment_root or saved.environment_fingerprint:
-            raise ValueError(
-                "Project pytest runs cannot be hardened until project revalidation is supported"
-            )
-        lines: list[str] = []
-        self._restore(run_id)  # a killed harden must not leave unvalidated tests behind
-        for task in self.state.tasks(run_id):
-            if task.status != "DONE" or (only is not None and task.id not in only):
-                continue
-            if task.mutated_at != task.commit:
-                self._mutate(run_id, task, self.git(self.integration(run_id), "rev-parse",
-                                                    "HEAD"), cap)
-                task = self.state.task(run_id, task.id)
-            scored = [e.data for e in self.state.events(run_id, task.id)
-                      if e.kind == "task.mutation"]
-            survivors = cast(list[dict[str, object]], scored[-1]["survivors"]) if scored else []
-            if not survivors:
-                lines.append(f"{task.id}: no surviving mutants")
-                continue
-            try:
-                lines.append(self._harden(run_id, task, survivors, cap))
-            except AttemptFailed as error:
-                lines.append(f"{task.id}: harden rejected: {error.detail[:300]}")
-            except Deferred as error:
-                lines.append(f"{task.id}: stopped: {error}")
-                break
-        return lines
-
-    def _harden(
-        self, run_id: str, task: OrchTask, survivors: list[dict[str, object]], cap: int
-    ) -> str:
-        run = self.state.run(run_id)
-        context = RunContext.of(run)
-        tests = context.tests_for(task)
-        integration = self.integration(run_id)
-        with self.git_lock:
-            head = self.git(integration, "rev-parse", "HEAD")
-        code = self.index.read(head, task.files)
-        data = self._claude(
-            run_id, task, "harden",
-            harden_prompt(task, context.requirements, tests, code, survivors,
-                          original_spec=run.spec), HARDEN_SCHEMA,
-        )
-        paths = sorted(tests)
-        with self.integration_change(run.id) as (integration, _):
-            try:
-                apply_edits(integration, paths, data.get("edits"))
-            except EditError as error:
-                raise AttemptFailed("harden", f"edits unusable: {error}") from None
-            new, plan = self._hardened_plan(run, task, paths, tests)
-            hashed = plan_hash(plan)
-            self.git(integration, "add", "-f", "--", *paths)
-            message = commit_message(
-                run.id, hashed, task, f"h{len(new)}", self._claude_route(run.id).label,
-                title=f"orch harden {task.id}: {len(new)} test(s) for surviving mutants",
-            )
-            self.git(integration, "commit", "-m", message,
-                     author=f"orch {self._claude_route(run.id).label}")
-            commit = self.git(integration, "rev-parse", "HEAD")
-            killed = self._validate_hardening(run, task, commit, new, survivors)
-            # The commit point: the plan and verified HEAD move together.
-            self.state.update_run(
-                run.id, "plan.tests_hardened",
-                {"task": task.id, "commit": commit, "tests": new},
-                plan=plan, plan_hash=hashed, verified_head=commit,
-            )
-            if run.status == "done":
-                self.git(self.repo, "tag", "-f", f"orch/{run.id}/done", commit)
-        self.state.transition(
-            run.id, task.id, "DONE", "task.hardened",
-            {"commit": commit, "tests": new, "killed": killed},
-            tests=[*task.tests, *new], claude_attempts=task.claude_attempts + 1,
-        )
-        report = self._mutate(run.id, self.state.task(run.id, task.id), commit, cap)
-        score = f"; mutation {task.mutation:.2f} -> {report.score:.2f}" if report else ""
-        return f"{task.id}: {len(new)} new test(s) kill {killed} survivor(s){score}"
-
-    def _hardened_plan(
-        self, run: Run, task: OrchTask, paths: list[str], frozen: dict[str, str]
-    ) -> tuple[list[str], dict[str, object]]:
-        """The new test ids and the revised plan; refuses edits that weaken or rename."""
-        integration = self.integration(run.id)
-        edited = {path: (integration / path).read_text() for path in paths}
-        new: list[str] = []
-        for path in paths:
-            before = set(unittest_ids(path, frozen[path]))
-            after = unittest_ids(path, edited[path])
-            if not before <= set(after):
-                raise AttemptFailed("harden", f"{path}: existing tests were removed or renamed")
-            kept = method_bodies(edited[path])
-            changed = [n for n, body in method_bodies(frozen[path]).items() if kept.get(n) != body]
-            if changed:
-                raise AttemptFailed("harden", f"{path}: existing tests changed: {changed[:3]}")
-            new += [test for test in after if test not in before]
-        if not new:
-            raise AttemptFailed("harden", "no new test methods")
-        for test in new:
-            match = REQ_TEST.fullmatch(test.rsplit(".", 1)[1])
-            if match is None or f"R{match.group(1)}" not in task.reqs:
-                raise AttemptFailed("harden", f"{test} is not named for one of {task.reqs}")
-        entries = [
-            {**t.entry(), "tests": [*t.tests, *new]} if t.id == task.id else t.entry()
-            for t in self.state.tasks(run.id) if t.status != "REPLANNED"
-        ]
-        plan = {
-            **run.plan,
-            "files": [{"path": p, "content": edited.get(p, c)}
-                      for p, c in plan_files(run.plan).items()],
-            "tasks": entries,
-        }
-        errors = lint(plan, fixture_paths=set(edited))
-        if errors:
-            raise AttemptFailed("harden", f"revised plan fails lint: {errors[:3]}")
-        return new, plan
-
-    def _validate_hardening(
-        self, run: Run, task: OrchTask, commit: str, new: list[str],
-        survivors: list[dict[str, object]],
-    ) -> int:
-        """New tests pass on the merged code, keep every merged test green and kill at
-        least one survivor. Returns how many survivors they kill."""
-        merged = [t for other in self.state.tasks(run.id) if other.status == "DONE"
-                  for t in other.tests]
-        with self.worktree(run.id, "harden", commit) as tree:
-            passed, report = self.verify(tree, self.scratch(run.id), commit, [*merged, *new])
-            if not passed:
-                raise AttemptFailed("harden", f"new tests fail on the merged code: {report[-600:]}")
-            # Mutants run the new tests alone, so alone they must pass on the real code;
-            # otherwise every mutant would count as killed.
-            passed, report = self.verify(tree, self.scratch(run.id), commit, new)
-            if not passed:
-                raise AttemptFailed("harden", f"new tests fail when run alone: {report[-600:]}")
-            limit = mutant_limit(self.elapsed())
-            keys = {survivor["key"] for survivor in survivors}
-            sources, found = self._mutants(task, commit)
-            targets = [m for m in found if m.key in keys]
-            outcome = self._kills(run.id, tree, commit, sources, targets, new, limit)
-        if outcome is None:
-            raise Deferred("interrupted while validating new tests")
-        killed = len(targets) - len(outcome[0])
-        if not killed:
-            raise AttemptFailed("harden", "the new tests kill none of the surviving mutants")
-        return killed
 
     def _finish(self, run_id: str) -> Run:
         tasks = self.state.tasks(run_id)
@@ -3102,17 +2306,6 @@ class Orchestrator:
                 changed_paths = apply_edits(integration, paths, edits)
             except EditError as error:
                 raise AttemptFailed("dispute", f"test correction unusable: {error}") from None
-            weakened = [
-                f"{path}::{name}"
-                for path in paths
-                for after in [assertions((integration / path).read_text())]
-                for name, count in assertions(frozen[path]).items()
-                if after.get(name, 0) < count
-            ]
-            if weakened:
-                raise AttemptFailed(
-                    "dispute", f"test correction removes assertions from {weakened[:3]}"
-                )
             plan = {
                 **run.plan,
                 "files": [
@@ -3123,7 +2316,7 @@ class Orchestrator:
                 "tasks": [t.entry() for t in self.state.tasks(run.id)
                           if t.status != "REPLANNED"],
             }
-            errors = lint(plan, fixture_paths=set(changed_paths))
+            errors = orch_generic.plan_errors(plan) if changed_paths else []
             if errors:
                 raise AttemptFailed("dispute", f"test correction fails lint: {errors[:3]}")
             hashed = plan_hash(plan)
@@ -3213,7 +2406,7 @@ class Orchestrator:
                     ) for new in replacements]
                 self.state.replan(
                     run_id, task.id, chosen, replacements, str(data.get("summary", ""))[:300],
-                    validate=partial(lint, fixture_paths=set()),
+                    validate=orch_generic.plan_errors,
                 )
         except Conflict as error:
             raise Parked(f"replan raced with execution: {error}") from None
@@ -3225,15 +2418,13 @@ class Orchestrator:
         """Every reason a proposed replacement subtree cannot replace the chosen tasks."""
         kept = [t.entry() for t in tasks if t.status != "REPLANNED" and t.id not in chosen]
         plan = {**run.plan, "tasks": [*kept, *entries]}
-        errors = lint(plan, fixture_paths=set())  # code split preserves existing frozen tests
+        errors = orch_generic.plan_errors(plan)  # a code split keeps the frozen checks
         if not errors:
             errors += replacement_frontier(
                 {path for old in tasks if old.id in chosen for path in old.files},
                 {entry["id"]: entry["depends_on"] for entry in entries},
                 {entry["id"]: entry["files"] for entry in entries},
             )
-        if not errors and run.environment_root:
-            errors = self._pack_errors(plan, run.base, run.spec)
         wanted = {test for t in tasks if t.id in chosen for test in t.tests}
         given = {test for e in entries if isinstance(e, dict) for test in e.get("tests", [])}
         taken = {t.id for t in tasks}
@@ -3355,11 +2546,12 @@ class Orchestrator:
         parents = self.git(self.repo, "rev-list", "--parents", "-n", "1", commit).split()
         if (any(key not in trailers for key in REQUIRED_TRAILERS)
                 or any(trailers.get(key) != value for key, value in expected.items())
-                or trailers.get("Orch-Model") not in {DSF.label, self._claude_route(run.id).label}
+                or trailers.get("Orch-Model") not in {DSF.label, self._claude_route(run.id).label,
+                                                      HUMAN.label}
                 or len(parents) != 2):
             raise Parked("Saved candidate no longer matches task contract or route")
         changed = set(self.git(self.repo, "diff", "--name-only", parents[1], commit).splitlines())
-        if not changed or changed - set(task.files) or self._project_controls(list(changed)):
+        if changed - set(task.files):  # an unchanged tree is fine: the checks decide
             raise Parked("Saved candidate changes files outside its implementation ownership")
         if task.interface_depends_on or "Orch-Inputs" in trailers:
             current = self.state.run(run.id)
@@ -3390,7 +2582,7 @@ class Orchestrator:
             raise Parked("Saved candidate no longer matches task contract or route")
         try:
             with self.git_lock:
-                self.git(path, "cherry-pick", original)
+                self.git(path, "cherry-pick", "--allow-empty", original)
         except RuntimeError as error:
             self.git(path, "cherry-pick", "--abort")
             raise AttemptFailed("rebase", str(error)) from None
@@ -3415,26 +2607,27 @@ class Orchestrator:
         chosen = list(dict.fromkeys([*own, *self._dependency_files(context, task, base)]))
         try:
             requested = requested_sources(self.index, path, base, chosen,
-                                          any_file=self.generic) if chosen else {}
+                                          any_file=True) if chosen else {}
         except ValueError:
             chosen = own
             requested = {}
         selectors = [item for item in chosen
                      if "::" not in item or item.split("::", 1)[0] not in chosen]
         if chosen == own and own:
-            requested = requested_sources(self.index, path, base, selectors, any_file=self.generic)
-        index = self.index.at(base)
-        originals = self.index.read(base, task.files)
-        owned = owned_sources(index, originals, task.tests, selectors)
-        partial_owned = {name: source for name, source in owned.items()
-                         if source != originals[name]}
-        arguments = (
+            requested = requested_sources(self.index, path, base, selectors, any_file=True)
+        owned = self.index.read(base, task.files)
+        partial_owned: dict[str, str] = {}
+        arguments: tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any] = (
             task, context.requirements, run.repo_map,
-            context.interfaces_for(task, index), owned,
-            context.tests_for(task, sliced=True),
-            (DSF_BUDGET if route == DSF else CLAUDE_BUDGET) - len(self.environment_text.encode()),
-            (task.last_diff, feedback or task.last_error), hint, self.rules_text, extra_rule,
-            self._dependencies(run.id, task, base),
+            context.interfaces_for(task), owned,
+            context.tests_for(task),
+            (DSF_BUDGET if route == DSF else CLAUDE_BUDGET),
+            (task.last_diff, feedback or task.last_error),
+            "\n".join(part for part in (
+                ("HUMAN GUIDANCE for this task (authoritative over earlier attempts):\n"
+                 + task.human_hint) if task.human_hint else "", hint) if part),
+            self.rules_text, extra_rule,
+            {},
         )
         contracts = context.dependency_contracts(task, run.base)
         try:
@@ -3448,7 +2641,7 @@ class Orchestrator:
         # Keep requested definitions exact. Only full-file reads become explicit catalogs.
         for size in (8192, 2048, 512, 128):
             compact = requested_sources(self.index, path, base, chosen, catalog_bytes=size,
-                                        any_file=self.generic)
+                                        any_file=True)
             try:
                 packed = context_pack(*arguments, requested=compact, original_spec=run.spec,
                                       language_note=self._language_note(),
@@ -3467,11 +2660,9 @@ class Orchestrator:
         paths = sorted({
             path for tid in task.depends_on if tid in context.tasks
             for path in context.tasks[tid].files
-            if (self.generic or (path.endswith(".py") and not LiveWorkspace.is_test_file(path)))
-            and path not in task.files
+            if path not in task.files
         })
-        present = (set(self.index.at(base).files) if not self.generic
-                   else set(self.index.tree(base)))
+        present = set(self.index.tree(base))
         paths = [path for path in paths if path in present]
         return paths if len(paths) <= DEPENDENCY_READS else []
 
@@ -3486,7 +2677,16 @@ class Orchestrator:
             context_feedback = ""
             repairs = 0
             call_route = route
-            while True:
+            # A task that owns no files (a cross-component agreement check) has nothing to
+            # build: its frozen checks alone decide, on the merged dependencies. Run
+            # r7313527a parked such a task after five rungs of builders correctly
+            # returning no edits.
+            status: object = "DONE"
+            answer: dict[str, object] = {}
+            rules = list(self.rule_ids)
+            if not task.files:
+                self.notify(f"[run] {task.id} owns no files; its checks decide")
+            while task.files:
                 if self.cancel.is_set() or self.stop_reason:
                     raise Deferred(self.stop_reason or "interrupted during context retrieval")
                 if self.max_cents and self.spent >= self.max_cents:
@@ -3505,12 +2705,12 @@ class Orchestrator:
                 prompt = ContextPrompt(pack.shared, pack.task + (
                     (pack.retry or "\nImplement the task.\n") if route.provider == "claude"
                     else pack.retry))
-                prefix = digest(self.environment_text + prompt.shared)[:12]
+                prefix = digest(prompt.shared)[:12]
                 self.state.record(
                     run.id, "attempt.called",
                     {"route": route.label, "prefix": prefix, "level": task.level,
                      "sample": label,
-                     "bytes": len(prompt.encode()) + len(self.environment_text.encode()),
+                     "bytes": len(prompt.encode()),
                      "rules": rules,
                      "context_requests": current.context_requests,
                      "partial_reads": list(pack.partial_reads),
@@ -3586,13 +2786,14 @@ class Orchestrator:
                                                         "text": result.text})
                     raise AttemptFailed("provider", f"{result.outcome}: {result.message}")
                 status = result.data.get("status")
+                answer = result.data
                 if status != "NEED_FILES":
                     if result.data.get("need_files"):
                         raise AttemptFailed(
                             "context", "need_files requires NEED_FILES without edits",
                         )
-                    if status != "DONE":
-                        break
+                    if status != "DONE" or result.data.get("edits") == []:
+                        break  # no edits: the owned files already satisfy it; tests decide
                     try:  # validates every edit and compiles before writing anything
                         apply_edits(path, task.files, result.data.get("edits"),
                                     visible=pack.partial_owned)
@@ -3619,7 +2820,7 @@ class Orchestrator:
                     if (result.data.get("edits") != [] or not isinstance(reads, list)
                             or not 1 <= len(reads) <= 8):
                         raise ValueError("NEED_FILES requires no edits and 1-8 selectors")
-                    requested_sources(self.index, path, base, reads, any_file=self.generic)
+                    requested_sources(self.index, path, base, reads, any_file=True)
                     selectors = [str(item) for item in reads]
                 except ValueError as error:
                     context_feedback = str(error)
@@ -3652,30 +2853,30 @@ class Orchestrator:
                 except Conflict as error:
                     raise Parked(str(error)) from None
             if status in {"BLOCKED", "TEST_DISPUTE"}:
-                raise Signal(str(status), str(result.data.get("reason", "")))
+                raise Signal(str(status), str(answer.get("reason", "")))
             if status != "DONE":
                 raise AttemptFailed("edit", "Expected DONE, NEED_FILES, BLOCKED or TEST_DISPUTE")
             # The sandbox's scratch tree and linked dependencies are never part of a change.
             self.git(path, "add", "-A", "--", ".",
-                     *(orch_verify.excludes(path) if self.generic else ()))
+                     *orch_verify.excludes(path))
             present = [owned for owned in task.files if (path / owned).exists()]
             if present:  # owned files may sit under a .gitignore pattern
                 self.git(path, "add", "-f", "--", *present)
+            # An unchanged tree is a candidate too: the frozen checks decide whether the
+            # task was already satisfied.
             diff = self.git(path, "diff", "--cached", base)
-            if not diff:
-                raise AttemptFailed("edit", "edits changed nothing")
             message = commit_message(
                 run.id, run.plan_hash, task, label, route.label,
                 rules=", ".join(rules) or "none",
                 inputs=(digest(dumps(context.dependency_contracts(task, run.base)))
                         if task.interface_depends_on else ""),
             )
-            self.git(path, "commit", "-m", message, author=f"orch {route.label}")
+            self.git(path, "commit", "--allow-empty", "-m", message, author=f"orch {route.label}")
             commit = self.git(path, "rev-parse", "HEAD")
             # Every attempt stays addressable as evidence after its worktree is removed.
             with self.git_lock:
                 self.git(self.repo, "update-ref", f"refs/orch/{run.id}/{task.id}/{label}", commit)
-            return Candidate(commit, diff, label, path, lesson(result.data.get("lesson")))
+            return Candidate(commit, diff, label, path, lesson(answer.get("lesson")))
         except (AttemptFailed, Deferred, Signal) as outcome:
             return outcome
 
@@ -3685,80 +2886,9 @@ class Orchestrator:
         folder.mkdir(parents=True, exist_ok=True)
         (folder / f"{call_id}.json").write_text(dumps(payload))
 
-    def _dependencies(self, run_id: str, task: OrchTask, base: str) -> dict[str, str]:
-        """Merged code this task's files and frozen tests call, along the call graph."""
-        try:
-            index = self.index.at(base)
-            code = dependency_code(
-                index, lambda paths: self.index.read(base, paths),
-                index.roots(task.files, task.tests), set(task.files), DEPENDENCY_BYTES,
-            )
-            if not task.interface_depends_on:
-                return code
-            tasks, owners = self._owners(run_id)
-            available = {
-                tid for tid in {owners[name.split("::", 1)[0]] for name in code
-                                if name.split("::", 1)[0] in owners}
-                if tasks[tid].status == "DONE" and tasks[tid].commit
-                and self.git(self.repo, "merge-base", tasks[tid].commit, base) == tasks[tid].commit
-            }
-            return {name: source for name, source in code.items()
-                    if owners.get(name.split("::", 1)[0]) in {None, *available}}
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
-            # The index only adds context; an attempt never fails for want of it.
-            self.state.record(run_id, "index.error", {"error": str(error)[:200]}, task.id)
-            return {}
-
     def _owners(self, run_id: str) -> tuple[dict[str, OrchTask], dict[str, str]]:
         tasks = {t.id: t for t in self.state.tasks(run_id) if t.status != "REPLANNED"}
         return tasks, {path: t.id for t in tasks.values() for path in t.files}
-
-    def _imports(self, run_id: str, task: OrchTask, commit: str, diff: str
-                 ) -> AttemptFailed | None:
-        """Imports the sandbox cannot satisfy fail the attempt. Imports of a task that is
-        absent from this candidate make it wait/refresh (the dependency is added),
-        unless that task already depends on this one."""
-        index = self.index.at(commit)
-        tasks, owner = self._owners(run_id)
-        graph = {t.id: t.depends_on for t in tasks.values()}
-        needed = closure(graph, task.id)
-        problems = [
-            f"{path} imports {name}, which is absent from the repository and pinned environment"
-            for path in task.files for name in index.missing_imports(
-                path, self.environment.modules if self.environment else ())
-        ]
-        imported = {
-            other for path in task.files for target in index.deps.get(path, ())
-            if (other := owner.get(target, task.id)) != task.id and other not in needed
-        }
-        # DONE is live state; the candidate may have branched before that dependency
-        # merged. Refresh its snapshot instead of misclassifying a stale stub as a
-        # model failure and climbing the repair ladder.
-        unbuilt = sorted(
-            other for other in imported
-            if tasks[other].status != "DONE" or not tasks[other].commit
-            or self.git(self.repo, "merge-base", tasks[other].commit, commit) != tasks[other].commit
-        )
-        problems += [
-            f"imports code of {other}, which depends on this task; answer BLOCKED to re-plan"
-            for other in unbuilt if task.id in closure(graph, other)
-        ]
-        if problems:
-            return AttemptFailed("import", "\n".join(problems), diff)
-        if unbuilt:
-            return Waiting(
-                unbuilt, f"imports code of {unbuilt}, absent from candidate revision", diff)
-        return None
-
-    def _implicit(self, run_id: str, task: OrchTask, commit: str) -> list[str]:
-        """Merged tasks this task's code imports without depending on them."""
-        index = self.index.at(commit)
-        tasks, owner = self._owners(run_id)
-        needed = closure({t.id: t.depends_on for t in tasks.values()}, task.id)
-        return sorted({
-            owner[target] for path in task.files for target in index.deps.get(path, ())
-            if owner.get(target, task.id) not in {task.id, *needed}
-        })
 
     def _check(
         self, run: Run, context: "RunContext", task: OrchTask, base: str,
@@ -3766,33 +2896,13 @@ class Orchestrator:
     ) -> "AttemptFailed | Signal | None":
         path, commit, diff = candidate.path, candidate.commit, candidate.diff
         changed = set(self.git(path, "diff", "--name-only", base, commit).splitlines())
-        if self._project_controls([*task.files, *changed]):
-            return AttemptFailed("scope", "Project pytest collection control is frozen", diff)
         outside = sorted(changed - set(task.files))
         if outside:
             return AttemptFailed("scope", f"changed files outside ownership: {outside}", diff)
-        current = self.index.read(commit, task.files, suffix="" if self.generic else ".py")
+        current = self.index.read(commit, task.files)
         missing = [owned for owned in task.files if owned in context.stubs and owned not in current]
         if missing:
             return AttemptFailed("interface", f"missing implementation files: {missing}", diff)
-        problems = [] if self.generic else [
-            problem
-            for owned in task.files
-            if owned in context.stubs
-            for problem in interface_errors(context.stubs[owned], current[owned])
-        ]
-        if problems:
-            return AttemptFailed("interface", "\n".join(problems), diff)
-        original = self.index.read(base, task.files)
-        problems = [] if self.generic else [
-            f"{owned}: {problem}"
-            for owned in current
-            for problem in implementation_errors(original.get(owned, ""),
-                                                current[owned],
-                                                context.stubs.get(owned, ""))
-        ]
-        if problems:
-            return AttemptFailed("structure", "\n".join(problems), diff)
         if task.interface_depends_on:
             tasks, _ = self._owners(run.id)
             waiting = [tid for tid in task.depends_on
@@ -3801,24 +2911,11 @@ class Orchestrator:
                        != tasks[tid].commit]
             if waiting:
                 return Waiting(waiting, "await dependency implementations in snapshot", diff)
-        imported = None if self.generic else self._imports(run.id, task, commit, diff)
-        if imported is not None:
-            return imported
         if self.git(path, "status", "--porcelain"):
             return AttemptFailed("scope", "worktree is not clean after commit", diff)
         passed, report = self.verify(path, self.scratch(run.id), commit, task.tests)
         if not passed:
-            category, evidence = (
-                diagnose_failure(report, set(context.tests_for(task)), current)
-                if not self.generic else ("test", report[-4000:]))
-            if category == "fixture":
-                self.state.record(run.id, "task.fixture_dispute", {
-                    "candidate": commit, "evidence": evidence,
-                }, task.id, task.attempts)
-                return Signal("TEST_DISPUTE", "Check this frozen test fixture before changing "
-                              "the implementation:\n" + evidence,
-                              AttemptFailed("fixture", evidence, diff))
-            return AttemptFailed(category, evidence, diff)
+            return AttemptFailed("test", report[-4000:], diff)
         return self._screen(run.id, task, candidate) if route == DSF else None
 
     def _screen(self, run_id: str, task: OrchTask, candidate: "Candidate") -> AttemptFailed | None:
@@ -3863,7 +2960,7 @@ class Orchestrator:
             ]
             try:
                 with self.git_lock:
-                    self.git(integration, "cherry-pick", commit)
+                    self.git(integration, "cherry-pick", "--allow-empty", commit)
             except RuntimeError as error:
                 with self.git_lock:
                     self.git(integration, "cherry-pick", "--abort")
@@ -3895,13 +2992,11 @@ class Orchestrator:
                 {"route": route.label, "level": task.level, "passed": True},
                 task.id, task.attempts,
             )
-            implicit = self._implicit(run.id, task, merged)
             self.state.transition(
                 run.id, task.id, "DONE", "task.done",
-                {"commit": merged, "candidate": candidate.label, "implicit": implicit},
+                {"commit": merged, "candidate": candidate.label, "implicit": []},
                 attempt=task.attempts, verified_head=merged, commit=merged, reason="",
                 pending_candidate="", failed_candidate="",
-                depends_on=[*task.depends_on, *implicit],
             )
         self._relax()
         self._observe(run.id, task.id, task.attempts, True)
@@ -3913,6 +3008,115 @@ class Orchestrator:
                 self.state.record(run.id, "rule.candidate", {"rule": rule.id}, task.id)
                 self.notify(f"[rules] new candidate {rule.id}: {rule.text}")
         self.notify(f"[run] {task.id} DONE at {merged[:10]} ({candidate.label})")
+
+    # --- a person takes over a task ---------------------------------------
+    def manual_path(self, run_id: str, task_id: str) -> Path:
+        return self.run_dir(run_id) / "manual" / task_id
+
+    def take(self, run_id: str, task_id: str) -> Path:
+        """Check out a task's best code for a person to finish, at the integration HEAD.
+
+        The task is parked so `orch run` will not rebuild it meanwhile; its owned files hold
+        the latest candidate when one exists, else the frozen stubs.
+        """
+        with self.exclusive(run_id):
+            task = self.state.task(run_id, task_id)
+            if task.status in {"DONE", "REPLANNED"}:
+                raise PlanError(f"{task_id} is {task.status}; nothing to take over")
+            path = self.manual_path(run_id, task_id)
+            if path.exists():
+                return path
+            head = self.git(self.integration(run_id), "rev-parse", "HEAD")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self.git_lock:
+                self.git(self.repo, "worktree", "add", "--detach", str(path), head)
+            orch_verify.link_ignored(self.repo, path)
+            candidate = task.pending_candidate or task.failed_candidate
+            if candidate:
+                for name in task.files:
+                    try:
+                        content = Workspace.git(self.repo, "show", f"{candidate}:{name}",
+                                                strip=False)
+                    except subprocess.CalledProcessError:
+                        continue  # a file the candidate did not create
+                    (path / name).parent.mkdir(parents=True, exist_ok=True)
+                    (path / name).write_text(content)
+            if task.status != "PARKED":
+                self.state.transition(run_id, task_id, "PARKED", "task.parked",
+                                      {"reason": "taken over by a person"},
+                                      attempt=task.attempts, reason="taken over by a person")
+            self.state.record(run_id, "task.manual_taken",
+                              {"base": head, "candidate": candidate, "path": str(path)},
+                              task_id)
+            return path
+
+    def submit(self, run_id: str, task_id: str) -> tuple[bool, str]:
+        """Verify a person's edits with the task's frozen checks and merge them like any
+        candidate (the merge gate reruns every merged task's checks)."""
+        with self.exclusive(run_id):
+            run = self.state.run(run_id)
+            task = self.state.task(run_id, task_id)
+            path = self.manual_path(run_id, task_id)
+            taken = [e for e in self.state.events(run_id, task_id) if e.kind == "task.manual_taken"]
+            if not path.exists() or not taken:
+                return False, f"{task_id} is not taken over; run `orch take {task_id}` first"
+            base = str(taken[-1].data["base"])
+            excludes = orch_verify.excludes(path)
+            self.git(path, "add", "-A", "--", ".", *excludes)
+            changed = set(self.git(path, "diff", "--cached", "--name-only", base).splitlines())
+            outside = sorted(changed - set(task.files))
+            if outside:
+                self.git(path, "reset", "-q")
+                return False, (f"edits outside {task_id}'s files {sorted(task.files)}: {outside}"
+                               "; frozen tests and other tasks' files cannot change here")
+            if not changed:
+                return False, "no changes to submit"
+            context = RunContext.of(run, self.state.tasks(run_id))
+            inputs = (digest(dumps(context.dependency_contracts(task, run.base)))
+                      if task.interface_depends_on else "")
+            self.git(path, "commit", "-q", "-m", commit_message(
+                run.id, run.plan_hash, task, f"a{task.attempts}h", HUMAN.label,
+                title=f"orch {task.id}: finished by a person", inputs=inputs),
+                author=HUMAN.label)
+            commit = self.git(path, "rev-parse", "HEAD")
+            # The same states as any candidate, so the run log and live view stay complete.
+            for status, kind in (("READY", "task.manual_submit"), ("RUNNING", "task.started"),
+                                 ("VERIFYING", "task.verifying")):
+                self.state.transition(run_id, task_id, status, kind,
+                                      {"candidate": commit, "by": HUMAN.label},
+                                      attempt=task.attempts)
+
+            def back(reason: str) -> None:
+                self.state.transition(run_id, task_id, "PARKED", "task.parked",
+                                      {"reason": reason}, attempt=task.attempts, reason=reason)
+
+            passed, report = self.verify(path, self.scratch(run_id), commit, list(task.tests))
+            if not passed:
+                self.git(path, "reset", "-q", "--soft", "HEAD~1")
+                back("a person's edit fails the frozen checks")
+                return False, report
+            diff = self.git(path, "diff", base, commit)
+            self.state.transition(run_id, task_id, "MERGING", "task.merging",
+                                  {"candidate": commit}, attempt=task.attempts)
+            try:
+                self._merge(run, self.state.task(run_id, task_id),
+                            Candidate(commit, diff, "human", path), HUMAN)
+            except (AttemptFailed, Parked) as failure:
+                self.git(path, "reset", "-q", "--soft", "HEAD~1")
+                back("a person's edit fails the merge gate")
+                detail = failure.detail if isinstance(failure, AttemptFailed) else str(failure)
+                return False, f"merge gate: {detail[-3000:]}"
+            done = self.state.task(run_id, task_id).status == "DONE"
+            if not done:  # the merge must be redone on a moved integration branch
+                self.state.transition(run_id, task_id, "PARKED", "task.parked",
+                                      {"reason": "rebase needed"}, attempt=task.attempts,
+                                      reason="submit again: the integration branch moved")
+            if done:
+                with self.git_lock:
+                    self.git(self.repo, "worktree", "remove", "--force", str(path))
+            return done, ("merged; continue with `orch run`" if done else
+                          "the integration branch moved and the merge must be redone: submit "
+                          "again")
 
     def _failed(
         self, run_id: str, task_id: str, number: int, level: int, failure: AttemptFailed
@@ -4009,32 +3213,6 @@ _NORECURSE = re.compile(r"(^|/)(\.[^/]*|_darcs|build|CVS|dist|node_modules|venv|
                         r"\{arch\})/")
 
 
-def project_test_shards(tree_listing: str, shards: int) -> list[list[str]]:
-    """Size-balanced groups of the files pytest collects by default (`git ls-tree -r -l`).
-
-    Returns [] when the suite is too small to be worth splitting or `shards` < 2.
-    """
-    files: list[tuple[int, str]] = []
-    for line in tree_listing.splitlines():
-        meta, _, path = line.partition("\t")
-        parts = meta.split()
-        if len(parts) != 4 or parts[1] != "blob" or not parts[3].isdigit():
-            continue
-        name = PurePosixPath(path).name
-        if ((name.startswith("test_") or name.endswith("_test.py")) and name.endswith(".py")
-                and not _NORECURSE.search(path) and LiveWorkspace.safe_path(path)):
-            files.append((int(parts[3]), path))
-    if shards < 2 or len(files) < PROJECT_SHARD_MIN_FILES:
-        return []
-    groups: list[list[str]] = [[] for _ in range(shards)]
-    sizes = [0] * shards
-    for size, path in sorted(files, reverse=True):  # largest first, into the lightest group
-        index = sizes.index(min(sizes))
-        groups[index].append(path)
-        sizes[index] += size
-    return [sorted(group) for group in groups if group]
-
-
 def default_verify_jobs() -> int:
     return max(2, os.cpu_count() or 2)
 
@@ -4093,13 +3271,6 @@ class Candidate:
     lesson: str = ""
 
 
-def test_modules(test: str) -> list[str]:
-    """Module keys of a test id: a dotted Python `pkg.mod.Class.method`, or a declared
-    check's test files."""
-    check = orch_verify.parse(test)
-    return list(check.files) if check is not None else [test.rsplit(".", 2)[0]]
-
-
 @dataclass(frozen=True)
 class RunContext:
     """Inputs every attempt of a run derives from its (possibly revised) plan."""
@@ -4122,17 +3293,10 @@ class RunContext:
         files = plan_files(plan)
         checked = set(orch_verify.files_of(
             [test for task in tasks_from(plan) for test in task.tests]))
-
-        def is_test(path: str) -> bool:
-            return path in checked or LiveWorkspace.is_test_file(path)
-
         return cls(
             files=files,
-            stubs={p: c for p, c in files.items() if not is_test(p)
-                   and (p.endswith(".py") or plan.get("engine") == "generic")},
-            # Python tests are addressed by dotted module ids; declared checks by their files.
-            modules={(python_module(p) if p.endswith(".py") and p not in checked else p): p
-                     for p in files if is_test(p)},
+            stubs={p: c for p, c in files.items() if p not in checked},
+            modules={p: p for p in files if p in checked},
             requirements={
                 str(item["id"]): str(item["text"])
                 for item in cast(list[dict[str, str]], plan["requirements"])
@@ -4140,22 +3304,15 @@ class RunContext:
             tasks={task.id: task for task in tasks_from(plan)},
         )
 
-    def interfaces_for(self, task: OrchTask, index: RepoIndex) -> dict[str, str]:
-        """Frozen contracts for this task, declared dependencies and imported helpers."""
+    def interfaces_for(self, task: OrchTask) -> dict[str, str]:
+        """Frozen stubs of this task and of every task it builds on, whole."""
         graph = {tid: other.depends_on for tid, other in self.tasks.items()}
         graph[task.id] = task.depends_on  # includes dependencies discovered during execution
         paths = set(task.files)
         for tid in closure(graph, task.id):
             if tid in self.tasks:
                 paths.update(self.tasks[tid].files)
-        for path in tuple(paths):
-            paths.update(index.reach(path))
-        symbols: dict[str, set[str]] = {}
-        for path, symbol, _ in index.referenced(index.roots(task.files, task.tests)):
-            symbols.setdefault(path, set()).add(symbol.name)
-        return {path: (self.stubs[path] if path in task.files else
-                       excerpt(path, self.stubs[path], symbols.get(path, set())))
-                for path in sorted(paths) if path in self.stubs}
+        return {path: self.stubs[path] for path in sorted(paths) if path in self.stubs}
 
     def dependency_contracts(self, task: OrchTask, baseline: str) -> dict[str, object]:
         """Version the promises used to build early, independent of implementation commits.
@@ -4180,18 +3337,7 @@ class RunContext:
                               "requirements": requirements}
         return contracts
 
-    def tests_for(self, task: OrchTask, *, sliced: bool = False) -> dict[str, str]:
-        """Frozen test files that hold this task's tests."""
-        paths = {
-            self.modules[module]
-            for test in task.tests
-            for module in test_modules(test)
-            if module in self.modules
-        }
-        if not sliced:
-            return {path: self.files[path] for path in sorted(paths)}
-        return {path: (self.files[path] if not path.endswith(".py") else excerpt(
-            path, self.files[path], {
-                ".".join(test.rsplit(".", 2)[1:]) for test in task.tests
-                if path in {self.modules.get(m) for m in test_modules(test)}
-            })) for path in sorted(paths)}
+    def tests_for(self, task: OrchTask) -> dict[str, str]:
+        """Frozen test files that this task's checks run."""
+        return {path: self.files[path] for path in orch_verify.files_of(list(task.tests))
+                if path in self.files}

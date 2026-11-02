@@ -13,9 +13,9 @@ from orchestragent.orch_ladder import (
     subtree,
     thicken_prompt,
 )
-from orchestragent.orch_mutate import harden_prompt
-from orchestragent.orch_plan import plan_prompt, tasks_from
+from orchestragent.orch_plan import tasks_from
 from orchestragent.orch_state import OrchTask
+from orchestragent.orch_thin import boundary_prompt
 
 
 @pytest.mark.parametrize("shape,valid", [("helper", True), ("report", False),
@@ -72,21 +72,17 @@ def dag(math_plan: dict[str, object]) -> list[OrchTask]:
     return [*tasks, extra]
 
 
-@pytest.mark.parametrize("stage", ["plan", "replan", "harden"])
+@pytest.mark.parametrize("stage", ["plan", "replan"])
 def test_dynamic_feedback_preserves_context_boundary(
     math_plan: dict[str, object], dag: list[OrchTask], stage: str,
 ) -> None:
-    spec = "Original constraints must survive later planning and test strengthening."
+    spec = "Original constraints must survive later planning and replanning."
     if stage == "plan":
-        first = plan_prompt(spec, "index", [], hint="first")
-        second = plan_prompt(spec, "index", ["ERR_SENTINEL_42"], hint="second")
-    elif stage == "replan":
+        first = boundary_prompt(spec, "index", [])
+        second = boundary_prompt(spec, "index", ["ERR_SENTINEL_42"])
+    else:
         first = replan_prompt(math_plan, dag, [dag[0].id], 8, dag[0], "first", original_spec=spec)
         second = replan_prompt(math_plan, dag, [dag[1].id], 9, dag[1], "ERR_SENTINEL_42",
-                               original_spec=spec)
-    else:
-        first = harden_prompt(dag[0], {"R1": "add"}, {}, {}, [], original_spec=spec)
-        second = harden_prompt(dag[0], {"R1": "add"}, {}, {}, [{"reason": "ERR_SENTINEL_42"}],
                                original_spec=spec)
     assert isinstance(first, ContextPrompt) and isinstance(second, ContextPrompt)
     assert first.shared == second.shared

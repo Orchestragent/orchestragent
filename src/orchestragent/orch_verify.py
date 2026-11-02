@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -75,21 +76,36 @@ def files_of(test_ids: list[str]) -> list[str]:
 # --- the sandbox environment, discovered rather than tabulated -------------------------
 SYSTEM = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/dev", "/sys")
 PRIVATE = (".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".config", ".netrc",
-           ".password-store", ".claude", ".codex", ".gemini", ".git-credentials")
-# Common toolchain homes that are not on PATH themselves (rustup's toolchains, Go's module
-# cache, Maven/Gradle caches). Environment plumbing only: any language still works, and
-# ORCH_SANDBOX_READ adds more.
+           ".password-store", ".claude", ".codex", ".gemini", ".git-credentials",
+           ".local/share/keyrings", ".local/share/orch", ".local/state", "Library")
+# Common toolchain homes and installed-dependency stores that are not on PATH themselves
+# (rustup's toolchains, Go's module store, Maven's repository), mounted read-only.
+# Environment plumbing only: any language still works, and ORCH_SANDBOX_READ adds more.
+# Pure build caches (~/.cache/go-build, ~/.npm) are deliberately absent: tools write them,
+# and the sandbox home is a private, writable tmpfs where they are rebuilt.
+SHARED = (".local", "Library", ".config")  # prefixes with more than one tool's files
 TOOL_HOMES = (".rustup", ".cargo", "go", ".m2", ".gradle", ".nvm", ".bun", ".deno",
-              ".pyenv", ".local/share/uv", ".local/share/pnpm", ".npm", ".cache/go-build",
+              ".pyenv", ".local/share/uv", ".local/share/pnpm",
               ".dotnet", ".sdkman", ".ghcup", ".elan", ".opam", ".rbenv", ".gem")
 
 
 def _private(path: Path, home: Path) -> bool:
+    """The home itself, a credential or key store, or a directory that contains one."""
     try:
         relative = path.relative_to(home)
     except ValueError:
-        return False
-    return not relative.parts or relative.parts[0] in PRIVATE
+        return _holds_orch_data(path)
+    if not relative.parts:
+        return True
+    text = relative.as_posix()
+    return (any(text == p or text.startswith(p + "/") or p.startswith(text + "/")
+                for p in PRIVATE) or _holds_orch_data(path))
+
+
+def _holds_orch_data(path: Path) -> bool:
+    from orchestragent.platform import default_data_dir  # keys live in the data dir
+    data = default_data_dir().resolve()
+    return data == path or data.is_relative_to(path)
 
 
 def toolchain_roots(environ: dict[str, str] | None = None) -> tuple[Path, ...]:
@@ -112,9 +128,32 @@ def toolchain_roots(environ: dict[str, str] | None = None) -> tuple[Path, ...]:
             found.append(path)
 
     for entry in environ.get("PATH", "").split(os.pathsep):
-        if entry:
-            bin_dir = Path(entry)
-            add(bin_dir.parent if bin_dir.name in {"bin", "sbin"} else bin_dir)
+        if not entry:
+            continue
+        bin_dir = Path(entry)
+        # A bin's install tree is mounted (lib/, share/ of a toolchain), except for a
+        # shared prefix whose other contents are not a toolchain: ~/.local/bin mounts just
+        # itself, never ~/.local/share; ~/bin never mounts the home.
+        parent = bin_dir.parent
+        parent_ok = bin_dir.name in {"bin", "sbin"} and parent != home and not (
+            parent.is_relative_to(home) and parent.relative_to(home).as_posix() in SHARED)
+        add(parent if parent_ok else bin_dir)
+        # Tools linked into a system directory (CI runners link /usr/bin/go into
+        # /opt/hostedtoolcache/...): mount the install tree the link points into.
+        try:
+            links = [item for item in bin_dir.iterdir() if item.is_symlink()]
+        except OSError:
+            continue
+        for link in links:
+            try:
+                target = link.resolve()
+            except OSError:
+                continue
+            if target.parent.name in {"bin", "sbin"}:
+                prefix = target.parent.parent
+                shared = prefix == home or (prefix.is_relative_to(home) and
+                                            prefix.relative_to(home).as_posix() in SHARED)
+                add(target.parent if shared else prefix)
     for key, value in environ.items():
         if key.endswith(("_HOME", "_ROOT", "GOPATH", "GOMODCACHE")) and value.startswith("/"):
             add(Path(value))
@@ -126,8 +165,30 @@ def toolchain_roots(environ: dict[str, str] | None = None) -> tuple[Path, ...]:
     return tuple(found)
 
 
+def git_dir(execution: Path) -> Path | None:
+    """The repository's .git a worktree points to: mounted read-only so tools that read
+    version-control metadata (build stamping, `git describe`) work in the sandbox."""
+    marker = execution / ".git"
+    try:
+        text = marker.read_text() if marker.is_file() else ""
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    worktree_git = (execution / text.split(":", 1)[1].strip()).resolve()
+    common = worktree_git / "commondir"
+    try:
+        return (worktree_git / common.read_text().strip()).resolve() if common.is_file() \
+            else worktree_git
+    except OSError:
+        return None
+
+
 def toolchain(execution: Path) -> Toolchain:
     roots = list(toolchain_roots())
+    repo_git = git_dir(execution)
+    if repo_git is not None and repo_git.is_dir():
+        roots.append(repo_git)
     roots += [link.resolve() for link in _links(execution)]  # linked ignored directories
     host_path = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
     # The real HOME: mounted toolchain homes resolve as usual, anything else written under
@@ -137,6 +198,12 @@ def toolchain(execution: Path) -> Toolchain:
                    and value.startswith("/")}
     return Toolchain("any", read_only=tuple(roots), path=tuple(host_path),
                      env={**passthrough, "HOME": str(Path.home())})
+
+
+# Ignored directories that may hold credentials are never linked into a worktree: test
+# output reaches model prompts. Files (.env, keys) are never linked at all.
+SECRET_DIR = re.compile(r"(^|/)\.?(secrets?|credentials?|private|keys?|tokens?|certs?|"
+                        r"\.env[^/]*|\.aws|\.ssh|\.gnupg)(/|$)", re.IGNORECASE)
 
 
 def link_ignored(repo: Path, worktree: Path) -> None:
@@ -153,7 +220,9 @@ def link_ignored(repo: Path, worktree: Path) -> None:
         return
     for line in listed.splitlines():
         name = line.rstrip("/")
-        if not line.endswith("/") or not name or name.startswith((".git", ".orch", ".data")):
+        if (not name or not (repo / name).is_dir()  # directories, or links to one
+                or name.startswith((".git", ".orch", ".data"))
+                or SECRET_DIR.search(name) or _holds_orch_data((repo / name).resolve())):
             continue
         source, target = repo / name, worktree / name
         if source.is_dir() and not target.exists() and not target.is_symlink():
@@ -162,15 +231,29 @@ def link_ignored(repo: Path, worktree: Path) -> None:
 
 
 def excludes(worktree: Path) -> list[str]:
-    """`git add -A` pathspecs that keep scratch and linked directories out of a change."""
-    linked = sorted(str(p.relative_to(worktree)) for p in _links(worktree))
-    return [f":(exclude){SCRATCH}", *(f":(exclude){path}" for path in linked)]
+    """`git add -A` pathspecs that keep scratch and linked directories out of a change.
+
+    A link git already ignores needs no pathspec (and naming an ignored path makes
+    `git add` fail); one it would stage, e.g. under a `node_modules/` directory-only
+    pattern, is excluded explicitly."""
+    paths = [SCRATCH, *sorted(str(p.relative_to(worktree)) for p in _links(worktree))]
+    return [f":(exclude){path}" for path in paths if not _ignored(worktree, path)]
+
+
+def _ignored(worktree: Path, path: str) -> bool:
+    try:
+        return subprocess.run(["git", "-C", str(worktree), "check-ignore", "-q", path],
+                              capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _links(worktree: Path) -> list[Path]:
     found = []
     for path in worktree.rglob("*"):
-        if ".git" in path.parts or SCRATCH in path.parts:
+        # Relative parts: orch's own worktrees live under the project's .git/orch/.
+        inside = path.relative_to(worktree).parts
+        if ".git" in inside or SCRATCH in inside:
             continue
         if path.is_symlink() and path.resolve().is_dir() \
                 and not path.resolve().is_relative_to(worktree.resolve()):
@@ -180,6 +263,7 @@ def _links(worktree: Path) -> list[Path]:
 
 # --- running ---------------------------------------------------------------------------
 def run_command(execution: Path, command: str, timeout: float) -> orch_sandbox.Result:
+    execution = execution.resolve()  # TMPDIR and mounts must survive `cd` in the command
     scratch = execution / SCRATCH
     (scratch / "tmp").mkdir(parents=True, exist_ok=True)
     base = toolchain(execution)
@@ -229,33 +313,11 @@ def red(execution: Path, check: Check, timeout: float = MIN_TIMEOUT) -> tuple[bo
         return False, ("These tests pass against the stubs, so they prove nothing: test the "
                        "behaviour the requirements state.")
     if result.code in NOT_RUNNABLE:
-        return False, ("The verification command could not run (exit "
-                       f"{result.code}); output:\n{result.output[-3000:]}")
+        listing = sorted(p.name + ("/" if p.is_dir() else "") for p in execution.iterdir()
+                         if not p.name.startswith("."))[:40]
+        return False, (
+            f"The verification command could not run (exit {result.code}); output:\n"
+            f"{result.output[-3000:]}\nIt runs with /bin/sh -c from the repository root, "
+            f"whose entries are: {' '.join(listing)}. Change into the component's directory "
+            "first when its tools and dependencies live there (for example `cd <dir> && ...`).")
     return True, ""
-
-
-# --- which pipeline ------------------------------------------------------------------
-PYTHON_PROJECT = ("pyproject.toml", "setup.py", "setup.cfg")
-OTHER_BUILDS = ("package.json", "go.mod", "Cargo.toml", "pom.xml", "build.gradle",
-                "build.gradle.kts", "CMakeLists.txt", "Gemfile", "composer.json", "mix.exs",
-                "pubspec.yaml", "Package.swift", "deno.json")
-
-
-def engine(repo: Path, tracked: list[str] | None = None) -> str:
-    """"python" for a pure Python project (the tuned unittest/pytest pipeline), otherwise
-    "generic". Routing only: generic plans may use any language; ORCH_ENGINE overrides."""
-    forced = os.environ.get("ORCH_ENGINE", "").strip().lower()
-    if forced in {"python", "generic"}:
-        return forced
-    if tracked is None:
-        try:
-            tracked = subprocess.run(["git", "-C", str(repo), "ls-files"], capture_output=True,
-                                     text=True, timeout=60, check=True).stdout.splitlines()
-        except (OSError, subprocess.SubprocessError):
-            tracked = []
-    names = {Path(path).name for path in tracked}
-    other = names.intersection(OTHER_BUILDS) or any(
-        name.endswith((".csproj", ".sln")) for name in names)
-    python = any(path.endswith(".py") for path in tracked) or any(
-        (repo / marker).exists() for marker in PYTHON_PROJECT)
-    return "python" if python and not other else "generic"

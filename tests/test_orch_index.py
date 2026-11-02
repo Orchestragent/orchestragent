@@ -1,36 +1,27 @@
-import copy
-from dataclasses import replace
 from pathlib import Path
-from threading import Event
-from typing import Any, cast
 
 import pytest
 
 from orchestragent.native import NativeResult
-from orchestragent.orch_audit import audit
-from orchestragent.orch_build import common_failures, failed_in, signature
+from orchestragent.orch_build import common_failures, failed_tests, signature
 from orchestragent.orch_cli import main
-from orchestragent.orch_index import (
-    Index,
-    RepoIndex,
-    assertions,
-    dependency_code,
-    grammar,
-    index_file,
-)
-from orchestragent.orch_plan import lint
-from orchestragent.orch_run import AttemptFailed, Orchestrator, Signal, Waiting
+from orchestragent.orch_index import Index, RepoIndex, grammar, index_file
+from orchestragent.orch_run import Orchestrator
 from orchestragent.workspace import Workspace
 from tests.conftest import (
+    ADD_TEST,
+    ADD_TESTS,
     ADDER_STUB,
+    DOUBLE_TEST,
+    DOUBLE_TESTS,
     DOUBLER_STUB,
     GOOD_ADD,
     GOOD_DOUBLE,
-    MATH_TESTS,
     Clock,
     ScriptedCaller,
     edit_result,
     local_runner,
+    scripted,
 )
 
 needs_tree_sitter = pytest.mark.skipif(grammar("typescript") is None, reason="no tree-sitter")
@@ -160,10 +151,8 @@ def mathops() -> RepoIndex:
     return RepoIndex.from_sources({
         "adder.py": ADDER,
         "doubler.py": DOUBLER_STUB,
-        "test_adder.py": "import unittest\n\nfrom adder import add\n\n\nclass AddTest("
-                         "unittest.TestCase):\n    def test_r1_adds(self) -> None:\n"
-                         "        self.assertEqual(add(2, 3), 5)\n",
-        "test_mathops.py": MATH_TESTS,
+        "test_add.py": ADD_TESTS,
+        "test_double.py": DOUBLE_TESTS,
         "plugins.py": "import importlib\n\nimport adder\n\n\ndef load() -> object:\n"
                       "    return importlib.import_module('x')\n",
         "test_plugins.py": "import unittest\n\nimport plugins\n\n\nclass P(unittest.TestCase):"
@@ -171,51 +160,12 @@ def mathops() -> RepoIndex:
     })
 
 
-TESTS = ["test_adder.AddTest.test_r1_adds", "test_mathops.DoubleTest.test_r2_doubles",
-         "test_plugins.P.test_r3_loads"]
-
-
-@pytest.mark.parametrize(
-    ("changed", "expected"),
-    [
-        (["doubler.py"], TESTS[1:]),
-        (["adder.py"], TESTS),
-        (["notes.md"], TESTS),
-        (["other.py"], TESTS[2:]),
-    ],
-    ids=["unrelated-module-skipped", "shared-dependency", "non-python-change", "dynamic-import"],
-)
-def test_impact_analysis_selects_only_tests_that_can_observe_a_change(
-    mathops: RepoIndex, changed: list[str], expected: list[str]
+@pytest.mark.parametrize("changed", [["doubler.py"], ["adder.py"], ["notes.md"], ["web/a.ts"]])
+def test_merge_gates_always_rerun_declared_checks(
+    mathops: RepoIndex, changed: list[str],
 ) -> None:
-    assert mathops.affected(TESTS, changed) == expected
-
-
-def test_dependency_code_follows_imports_and_calls_but_skips_stubs(mathops: RepoIndex) -> None:
-    sources = {"adder.py": ADDER, "doubler.py": DOUBLER_STUB}
-    roots = mathops.roots(["doubler.py"], ["test_mathops.DoubleTest.test_r2_doubles"])
-    assert roots == [
-        ("doubler.py", ""),
-        ("test_mathops.py", "DoubleTest"),
-        ("test_mathops.py", "DoubleTest.test_r2_doubles"),
-    ]
-    add = 'def add(a: int, b: int) -> int:\n    """Return a + b."""\n    return a + b\n'
-    packed = dependency_code(mathops, lambda paths: sources, roots, {"doubler.py"}, 5000)
-    assert packed == {"adder.py::add": add}  # the stub's import; double itself is a stub
-    assert dependency_code(mathops, lambda paths: sources, roots, {"doubler.py"}, 20) == {}
-
-
-@pytest.mark.parametrize(("available", "missing"), [((), ["numpy"]), (("numpy",), [])])
-def test_missing_imports_name_third_party_packages_only(
-    available: tuple[str, ...], missing: list[str],
-) -> None:
-    index = RepoIndex.from_sources({
-        "pkg/mod.py": "import json\nimport numpy as np\nfrom . import sibling\nfrom pkg import x\n",
-        "pkg/sibling.py": "",
-        "ns/deep/leaf.py": "import ns.deep\n",
-    })
-    assert index.missing_imports("pkg/mod.py", available) == missing
-    assert index.missing_imports("ns/deep/leaf.py") == []
+    # A shell command can observe any file, so no declared check is ever skipped.
+    assert mathops.affected([ADD_TEST, DOUBLE_TEST], changed) == [ADD_TEST, DOUBLE_TEST]
 
 
 def test_import_roots_reuse_blob_parses_and_partition_revision_cache(
@@ -234,10 +184,9 @@ def test_import_roots_reuse_blob_parses_and_partition_revision_cache(
     count = index.parsed
     index.source_roots = (".", "src")
     rooted = index.at(revision)
-    assert rooted.missing_imports("consumer.py") == []
     assert rooted.deps["consumer.py"] == frozenset({"src/pkg/__init__.py"})
     assert rooted.deps["src/pkg/__init__.py"] == frozenset({"src/pkg/mod.py"})
-    assert original.missing_imports("consumer.py") == ["pkg"] and index.parsed == count
+    assert original.deps["consumer.py"] == frozenset() and index.parsed == count
     index.source_roots = (".",)
     assert index.at(revision) is original
 
@@ -257,16 +206,11 @@ def test_repo_map_keeps_the_most_used_files_when_over_budget(mathops: RepoIndex)
     )
 
 
-def test_assertions_are_counted_per_test_method() -> None:
-    source = MATH_TESTS + (
-        "\n\nclass More(unittest.TestCase):\n    def test_r1_many(self) -> None:\n"
-        "        assert add(1, 1) == 2\n        with self.assertRaises(TypeError):\n"
-        "            add('a', 1)\n        self.assertTrue(add(0, 0) == 0)\n"
-        "    def helper(self) -> None:\n        self.assertEqual(1, 1)\n"
-    )
-    assert assertions(source) == {
-        "AddTest.test_r1_adds": 1, "DoubleTest.test_r2_doubles": 1, "More.test_r1_many": 3,
-    }
+def test_repo_map_lists_files_without_a_parser_by_path(orch_repo: Path, tmp_path: Path) -> None:
+    revision = commit(orch_repo, {"db/schema.sql": "CREATE TABLE t (id INT);\n",
+                                  "adder.py": ADDER}, "mixed")
+    mapped = Index(orch_repo, tmp_path / "index.sqlite").at(revision).repo_map(100_000)
+    assert "db/schema.sql" in mapped and "README.md" in mapped and "def add" in mapped
 
 
 def commit(repo: Path, files: dict[str, str], message: str) -> str:
@@ -283,7 +227,8 @@ def test_index_parses_each_blob_once_and_persists_across_processes(
 ) -> None:
     first = commit(orch_repo, {"adder.py": ADDER, "doubler.py": DOUBLER_STUB}, "two")
     index = Index(orch_repo, tmp_path / "index.sqlite")
-    assert sorted(index.at(first).files) == ["adder.py", "doubler.py"] and index.parsed == 2
+    assert sorted(index.at(first).files) == ["README.md", "adder.py", "doubler.py"]
+    assert index.parsed == 2
     second = commit(orch_repo, {"doubler.py": DOUBLER_STUB.replace("raise NotImplementedError",
                                                                    "return add(a, a)")}, "impl")
     assert index.at(second).files["doubler.py"].refs == {"double": ["adder.add"],
@@ -294,7 +239,7 @@ def test_index_parses_each_blob_once_and_persists_across_processes(
     assert again.parsed == 0 and again.read(second, ["adder.py", "nope.py"]) == {
         "adder.py": ADDER
     }
-    assert index.snapshot(first, "r1/plan") == 2 and again.snapshots() == [(first, "r1/plan", 2)]
+    assert index.snapshot(first, "r1/plan") == 3 and again.snapshots() == [(first, "r1/plan", 3)]
 
 
 def test_cochange_graph_comes_from_git_history(orch_repo: Path, tmp_path: Path) -> None:
@@ -307,85 +252,60 @@ def test_cochange_graph_comes_from_git_history(orch_repo: Path, tmp_path: Path) 
     assert [(c.a, c.b, c.together, c.weight) for c in coupling] == [("a.py", "b.py", 3, 1.0)]
 
 
+FAILED_ADD = (f"FAIL (exit 1): {ADD_TEST}\n\n--- python3 -m unittest -q test_add\n"
+              '  File "/x/.git/orch/r1/work/T-001-a1-abcdef/adder.py", line 3, in add\n'
+              "TypeError: boom\n")
+
+
 @pytest.mark.parametrize(
     ("other", "same"),
     [
         ('  File "/x/.git/orch/r1/work/T-001-a2-ffffff/adder.py", line 9, in add', True),
         ('  File "/x/.git/orch/r1/work/T-001-a1-abcdef/adder.py", line 3, in sub', False),
-        ('  File "/usr/lib/python3.12/unittest/case.py", line 58, in testPartExecutor', True),
-        ('  File "/work/adder.py", line 4, in add', True),
     ],
-    ids=["moved-line-other-worktree", "other-function", "stdlib-frame-ignored", "bwrap-mount"],
+    ids=["moved-line-other-worktree", "other-function"],
 )
-def test_failure_signatures_use_symbols_not_lines_or_paths(other: str, same: bool) -> None:
-    report = ("ERROR: test_r1_adds (m.AddTest.test_r1_adds)\nTraceback:\n"
-              '  File "/x/.git/orch/r1/work/T-001-a1-abcdef/adder.py", line 3, in add\n'
-              "TypeError: boom\n")
-    lines = report.splitlines()
-    changed = "\n".join([*lines[:2], other if "adder.py" in other else lines[2], *lines[3:]])
-    if "unittest" in other:
-        changed = report.replace("Traceback:\n", f"Traceback:\n{other}\n")
-    assert (signature("test", report) == signature("test", changed)) is same
-
-
-SPLIT_TESTS = {
-    "test_adder.py": "import unittest\n\nfrom adder import add\n\n\nclass AddTest("
-                     "unittest.TestCase):\n    def test_r1_adds(self) -> None:\n"
-                     "        self.assertEqual(add(2, 3), 5)\n",
-    "test_doubler.py": "import unittest\n\nfrom doubler import double\n\n\nclass DoubleTest("
-                       "unittest.TestCase):\n    def test_r2_doubles(self) -> None:\n"
-                       "        self.assertEqual(double(4), 8)\n",
-}
-
-
-@pytest.fixture
-def split_plan(math_plan: dict[str, object]) -> dict[str, object]:
-    plan = copy.deepcopy(math_plan)
-    plan["files"] = [*cast(list[object], plan["files"])[:2],
-                     *({"path": p, "content": c} for p, c in SPLIT_TESTS.items())]
-    tasks = cast(list[dict[str, object]], plan["tasks"])
-    tasks[0]["tests"] = ["test_adder.AddTest.test_r1_adds"]
-    tasks[1]["tests"] = ["test_doubler.DoubleTest.test_r2_doubles"]
-    return plan
+def test_failure_signatures_ignore_worktree_paths_and_numbers(other: str, same: bool) -> None:
+    changed = FAILED_ADD.replace(FAILED_ADD.splitlines()[3], other)
+    assert (signature("test", FAILED_ADD) == signature("test", changed)) is same
 
 
 def orchestrate(
     repo: Path, plan: dict[str, object], answers: dict[str, list[NativeResult]]
 ) -> tuple[Orchestrator, ScriptedCaller]:
-    caller = ScriptedCaller({"plan": [NativeResult("ok", plan)], **answers})
+    caller = scripted(plan, answers)
     return Orchestrator(repo, caller, local_runner, notify=lambda line: None, clock=Clock()), caller
 
 
-def test_builder_sees_merged_dependency_code_and_gates_skip_unaffected_tests(
-    orch_repo: Path, split_plan: dict[str, object]
+def test_builder_sees_merged_dependency_code_and_gates_rerun_merged_checks(
+    orch_repo: Path, math_plan: dict[str, object], unsandboxed: None,
 ) -> None:
     orchestrator, caller = orchestrate(
-        orch_repo, split_plan, {"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]}
+        orch_repo, math_plan, {"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]}
     )
     run = orchestrator.execute(orchestrator.plan("spec").id, jobs=1)
-    prompt = next(text for _, key, text in caller.calls if key == "dsh:T-002")
+    prompt = [text for _, key, text in caller.calls if key == "dsh:T-002"][-1]
     gates = {e.task_id: e.data for e in orchestrator.state.events(run.id) if e.kind == "task.gate"}
     assert run.status == "done"
     # A building-on task reads its dependency's merged file whole (since dfdc631).
     context = prompt.split("REQUESTED READ-ONLY CONTEXT", 1)[1]
     assert "--- adder.py ---" in context and "return a + b" in context
-    assert gates == {"T-001": {"tests": 1, "skipped": 0}, "T-002": {"tests": 1, "skipped": 1}}
+    assert gates == {"T-001": {"tests": 1, "skipped": 0}, "T-002": {"tests": 2, "skipped": 0}}
 
 
-def test_final_gate_bisects_a_regression_the_impact_analysis_missed(
-    orch_repo: Path, split_plan: dict[str, object]
+def test_final_gate_bisects_a_regression_the_merge_gates_missed(
+    orch_repo: Path, math_plan: dict[str, object], unsandboxed: None,
 ) -> None:
     def runner(execution: Path, scratch: Path, revision: str, names: list[str] | None,
                *, timeout: float = 25.0) -> tuple[bool, str]:
         hidden = "HIDDEN" in (execution / "doubler.py").read_text()
-        if hidden and names and "test_adder.AddTest.test_r1_adds" in names:
-            return False, ("FAIL: test_r1_adds (test_adder.AddTest.test_r1_adds)\n"
-                           "Ran 1 test\n\nFAILED (failures=1)\n")
+        if hidden and execution.name.startswith("final") and names and ADD_TEST in names:
+            return False, f"FAIL (exit 1): {ADD_TEST}\n\n--- add\nAssertionError\n"
         return local_runner(execution, scratch, revision, names)
 
     sneaky = edit_result("doubler.py", "return add(a, a)  # HIDDEN coupling")
     orchestrator, _ = orchestrate(
-        orch_repo, split_plan, {"dsh:T-001": [GOOD_ADD], "dsh:T-002": [sneaky, GOOD_DOUBLE]}
+        orch_repo, math_plan, {"dsh:T-001": [GOOD_ADD], "dsh:T-002": [sneaky, GOOD_DOUBLE]}
     )
     orchestrator.runner = runner
     run = orchestrator.execute(orchestrator.plan("spec").id, jobs=1)
@@ -395,240 +315,65 @@ def test_final_gate_bisects_a_regression_the_impact_analysis_missed(
 
 
 def test_final_gate_parks_instead_of_blaming_when_tests_interfere(
-    orch_repo: Path, split_plan: dict[str, object]
+    orch_repo: Path, math_plan: dict[str, object], unsandboxed: None,
 ) -> None:
     def runner(execution: Path, scratch: Path, revision: str, names: list[str] | None,
                *, timeout: float = 25.0) -> tuple[bool, str]:
-        together = names and {"test_adder.AddTest.test_r1_adds",
-                              "test_doubler.DoubleTest.test_r2_doubles"} <= set(names)
-        if together:  # one test leaks state into the other only when both run
-            return False, ("FAIL: test_r1_adds (test_adder.AddTest.test_r1_adds)\n"
-                           "Ran 2 tests\n\nFAILED (failures=1)\n")
+        together = names and {ADD_TEST, DOUBLE_TEST} <= set(names)
+        if together and execution.name.startswith("final"):
+            # one check leaks state into the other only when both run at the end
+            return False, f"FAIL (exit 1): {ADD_TEST}\nPASS: {DOUBLE_TEST}\n"
         return local_runner(execution, scratch, revision, names)
 
     orchestrator, _ = orchestrate(
-        orch_repo, split_plan, {"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]}
+        orch_repo, math_plan, {"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]}
     )
     orchestrator.runner = runner
     run = orchestrator.execute(orchestrator.plan("spec").id, jobs=1)
     kinds = [e.kind for e in orchestrator.state.events(run.id)]
     assert (run.status, "run.regression" in kinds) == ("parked", False)
-    assert run.message.startswith(
-        "test_adder.AddTest.test_r1_adds fails only together with other tests"
-    )
+    assert run.message.startswith(f"{ADD_TEST} fails only together with other tests")
 
 
 @pytest.mark.parametrize(
-    ("report", "expected"),
+    ("report", "candidates", "expected"),
     [
-        ("FAIL: t (m.A.test_r1_x)\nERROR: u (m.A.test_r2_y)\nFAILED (failures=1, errors=1)\n",
-         ["m.A.test_r1_x", "m.A.test_r2_y"]),
-        ("ERROR: test_m (unittest.loader._FailedTest.test_m)\nFAILED (errors=1)\n",
-         ["pkg.test_m.A.test_r1_x", "pkg.test_m.A.test_r2_y"]),
-        ("ERROR: u (m.A.test_r2_y)\nFAILED (failures=3, errors=1)\n", None),
-        ("Ran 2 tests\n", None),
+        (f"FAIL (exit 1): {ADD_TEST}\nTIMEOUT: {DOUBLE_TEST}\n", None, [ADD_TEST, DOUBLE_TEST]),
+        (f"PASS: {ADD_TEST}\nFAIL (exit 2): {DOUBLE_TEST}\n", None, [DOUBLE_TEST]),
+        (f"FAIL (exit 1): {DOUBLE_TEST}\n", [ADD_TEST], []),
+        ("FAIL: test_r1_x (m.A.test_r1_x)\nFAILED (failures=1)\n", None, []),
+        (f"--- output\nFAIL (exit 1): {ADD_TEST} was mentioned\n", [ADD_TEST], []),
     ],
-    ids=["named", "import-error", "cut-tail", "no-summary"],
+    ids=["fail-and-timeout", "pass-ignored", "outside-candidates", "framework-output",
+         "not-a-report-line"],
 )
-def test_failures_are_attributed_only_from_complete_reports(
-    report: str, expected: list[str] | None
+def test_failures_are_attributed_only_from_check_report_lines(
+    report: str, candidates: list[str] | None, expected: list[str],
 ) -> None:
-    tests = ["m.A.test_r1_x", "m.A.test_r2_y", "pkg.test_m.A.test_r1_x", "pkg.test_m.A.test_r2_y"]
-    assert failed_in(report, tests) == expected
+    assert failed_tests(report, candidates) == expected
 
 
 @pytest.mark.parametrize("second,expected", [
-    ("FAIL: t (m.A.test_r1_x)\nFAILED (failures=1)\n", ["m.A.test_r1_x"]),
-    ("FAIL: t (m.A.test_r2_y)\nFAILED (failures=1)\n", []),
-    ("FAIL: t (m.A.test_r1_x)\nFAILED (failures=2)\n", []),
-    ("FAIL: t (m.A.test_r1_x)\n", []),
+    (f"FAIL (exit 1): {ADD_TEST}\nPASS: {DOUBLE_TEST}\n", [ADD_TEST]),
+    (f"PASS: {ADD_TEST}\nFAIL (exit 1): {DOUBLE_TEST}\n", []),
+    (f"PASS: {ADD_TEST}\nPASS: {DOUBLE_TEST}\n", []),
+    ("timed out after 25s", []),
 ])
-def test_candidate_agreement_requires_complete_shared_failure_evidence(
+def test_candidate_agreement_requires_shared_failure_evidence(
     second: str, expected: list[str],
 ) -> None:
-    first = "FAIL: t (m.A.test_r1_x)\nFAILED (failures=1)\n"
-    tests = ["m.A.test_r1_x", "m.A.test_r2_y"]
+    first = f"FAIL (exit 1): {ADD_TEST}\nPASS: {DOUBLE_TEST}\n"
+    tests = [ADD_TEST, DOUBLE_TEST]
     assert common_failures([first, second], tests) == expected
     assert common_failures([first], tests) == []
 
 
-def test_impact_analysis_follows_package_init_chains() -> None:
-    index = RepoIndex.from_sources({
-        "pkg/__init__.py": "from pkg.core import X\n",
-        "pkg/core.py": "X = 1\n",
-        "pkg/mod.py": "def f() -> int:\n    return 1\n",
-        "tests/test_m.py": "import unittest\n\nfrom pkg.mod import f\n",
-    })
-    tests = ["tests.test_m.T.test_r1_a"]
-    assert index.affected(tests, ["pkg/core.py"]) == tests  # via pkg/__init__.py
-    assert index.deps["pkg/mod.py"] == frozenset()  # task order ignores the __init__
-
-
-def test_imports_outside_the_sandbox_fail_the_attempt_with_a_clear_error(
-    orch_repo: Path, math_plan: dict[str, object]
-) -> None:
-    third_party = edit_result("adder.py", "import numpy\n    return a + b")
-    orchestrator, caller = orchestrate(
-        orch_repo, math_plan, {"dsh:T-001": [third_party, GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]}
-    )
-    run = orchestrator.execute(orchestrator.plan("spec").id)
-    failed = [e.data for e in orchestrator.state.events(run.id, "T-001") if e.kind == "task.failed"]
-    retry = next(text for _, key, text in caller.calls[2:] if key == "dsh:T-001")
-    assert (run.status, [f["category"] for f in failed]) == ("done", ["import"])
-    assert "adder.py imports numpy" in retry and "pinned environment" in retry
-
-
-@pytest.fixture
-def implicit_import_plan(math_plan: dict[str, object]) -> dict[str, object]:
-    plan = copy.deepcopy(math_plan)
-    stub = "def triple(a: int) -> int:\n    raise NotImplementedError\n"
-    files = cast(list[dict[str, str]], plan["files"])
-    files.append({"path": "tripler.py", "content": stub})
-    files[2]["content"] = MATH_TESTS.replace(
-        "from doubler import double\n", "from doubler import double\nfrom tripler import triple\n"
-    ) + (
-        "\n\nclass TripleTest(unittest.TestCase):\n    def test_r3_triples(self) -> None:\n"
-        "        self.assertEqual(triple(2), 6)\n"
-    )
-    cast(list[object], plan["requirements"]).append({"id": "R3", "text": "triple"})
-    cast(list[object], plan["tasks"]).append({
-        "id": "T-003", "goal": "triple", "reqs": ["R3"], "files": ["tripler.py"],
-        "depends_on": ["T-001"], "tests": ["test_mathops.TripleTest.test_r3_triples"],
-        "contract": "3a",
-    })
-    return plan
-
-
-@pytest.mark.parametrize("interrupted", [False, True])
-def test_dependency_handoff_reuses_code_without_model_communication_even_after_restart(
-    orch_repo: Path, implicit_import_plan: dict[str, object],
-    monkeypatch: pytest.MonkeyPatch, interrupted: bool,
-) -> None:
-    triple = edit_result("tripler.py", "from doubler import double\n    return double(a) + a")
-    # T-003 may generate while T-002 still verifies (generation and verification are
-    # separate pools); its immutable candidate waits for T-002, then replays without inference.
-    orchestrator, caller = orchestrate(
-        orch_repo, implicit_import_plan,
-        {"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE], "dsh:T-003": [triple]},
-    )
-    handed_off = Event()
-    check, wait_for = orchestrator._check, orchestrator._wait
-
-    def checked(*args: Any, **kwargs: Any) -> AttemptFailed | Signal | None:
-        if args[2].id == "T-002":
-            assert handed_off.wait(5), "dependency handoff deadlocked"
-        return check(*args, **kwargs)
-
-    def waiting(run_id: str, task_id: str, number: int, outcome: Waiting) -> None:
-        wait_for(run_id, task_id, number, outcome)
-        if interrupted:
-            orchestrator.cancel.set()
-        handed_off.set()
-
-    monkeypatch.setattr(orchestrator, "_check", checked)
-    monkeypatch.setattr(orchestrator, "_wait", waiting)
-    run = orchestrator.execute(orchestrator.plan("spec").id, jobs=2)
-    if interrupted:
-        assert run.status == "paused"
-        orchestrator = Orchestrator(orch_repo, caller, local_runner, notify=lambda _: None)
-        run = orchestrator.execute(run.id, jobs=2)
-    task = orchestrator.state.task(run.id, "T-003")
-    kinds = [e.kind for e in orchestrator.state.events(run.id, "T-003")]
-    assert (run.status, task.depends_on, task.level) == ("done", ["T-001", "T-002"], 0)
-    assert "task.failed" not in kinds and task.attempts == 1  # a wait costs no rung
-    assert handed_off.is_set() and "task.candidate_reused" in kinds
-    assert caller.keys().count("dsh:T-003") == 1 and len(caller.calls) == 4
-    assert audit(orchestrator, run.id, run_tests=False) == []
-
-
-@pytest.mark.parametrize("dependency_in_candidate", [False, True])
-def test_done_dependency_must_be_present_in_candidate_revision(
-    orch_repo: Path, implicit_import_plan: dict[str, object],
-    monkeypatch: pytest.MonkeyPatch, dependency_in_candidate: bool,
-) -> None:
-    orchestrator, _ = orchestrate(orch_repo, implicit_import_plan, {})
-    run = orchestrator.plan("snapshot race")
-    with orchestrator.worktree(run.id, "completed-dependency", run.checkpoint) as tree:
-        (tree / "doubler.py").write_text(DOUBLER_STUB.replace(
-            "raise NotImplementedError", "return a * 2"))
-        Workspace.git(tree, "commit", "-am", "completed sibling")
-        completed = Workspace.git(tree, "rev-parse", "HEAD")
-    base = completed if dependency_in_candidate else run.checkpoint
-    with orchestrator.worktree(run.id, "candidate", base) as tree:
-        (tree / "tripler.py").write_text(
-            "from doubler import double\ndef triple(a: int) -> int:\n    return double(a) + a\n")
-        Workspace.git(tree, "commit", "-am", "candidate imports sibling")
-        candidate = Workspace.git(tree, "rev-parse", "HEAD")
-    tasks, owners = orchestrator._owners(run.id)
-    tasks["T-002"] = replace(tasks["T-002"], status="DONE", commit=completed)
-    monkeypatch.setattr(orchestrator, "_owners", lambda _: (tasks, owners))
-    outcome = orchestrator._imports(run.id, tasks["T-003"], candidate, "")
-    assert (type(outcome).__name__ if outcome else "ready") == (
-        "ready" if dependency_in_candidate else "Waiting")
-
-
-@pytest.mark.parametrize(("reverse", "expected"), [(False, "Waiting"), (True, "AttemptFailed")])
-def test_importing_an_unbuilt_sibling_waits_unless_that_would_be_a_cycle(
-    orch_repo: Path, math_plan: dict[str, object], reverse: bool, expected: str
-) -> None:
-    plan = copy.deepcopy(math_plan)
-    cast(list[dict[str, str]], plan["files"]).append({"path": "extra.py", "content": "Y = 1\n"})
-    tasks = cast(list[dict[str, object]], plan["tasks"])
-    tasks[0]["files"] = ["adder.py", "extra.py"]  # T-001 may import doubler (T-002)
-    orchestrator, _ = orchestrate(orch_repo, plan, {})
-    run = orchestrator.plan("spec")
-    with orchestrator.worktree(run.id, "T-001-a1", run.checkpoint) as tree:
-        (tree / "extra.py").write_text("from doubler import double\n\nY = double(1)\n")
-        Workspace.git(tree, "commit", "-am", "imports a sibling")
-        commit = Workspace.git(tree, "rev-parse", "HEAD")
-    task = orchestrator.state.task(run.id, "T-001")
-    if not reverse:  # without T-002 -> T-001 the wait is safe
-        orchestrator.state.transition(run.id, "T-002", "PLANNED", "test.setup", {},
-                                      depends_on=[])
-    found = orchestrator._imports(run.id, task, commit, "")
-    assert type(found).__name__ == expected
-    assert found is not None and ("T-002" in found.detail)
-
-
-def test_lint_requires_a_dependency_for_every_imported_stub(math_plan: dict[str, object]) -> None:
-    cast(list[dict[str, object]], math_plan["tasks"])[1]["depends_on"] = []
-    assert lint(math_plan) == [
-        "T-002: doubler.py imports adder.py, owned by T-001; add T-001 to depends_on"
-    ]
-
-
-def test_test_corrections_may_not_delete_assertions(
-    orch_repo: Path, math_plan: dict[str, object]
-) -> None:
-    files = cast(list[dict[str, str]], math_plan["files"])
-    files[2]["content"] = MATH_TESTS.replace("3), 5", "3), 6")
-    weaken = NativeResult("ok", {
-        "verdict": "tests_wrong", "explanation": "drop it",
-        "edits": [{"path": "test_mathops.py", "search": "        self.assertEqual(add(2, 3), 6)\n",
-                   "replace": "        pass\n"}],
-    })
-    dispute = edit_result("adder.py", "", "TEST_DISPUTE")
-    stop = NativeResult("quota_exhausted", {}, message="stop here")
-    orchestrator, calls = orchestrate(
-        orch_repo, math_plan, {"dsh:T-001": [dispute, stop], "claude:T-001": [weaken]}
-    )
-    run = orchestrator.execute(orchestrator.plan("spec").id)
-    failed = [e.data for e in orchestrator.state.events(run.id, "T-001") if e.kind == "task.failed"]
-    task = orchestrator.state.task(run.id, "T-001")
-    assert (run.status, [f["category"] for f in failed]) == ("paused", ["dispute"])
-    assert task.last_error == (
-        "test correction removes assertions from ['test_mathops.py::AddTest.test_r1_adds']"
-    )
-    assert "3), 6" in Workspace.git(orch_repo, "show", f"{run.branch}:test_mathops.py")
-    assert task.pending_review == ""
-    assert calls.keys().count("claude:T-001") == 1
-
-
 def test_index_and_trace_commands_use_the_symbol_index(
-    orch_repo: Path, split_plan: dict[str, object], capsys: pytest.CaptureFixture[str]
+    orch_repo: Path, math_plan: dict[str, object], capsys: pytest.CaptureFixture[str],
+    unsandboxed: None,
 ) -> None:
     orchestrator, _ = orchestrate(
-        orch_repo, split_plan, {"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]}
+        orch_repo, math_plan, {"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]}
     )
     run = orchestrator.execute(orchestrator.plan("spec").id)
     capsys.readouterr()
@@ -642,8 +387,8 @@ def test_index_and_trace_commands_use_the_symbol_index(
         "adder.py:4  function def add(a: int, b: int) -> int",
         "  used by doubler.py::<module>",
         "  used by doubler.py::double",
-        "  used by test_adder.py::<module>",
-        "  used by test_adder.py::AddTest.test_r1_adds",
+        "  used by test_add.py::<module>",
+        "  used by test_add.py::AddTest.test_r1_adds",
     ]
     assert traced[0] == f"doubler.py:8 <- commit {task_commit}"
     assert traced[-3:] == [
@@ -651,3 +396,19 @@ def test_index_and_trace_commands_use_the_symbol_index(
         f"    {plan_commit}   2 line(s)  (not an orch task commit)",
         f"    {task_commit}   1 line(s)  T-002",
     ]
+
+
+def test_tree_sitter_indexing_survives_a_generated_go_test_file() -> None:
+    """tree-sitter 0.26.0 corrupted the heap on this model-written Go test file and orch died
+    with SIGSEGV (polyglot-ledger N9-N11); the pinned version must index it repeatedly."""
+    from dataclasses import asdict
+
+    from orchestragent.orch_index import grammar, index_file
+
+    if grammar("go") is None:
+        pytest.skip("tree-sitter Go grammar not installed")
+    source = (Path(__file__).parent / "data" / "generated_go_test.go.txt").read_bytes()
+    for _ in range(200):
+        found = index_file("api/ledger/parse_t001_test.go", source)
+        asdict(found)
+    assert found.backend == "tree-sitter" and found.symbols

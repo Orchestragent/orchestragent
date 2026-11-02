@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 
 from orchestragent.cursor import CursorClient
-from orchestragent.live import object_schema
 from orchestragent.native import NativeClients
+from orchestragent.serialization import object_schema
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = object_schema(

@@ -13,7 +13,7 @@ from orchestragent.orch_state import OrchState, Run
 from orchestragent.orch_usage import Call
 from orchestragent.serialization import dumps
 from orchestragent.store import Conflict
-from tests.conftest import GOOD_ADD, GOOD_DOUBLE, ScriptedCaller
+from tests.conftest import ADD_DESIGN, DOUBLE_DESIGN, GOOD_ADD, GOOD_DOUBLE, ScriptedCaller
 
 LESSON = "Check both operands before returning an arithmetic result."
 
@@ -292,7 +292,8 @@ def test_resume_keeps_the_planned_policy_and_new_runs_use_the_promoted_version(
     proposed = registry.snapshot(("r1",))
     caller.responses.update({
         "plan": [NativeResult("ok", copy.deepcopy(math_plan)) for _ in range(2)],
-        "dsh:T-001": [GOOD_ADD, GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE, GOOD_DOUBLE]})
+        "dsh:T-001": [ADD_DESIGN, GOOD_ADD, ADD_DESIGN, GOOD_ADD],
+        "dsh:T-002": [DOUBLE_DESIGN, GOOD_DOUBLE, DOUBLE_DESIGN, GOOD_DOUBLE]})
     first = orchestrator.plan("first spec")
     registry.promote(proposed.id, *evidence_reports(proposed))
     first = orchestrator.execute(first.id)

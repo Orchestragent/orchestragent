@@ -17,10 +17,9 @@ import importlib
 import json
 import re
 import sqlite3
-import sys
 import threading
 from collections import Counter, deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from functools import cache
@@ -227,19 +226,6 @@ def _uses(nodes: Iterable[ast.AST], names: dict[str, str]) -> list[str]:
     return sorted(found)
 
 
-def is_stub(node: ast.AST) -> bool:
-    """A body that only raises NotImplementedError (after an optional docstring)."""
-    body = getattr(node, "body", [])
-    if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
-            and isinstance(body[0].value.value, str)):
-        body = body[1:]
-    if len(body) != 1 or not isinstance(body[0], ast.Raise):
-        return False
-    error = body[0].exc
-    target = error.func if isinstance(error, ast.Call) else error
-    return (isinstance(target, ast.Name) and target.id == "NotImplementedError"
-            or isinstance(target, ast.Attribute) and target.attr == "NotImplementedError"
-            and isinstance(target.value, ast.Name) and target.value.id == "builtins")
 
 
 def _body_line(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> int:
@@ -393,7 +379,11 @@ def _tree_sitter(path: str, source: bytes, language: str) -> FileIndex | None:
     lang = grammar(language)
     if lang is None:
         return None
-    root = Parser(lang).parse(source).root_node
+    # tree-sitter is pinned below 0.26: 0.26.0 returned invalid field nodes for a generated
+    # Go test file and corrupted the heap (orch died with SIGSEGV, polyglot-ledger N9-N11).
+    parser = Parser(lang)
+    tree = parser.parse(source)
+    root = tree.root_node
     kinds = DEFINITIONS[language]
     symbols: list[Symbol] = []
     imports: list[str] = []
@@ -436,6 +426,7 @@ def _tree_sitter(path: str, source: bytes, language: str) -> FileIndex | None:
                 visit(child, qual, depth + 1)
 
     visit(root, "", 0)
+    del root, tree, parser  # nodes first, then the tree they point into
     return FileIndex(path, language, "tree-sitter", symbols, sorted(set(imports)), {}, False)
 
 
@@ -581,20 +572,6 @@ class RepoIndex:
                     found.add(hit)
         return found
 
-    def missing_imports(self, path: str, available: Iterable[str] = ()) -> list[str]:
-        """Python imports that are neither standard library nor in this revision."""
-        f = self.files.get(path)
-        if f is None or f.language != "python":
-            return []
-        missing = set()
-        installed = frozenset(available)
-        for name in f.imports:
-            top = name.split(".")[0]
-            if top in sys.stdlib_module_names or top == "__future__" or top in installed:
-                continue
-            if self.resolve(name) is None and top not in self.packages:
-                missing.add(top)
-        return sorted(missing)
 
     def reach(self, path: str) -> frozenset[str]:
         """Every file `path` imports, transitively, including itself."""
@@ -770,48 +747,14 @@ def _normalize(path: str) -> str:
     return "/".join(parts)
 
 
-def stub_only(source: str, symbol: Symbol) -> bool:
-    """True when a Python symbol's body is still the planner's NotImplementedError stub."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return False
-    for _, node, _ in definitions(tree):
-        if node.lineno == symbol.line:
-            return is_stub(node)
-    return False
 
 
 def segment(source: str, symbol: Symbol) -> str:
     return "".join(source.splitlines(keepends=True)[symbol.line - 1 : symbol.end])
 
 
-def assertions(source: str) -> dict[str, int]:
-    """Assertions per test method ('Class.method'): assert statements, self.assert*/fail*
-    calls and assertRaises-style context managers. A correction may not lower any."""
-    counts: dict[str, int] = {}
-    for qual, node, _ in definitions(ast.parse(source)):
-        if "." not in qual or not qual.rsplit(".", 1)[1].startswith("test"):
-            continue
-        count = 0
-        for inner in ast.walk(node):
-            if isinstance(inner, ast.Assert):
-                count += 1
-            elif isinstance(inner, ast.Call):
-                name = _dotted(inner.func) or ""
-                if re.fullmatch(r"self\.(assert\w*|fail\w*)", name):
-                    count += 1
-        counts[qual] = count
-    return counts
 
 
-def method_bodies(source: str) -> dict[str, str]:
-    """Normalized AST of every test method ('Class.method'), to tell whether one changed."""
-    return {
-        qual: ast.dump(node)
-        for qual, node, _ in definitions(ast.parse(source))
-        if "." in qual and qual.rsplit(".", 1)[1].startswith("test")
-    }
 
 
 # --- persistence: parse each blob once, snapshot each checkpoint ----------------------
@@ -914,7 +857,11 @@ class Index:
             key = revision, self.source_roots
             if key in self._revisions:
                 return self._revisions[key]
-        code = {path: blob for path, blob in self.tree(revision).items() if language_of(path)}
+        tree = self.tree(revision)
+        code = {path: blob for path, blob in tree.items() if language_of(path)}
+        # Files without a parser (any other language, configs, SQL, scripts) are still part
+        # of the map, listed by path, so planners see the whole project.
+        listed = {path: FileIndex(path, "", "none") for path in tree if path not in code}
         with self.lock:
             unknown = [(p, b) for p, b in code.items() if (p, b) not in self._files]
         if unknown:
@@ -933,7 +880,9 @@ class Index:
                 self._files.update(parsed)
                 self.parsed += len(parsed)
         with self.lock:
-            built = RepoIndex({p: self._files[(p, b)] for p, b in sorted(code.items())}, key[1])
+            built = RepoIndex({**listed, **{p: self._files[(p, b)] for p, b in code.items()}},
+                              key[1])
+            built.files = dict(sorted(built.files.items()))
             if len(self._revisions) > 16:
                 self._revisions.clear()
             self._revisions[key] = built
@@ -1007,31 +956,3 @@ class Index:
         return found
 
 
-def dependency_code(
-    index: RepoIndex, read: Callable[[list[str]], dict[str, str]],
-    roots: list[tuple[str, str]], exclude: set[str], budget: int,
-) -> dict[str, str]:
-    """Implemented code that `roots` call, packed along the call graph inside `budget`.
-
-    Keyed `path::symbol`; stubs, test files and `exclude` are skipped; nearest hops
-    first, then file position, so the same base always yields the same bytes.
-    """
-    wanted = [
-        (path, symbol) for path, symbol, _ in index.referenced(roots)
-        if path not in exclude and not PurePosixPath(path).name.startswith("test_")
-        and index.files[path].language == "python" and symbol.kind != "method"
-    ]
-    sources = read(sorted({path for path, _ in wanted}))
-    packed: dict[str, str] = {}
-    used = 0
-    for path, symbol in wanted:
-        source = sources.get(path, "")
-        if not source or stub_only(source, symbol):
-            continue
-        text = segment(source, symbol)
-        size = len(text.encode()) + len(path) + len(symbol.name) + 12
-        if used + size > budget:
-            continue
-        packed[f"{path}::{symbol.name}"] = text
-        used += size
-    return packed

@@ -6,10 +6,9 @@ import uuid
 from pathlib import Path
 
 from orchestragent.envelope import digest
-from orchestragent.live import object_schema
 from orchestragent.native import NativeClients
 from orchestragent.orch_usage import Call, Ledger, usage_fields
-from orchestragent.serialization import dumps
+from orchestragent.serialization import dumps, object_schema
 from orchestragent.store import Store
 from orchestragent.workspace import Workspace
 

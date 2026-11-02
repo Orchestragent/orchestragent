@@ -25,29 +25,23 @@ def test_check_ids_round_trip_and_report_failures() -> None:
 
 def test_sandbox_roots_never_include_home_or_private_dirs(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    for name in (".cargo/bin", ".ssh", ".config/gh", "go/pkg", "tools/bin"):
+    for name in (".cargo/bin", ".ssh", ".config/gh", "go/pkg", "tools/bin", "tools/lib",
+                 ".local/bin", ".local/share/keyrings", "bin"):
         (home / name).mkdir(parents=True)
     roots = orch_verify.toolchain_roots({
         "HOME": str(home),
-        "PATH": f"{home}/.cargo/bin:{home}/tools/bin:{home}/.ssh:/usr/bin",
+        "PATH": f"{home}/.cargo/bin:{home}/tools/bin:{home}/.local/bin:{home}/bin:"
+                f"{home}/.ssh:/usr/bin",
         "SECRET_HOME": str(home / ".config"),
         "ORCH_SANDBOX_READ": str(home),
     })
+    # a toolchain's whole install tree (its lib/ too: CI's Python lives under the home)
     assert home / ".cargo" in roots and home / "tools" in roots and home / "go" in roots
-    assert home not in roots
+    # a shared prefix mounts only its bin, and ~/bin never mounts the home
+    assert home / ".local/bin" in roots and home / ".local" not in roots
+    assert home / "bin" in roots and home not in roots
     assert not any(r.is_relative_to(home / ".ssh") or r.is_relative_to(home / ".config")
                    for r in roots)
-
-
-def test_engine_routes_pure_python_to_the_tuned_pipeline(tmp_path: Path,
-                                                         monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("ORCH_ENGINE")
-    assert orch_verify.engine(tmp_path, ["pkg/mod.py", "README.md"]) == "python"
-    assert orch_verify.engine(tmp_path, ["pkg/mod.py", "web/package.json"]) == "generic"
-    assert orch_verify.engine(tmp_path, ["main.go", "go.mod"]) == "generic"
-    assert orch_verify.engine(tmp_path, []) == "generic"  # a new project: any language
-    monkeypatch.setenv("ORCH_ENGINE", "generic")
-    assert orch_verify.engine(tmp_path, ["pkg/mod.py"]) == "generic"
 
 
 BOUNDARY: dict[str, object] = {
@@ -73,6 +67,18 @@ def test_boundary_accepts_any_language_and_checks_structure() -> None:
     assert "R2: accepted by both" in errors and "acyclic" in errors
     escaping = {**BOUNDARY, "files": [{"path": "../x.go", "content": "x"}]}
     assert any("safe relative" in e for e in orch_generic.boundary_errors(escaping, frozenset()))
+
+
+def test_planner_cases_reach_the_test_designer_only_as_worked_examples() -> None:
+    from orchestragent import orch_thin
+    tasks = cast(list[dict[str, object]], BOUNDARY["tasks"])
+    cased = {**BOUNDARY, "tasks": [{**tasks[0], "cases": ["Add(2, 3) == 5"]}, tasks[1]]}
+    assert orch_generic.boundary_errors(cased, frozenset()) == []
+    bad = {**BOUNDARY, "tasks": [{**tasks[0], "cases": "Add(2, 3) == 5"}, tasks[1]]}
+    assert any("cases must be a list" in e for e in orch_generic.boundary_errors(bad, frozenset()))
+    prompt = orch_thin.test_prompt("spec", cased, "", [], task_id="T-001")
+    assert "Add(2, 3) == 5" in prompt and orch_thin.CASES_USE in prompt
+    assert "`cases`" in orch_thin.boundary_prompt("spec", "", [])
 
 
 def test_shards_carry_their_command_and_assemble_into_check_ids() -> None:
@@ -152,3 +158,26 @@ def test_ignored_dependency_dirs_are_linked_and_never_staged(tmp_path: Path) -> 
     staged = subprocess.run([*git, "-C", str(tree), "diff", "--cached", "--name-only"],
                             capture_output=True, text=True, check=True).stdout.split()
     assert staged == ["web/index.ts"]
+
+
+@pytest.mark.parametrize("pattern", ["node_modules\n", "node_modules/\n"])
+def test_links_in_worktrees_under_git_are_found_and_never_staged(tmp_path: Path,
+                                                                 pattern: str) -> None:
+    """orch's worktrees live under <repo>/.git/orch/; linked dependency directories there
+    must still be mounted and kept out of commits, whatever the ignore pattern's style."""
+    tree = tmp_path / "repo" / ".git" / "orch" / "r1" / "work" / "task-1"
+    tree.mkdir(parents=True)
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(tree)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    (tree / ".gitignore").write_text(pattern)
+    (tree / "web").mkdir()
+    (tree / "web" / "app.ts").write_text("export {}\n")
+    (tree / "web" / "node_modules").symlink_to(tmp_path, target_is_directory=True)
+    (tree / orch_verify.SCRATCH).mkdir()
+    (tree / orch_verify.SCRATCH / "cache").write_text("x")
+    assert orch_verify._links(tree) == [tree / "web" / "node_modules"]
+    assert tmp_path.resolve() in orch_verify.toolchain(tree).read_only
+    subprocess.run([*git, "add", "-A", "--", ".", *orch_verify.excludes(tree)], check=True)
+    staged = subprocess.run([*git, "diff", "--cached", "--name-only"], capture_output=True,
+                            text=True, check=True).stdout.split()
+    assert staged == [".gitignore", "web/app.ts"]

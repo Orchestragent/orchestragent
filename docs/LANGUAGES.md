@@ -41,19 +41,12 @@ protect correctness and safety.
 None of these gates parses a language. Reports such as JUnit XML may still be shown to the
 models to help them, but a report never decides pass or fail.
 
-## Which pipeline runs
+## One pipeline
 
-- **Pure Python projects** keep the tuned unittest/pytest pipeline. It is benchmarked, and its
-  AST lints catch Python-specific test mistakes.
-- **Everything else** uses the generic pipeline above:
-  - a project with another build manifest anywhere (`package.json`, `go.mod`, `Cargo.toml`,
-    Maven/Gradle files, `*.csproj`, …);
-  - a Python project that also has such a manifest;
-  - a brand-new, empty project.
-- `ORCH_ENGINE=python|generic` overrides the choice.
-
-This is routing only. The generic pipeline is free to use Python too. Once it matches the
-Python pipeline on the Python benchmarks, the two converge.
+There is one pipeline, and it is language-agnostic. orch has no Python engine, no language
+table and no routing by project type: a Python project, a Go service, a TypeScript app and a
+repository mixing all three go through the same planning, test design, build and merge
+gates.
 
 ## Toolchains in the sandbox
 
@@ -71,13 +64,25 @@ Dependencies are never downloaded during a run. The project must already be inst
 able to run its tests offline: `npm ci`, `go mod download`, `cargo fetch`, a populated
 `.venv`, and so on.
 
+## What never enters the sandbox
+
+orch never mounts or links these into the sandbox:
+
+- the home directory itself, credential stores (`.ssh`, `.gnupg`, `.aws`, `.config`,
+  `~/Library`, keyrings) and agent logins;
+- orch's own data directory, where API keys live;
+- ignored directories whose names suggest secrets (`secrets/`, `credentials/`,
+  `.env*`, `keys/`, ...).
+
+Ignored files are never linked at all. Only ignored *directories* are linked (installed
+dependencies), and they are mounted read-only.
+
 ## Status (2026-11-02)
 
-- The generic pipeline runs end to end with scripted models on a mixed shell + Python
-  project: plan → red gate → build → green → merge.
-- The sandbox and checks were exercised by hand on vitest + tsc, go test, cargo test and
-  unittest, side by side in one repository.
-- Next:
-  - a project-level check declared by the planner (pre-existing tests as a baseline);
-  - integration checks across components;
-  - a real multi-language benchmark against a single Opus agent.
+- One language-agnostic pipeline. The Python-only machinery is removed: AST lints,
+  unittest/pytest runners, the pinned pytest environment, mutation testing, and the
+  routing by project type.
+- Verified end to end with scripted models on a shell + Python project, and with real models
+  (Opus 5.5 plans, DeepSeek V4.1 Flash designs and builds) on `polyglot-ledger`, a Go
+  service plus a TypeScript client graded by hidden Go, vitest and tsc checks.
+- Benchmarks are run with `scripts/orch_bench.py` (see `examples/orch-bench`).

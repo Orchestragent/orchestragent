@@ -9,7 +9,14 @@ from orchestragent.orch_rules import RULE_BYTES, Rule, arm, layer, lesson, verdi
 from orchestragent.orch_run import Orchestrator
 from orchestragent.orch_state import Run
 from orchestragent.workspace import Workspace
-from tests.conftest import BAD_ADD, GOOD_ADD, GOOD_DOUBLE, ScriptedCaller
+from tests.conftest import (
+    ADD_DESIGN,
+    BAD_ADD,
+    DOUBLE_DESIGN,
+    GOOD_ADD,
+    GOOD_DOUBLE,
+    ScriptedCaller,
+)
 
 LESSON = "Return the arithmetic result directly; never invert the requested operator."
 
@@ -84,14 +91,16 @@ def test_candidates_are_trialled_then_promoted_into_the_shared_prefix(
     orchestrator.state.add_rule(LESSON, "seed")
     caller.responses.update(
         {"plan": [NativeResult("ok", copy.deepcopy(math_plan))] * 2,
-         "dsh:T-001": [GOOD_ADD, GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE, GOOD_DOUBLE]}
+         "dsh:T-001": [ADD_DESIGN, GOOD_ADD, ADD_DESIGN, GOOD_ADD],
+         "dsh:T-002": [DOUBLE_DESIGN, GOOD_DOUBLE, DOUBLE_DESIGN, GOOD_DOUBLE]}
     )
     first = orchestrator.execute(orchestrator.plan("spec").id)
     trialled = orchestrator.state.rules()[0]
     shown = [arm("r1", task, 1) for task in ("T-001", "T-002")]
     assert first.status == "done"
     assert (trialled.with_total, trialled.without_total) == (sum(shown), 2 - sum(shown))
-    prompts = [prompt for _, key, prompt in caller.calls if key.startswith("dsh:")]
+    prompts = [prompt for _, key, prompt in caller.calls  # builders, not test designers
+               if key.startswith("dsh:") and "ASSIGNED TEST SHARD" not in prompt]
     assert ["EXTRA RULE (on trial)" in prompt for prompt in prompts] == shown
 
     orchestrator.state.save_rule(replace(trialled, with_passed=6, with_total=6,

@@ -5,14 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from orchestragent.live_workspace import LiveWorkspace
-from orchestragent.orch_cli import ROOT, doctor_lines, main, providers, report_text
+from orchestragent.orch_cli import CANARY, ROOT, doctor_lines, main, providers, report_text
 from orchestragent.orch_planning import PlanningSession, PlanningStore
 from orchestragent.orch_progress import snapshot
 from orchestragent.orch_run import Orchestrator
 from orchestragent.orch_state import Run
 from orchestragent.orch_usage import Call, summary
 from tests.conftest import (
+    ADD_CHECK,
     BAD_ADD,
     GOOD_ADD,
     GOOD_DOUBLE,
@@ -22,6 +22,7 @@ from tests.conftest import (
     ScriptedJev,
     local_runner,
     rung,
+    scripted,
 )
 
 READY: dict[str, object] = {
@@ -29,6 +30,14 @@ READY: dict[str, object] = {
     "dsh": {"credential_ready": True, "verified": True},
 }
 BUDGET: dict[str, object] = {"cap_cents": 10000, "spent_cents": 12, "reserved_cents": 300}
+
+
+def canary_passes(execution: Path, scratch: Path, revision: str, names: list[str] | None,
+                  *, timeout: float = 25.0) -> tuple[bool, str]:
+    """A sandbox whose canary passes (processes run, network closed): doctor's prerequisite
+    checks are tested here; the real sandbox is exercised by test_orch_verify."""
+    assert names == [CANARY.id] and (execution / "canary.sh").is_file()
+    return True, f"PASS: {CANARY.id}"
 
 
 def test_cli_stages_scheduling_candidate_without_provider_or_activation(
@@ -62,7 +71,9 @@ def test_progress_traces_waits_and_unknown_receipts_without_dispatch(
     assert observed["counts"] == {"generating": 1, "dependency_wait": 1}
     assert observed["remaining_chain"] == 2
     assert observed["tasks"][1]["generation_waits"] == ["T-001"]
-    assert observed["tasks"][0]["call_ids"] == [unfinished_call.id]
+    # the task's test-design receipt is listed too; the build receipt is unresolved
+    assert [c for c in observed["tasks"][0]["call_ids"] if "-test-design-" not in c] == [
+        unfinished_call.id]
     assert observed["unresolved_calls"] == [unfinished_call.id]
     assert observed["usage"]["totals"]["cache_hit_rate"] is None
     assert orchestrator.state.events(planned.id) == before
@@ -127,56 +138,6 @@ def test_reconcile_is_read_only_and_unknown_retry_is_explicit(
     assert code == 0 and orchestrator.state.task(planned.id, "T-001").status == "READY"
 
 
-@pytest.mark.parametrize("strategy", ["opus-dsf", "sonnet-dsf"])
-def test_bench_mock_and_report_never_construct_provider_clients(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
-    strategy: str,
-) -> None:
-    def forbidden(_: Path) -> None:
-        pytest.fail("Mock/report must not inspect credentials or create provider clients")
-
-    monkeypatch.setattr("orchestragent.orch_cli.providers", forbidden)
-    monkeypatch.setattr(LiveWorkspace, "run_unittests", staticmethod(local_runner))
-    suite = ROOT / "examples" / "orch-bench" / "suite.json"
-    output = tmp_path / "bench"
-    assert main(["bench", str(suite), "--output", str(output), "--json",
-                 "--strategy", strategy, "--max-calls", "30"]) == 0
-    result = json.loads(capsys.readouterr().out)
-    assert result["passed_trials"] == 2 and result["synthetic"] is True
-    assert result["config"]["strategy"] == strategy
-    if strategy == "sonnet-dsf":
-        calls = [call for trial in result["trials"] for call in trial["usage"]["calls"]]
-        assert all(call["model"] in {"claude-sonnet-5-5", "deepseek-flash"} for call in calls)
-        assert sum(call["purpose"] == "test-design" for call in calls) == 2
-    assert main(["bench", "--output", str(output), "--report", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out) == result
-    assert main(["bench", str(suite), "--output", str(output)]) == 1
-    assert "File exists" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("budget", ["nan", "inf", "-1"])
-def test_bench_rejects_an_invalid_optional_spend_stop(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], budget: str,
-) -> None:
-    output = tmp_path / "bench"
-    assert main(["bench", "missing.json", "--output", str(output),
-                 "--max-cny", budget]) == 1
-    assert "finite and not negative" in capsys.readouterr().err
-    assert not output.exists()
-
-
-@pytest.mark.parametrize("options", [["--context-mode", "scoped"],
-                                   ["--context-bytes", "100000"],
-                                   ["--baseline-attempts", "0"]])
-def test_bench_rejects_invalid_context_modes_before_providers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, options: list[str],
-) -> None:
-    monkeypatch.setattr("orchestragent.orch_cli.providers",
-                        lambda *_: pytest.fail("provider construction"))
-    assert main(["bench", "missing.json", "--output", str(tmp_path / "bad"),
-                 "--live", *options]) == 1
-
-
 def cli(repo: Path, capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, str]:
     code = main(["--repo", str(repo), *args])
     captured = capsys.readouterr()
@@ -206,7 +167,7 @@ def test_cli_progress_traces_pending_review_and_online_cost_includes_its_receipt
     code, output = cli(orch_repo, capsys, "progress", "--run", planned.id, "--json")
     task = json.loads(output)["tasks"][0]
     assert code == 0 and task["review"] == "frozen-review-id" and task["stage"] == stage
-    assert task["call_ids"] == [receipt.id]
+    assert [c for c in task["call_ids"] if "-test-design-" not in c] == [receipt.id]
     code, output = cli(orch_repo, capsys, "cost", "--run", planned.id,
                        "--scope", "online", "--json")
     observed = json.loads(output)["totals"]
@@ -245,7 +206,7 @@ def test_context_inspects_same_interface_selection_without_providers(
     result = json.loads(out)
     assert code == 0 and result["interface_files"] == expected
     assert result["revision"] == planned.verified_head
-    assert result["test_files"] == ["test_mathops.py"]
+    assert result["test_files"] == (["test_add.py"] if task_id == "T-001" else ["test_double.py"])
 
 
 def test_context_excerpts_and_cache_decisions_are_available_in_cli(
@@ -253,7 +214,7 @@ def test_context_excerpts_and_cache_decisions_are_available_in_cli(
 ) -> None:
     code, out = cli(orch_repo, capsys, "context", "T-001", "--show", "--json")
     context = json.loads(out)
-    assert code == 0 and "class DoubleTest" not in context["test_excerpts"]["test_mathops.py"]
+    assert code == 0 and "class DoubleTest" not in context["test_excerpts"]["test_add.py"]
     assert context["context_requests"] == 0 and context["requested_selectors"] == []
     code, out = cli(orch_repo, capsys, "cache", "--json")
     result = json.loads(out)
@@ -301,7 +262,7 @@ def test_why_links_requirement_to_tests_tasks_and_commits(
     _, out = cli(orch_repo, capsys, "why", "R1")
     assert out.splitlines() == [
         "R1: add two integers",
-        "  test test_mathops.AddTest.test_r1_adds",
+        f"  check T-001: {ADD_CHECK.command}",
         f"  task T-001 DONE {commit[:10]}  implement add",
     ]
 
@@ -328,14 +289,14 @@ def test_cost_groups_usage_by_model(
 ) -> None:
     _, out = cli(orch_repo, capsys, "cost", "--by", "model", "--json")
     result = json.loads(out)
-    assert result["totals"]["calls"] == 3  # includes the planner
+    assert result["totals"]["calls"] == 5  # includes the planner and two test designers
     dsf = result["groups"]["dsh/deepseek-flash"]
     assert dsf["known_tokens"]["output_tokens"] == 40
     assert dsf["reported_calls"]["cache_read_tokens"] == 0
     assert dsf["cache_hit_rate"] is None  # an omitted counter is not a zero hit
     assert dsf["costs"]["settled_cents"]["known_sum"] == 2
     # Task dependencies are dynamic; both tasks reuse the project prefix.
-    assert len({c["prefix_hash"] for c in result["calls"] if c["provider"] == "dsh"}) == 1
+    assert len({c["prefix_hash"] for c in result["calls"] if c["purpose"] == "build"}) == 1
 
 
 @pytest.mark.parametrize(
@@ -361,7 +322,7 @@ def test_status_without_runs_points_to_plan(
 
 
 def test_doctor_passes_when_every_prerequisite_holds(orch_repo: Path, tmp_path: Path) -> None:
-    ok, lines = doctor_lines(orch_repo, READY, BUDGET, local_runner, tmp_path / "doctor")
+    ok, lines = doctor_lines(orch_repo, READY, BUDGET, canary_passes, tmp_path / "doctor")
     assert ok and all(line.startswith("  ok ") for line in lines[1:-1])
     assert lines[-2] == ("  ok dsh spent ¥0.12 on this machine; no local cap "
                          "(an empty DeepSeek balance stops dispatch)")
@@ -381,7 +342,7 @@ def test_doctor_names_the_fix_for_each_missing_prerequisite(
     budget: dict[str, object],
     fix: str,
 ) -> None:
-    ok, lines = doctor_lines(orch_repo, providers, budget, local_runner, tmp_path / "doctor")
+    ok, lines = doctor_lines(orch_repo, providers, budget, canary_passes, tmp_path / "doctor")
     assert not ok
     assert [line for line in lines if line.startswith("  FIX")] == [
         line for line in lines if fix in line
@@ -413,7 +374,7 @@ def test_cost_by_rule_attributes_calls_to_the_rules_in_their_prompt(
     finished: Run, orch_repo: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _, out = cli(orch_repo, capsys, "cost", "--by", "rule", "--json")
-    assert json.loads(out)["groups"]["none"]["calls"] == 3
+    assert json.loads(out)["groups"]["none"]["calls"] == 5
 
 
 @pytest.mark.parametrize(("preset", "expected"), [(None, 900.0), ("30", 30.0), ("0", 900.0)])
@@ -431,20 +392,20 @@ def test_cli_clients_get_a_default_deadline_without_leaking_it(
 
 
 def test_doctor_reports_jev_as_optional(orch_repo: Path, tmp_path: Path) -> None:
-    ok, lines = doctor_lines(orch_repo, READY, BUDGET, local_runner, tmp_path / "doctor")
+    ok, lines = doctor_lines(orch_repo, READY, BUDGET, canary_passes, tmp_path / "doctor")
     ready = {**READY, "jev": {"ready": True}}
     assert ok and lines[-1].startswith("  opt jev (typesafe-ai/jev) not configured")
-    assert doctor_lines(orch_repo, ready, BUDGET, local_runner, tmp_path / "d")[1][-1] == (
+    assert doctor_lines(orch_repo, ready, BUDGET, canary_passes, tmp_path / "d")[1][-1] == (
         "  ok  jev (typesafe-ai/jev) ready for triage and pre-screen"
     )
 
 
 def test_jev_report_compares_decisions_with_the_rules(
-    orch_repo: Path, caller: ScriptedCaller, clock: Clock, capsys: pytest.CaptureFixture[str]
+    orch_repo: Path, math_plan: dict[str, object], clock: Clock,
+    capsys: pytest.CaptureFixture[str], unsandboxed: None,
 ) -> None:
-    caller.responses.update(
-        {"dsh:T-001": [BAD_ADD], "claude:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]}
-    )
+    caller = scripted(math_plan, {"dsh:T-001": [BAD_ADD], "claude:T-001": [GOOD_ADD],
+                                  "dsh:T-002": [GOOD_DOUBLE]})
     orchestrator = Orchestrator(
         orch_repo, caller, local_runner, notify=lambda line: None, clock=clock,
         decide=ScriptedJev(triage=[rung("claude_patch", 0.9)]), jev_mode="on",
@@ -488,7 +449,7 @@ def test_doctor_distinguishes_local_configuration_from_inference_evidence(
 ) -> None:
     status = {**READY, "dsh": {"credential_ready": True, "verified": verified,
                                "authentication": {"state": state}}}
-    ok, lines = doctor_lines(orch_repo, status, BUDGET, local_runner, tmp_path / "doctor")
+    ok, lines = doctor_lines(orch_repo, status, BUDGET, canary_passes, tmp_path / "doctor")
     assert ok is expected
     assert any(label in line for line in lines)
     if state == "unverified":
@@ -507,6 +468,6 @@ def test_doctor_first_inference_option_preserves_real_failures(
     status = {**READY, "dsh": {"credential_ready": True, "configured": configured,
                                "verified": False, "authentication": {"state": state}}}
     ok, lines = doctor_lines(orch_repo, status, {**BUDGET, "cap_cents": cap},
-                            local_runner, tmp_path / "doctor", allow_unverified_auth=True)
+                            canary_passes, tmp_path / "doctor", allow_unverified_auth=True)
     assert ok is expected
     assert not any("verified by actual inference" in line for line in lines)

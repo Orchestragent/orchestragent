@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import math
 import os
-import resource
 import shutil
 import signal
 import subprocess
@@ -122,31 +121,29 @@ def run(workdir: Path, argv: list[str], toolchain: Toolchain, *, timeout: float,
     workdir = workdir.resolve()
     env = _environment(workdir, toolchain)
     Path(env["TMPDIR"]).mkdir(exist_ok=True)
-    cpu, files = toolchain.cpu_seconds, toolchain.open_files
-
-    def limits() -> None:  # inherited by bwrap/sandbox-exec and every process below them
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (output_limit * 64, output_limit * 64))
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        wanted = files if hard == resource.RLIM_INFINITY else min(files, hard)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+    # Limits are set by the shell's own ulimit, then exec: orch runs sandboxes from many
+    # threads, and subprocess's preexec_fn (Python code between fork and exec) is unsafe
+    # there. They are inherited by bwrap/sandbox-exec and every process below them.
+    blocks = output_limit * 64 // 512  # ulimit -f counts 512-byte blocks
+    limits = (f"ulimit -t {toolchain.cpu_seconds}; ulimit -f {blocks}; "
+              f"ulimit -n {toolchain.open_files} 2>/dev/null; exec \"$@\"")
 
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as program:
         pass_fds: tuple[int, ...] = ()
         if is_macos():
             command = ["/usr/bin/sandbox-exec", "-p", mac_profile(workdir, toolchain), *argv]
         else:
-            program.write(seccomp_filter(processes=True))
+            program.write(seccomp_filter())
             program.flush()
             program.seek(0)
             fd = program.fileno()
             os.set_inheritable(fd, True)
             pass_fds = (fd,)
             command = linux_command(workdir, argv, toolchain, env, fd)
+        command = ["/bin/sh", "-c", limits, "orch-limits", *command]
         process = subprocess.Popen(
             command, cwd=workdir, env=env, stdin=subprocess.DEVNULL, stdout=output,
-            stderr=subprocess.STDOUT, pass_fds=pass_fds, start_new_session=True,
-            preexec_fn=limits)
+            stderr=subprocess.STDOUT, pass_fds=pass_fds, start_new_session=True)
         try:
             code, timed_out = process.wait(timeout=timeout), False
         except subprocess.TimeoutExpired:

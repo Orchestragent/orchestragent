@@ -13,36 +13,27 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 from typing import cast
 
+from orchestragent import orch_verify
 from orchestragent.access import Access
-from orchestragent.live_workspace import LiveWorkspace
 from orchestragent.native import NativeResult
 from orchestragent.orch_audit import audit
-from orchestragent.orch_baseline import baseline
-from orchestragent.orch_bench import Case, mock_caller, read_report, report_lines, run_suite
 from orchestragent.orch_build import parse_trailers
 from orchestragent.orch_desktop import CLIENTS as MCP_CLIENTS
-from orchestragent.orch_environment import PytestEnvironment
 from orchestragent.orch_index import Index, Symbol, backend
 from orchestragent.orch_ladder import RUNGS
-from orchestragent.orch_plan import REQ_TEST, plan_files, unittest_ids
 from orchestragent.orch_planning import PlanningStore
 from orchestragent.orch_policy import PolicyStore, Tuning
 from orchestragent.orch_progress import lines as progress_lines
 from orchestragent.orch_progress import snapshot as progress_snapshot
-from orchestragent.orch_rules import PROXY_RUNS
 from orchestragent.orch_run import (
-    CLAUDE_PLAN,
     DSF,
     JEV_MODES,
-    SONNET_PLAN,
-    Caller,
     Orchestrator,
     PlanError,
     RunContext,
@@ -53,13 +44,14 @@ from orchestragent.orch_state import IN_FLIGHT, OrchState, OrchTask, Run
 from orchestragent.orch_usage import lines as usage_lines
 from orchestragent.orch_usage import report as usage_report
 from orchestragent.orch_usage import unresolved
+from orchestragent.orch_verify import Check
 from orchestragent.orch_watch import Json, Source
 from orchestragent.orch_watch import export as watch_export
 from orchestragent.orch_watch_server import Settings as WatchSettings
 from orchestragent.orch_watch_server import is_loopback, new_token, serve
 from orchestragent.orch_watch_tui import choose, plain, tui
 from orchestragent.platform import default_data_dir, sandbox_name
-from orchestragent.providers import ProviderClients, dsf_transport
+from orchestragent.providers import ProviderClients
 from orchestragent.serialization import dumps
 from orchestragent.store import Conflict
 from orchestragent.workspace import Workspace
@@ -124,8 +116,6 @@ def status_lines(state: OrchState, run: Run, full: bool = True) -> list[str]:
         f"run {run.id}  {run.status}  branch {run.branch}  plan {run.plan_hash}",
         *([f"  {run.message}"] if run.message else []),
         *([f"  policy {run.policy_id}"] if run.policy_id else []),
-        *([f"  pytest environment {run.environment_fingerprint}"]
-          if run.environment_fingerprint else []),
     ]
     if not full and len(tasks) > SUMMARY_AT:
         lines += summary_lines(state, run, tasks)
@@ -137,16 +127,32 @@ def status_lines(state: OrchState, run: Run, full: bool = True) -> list[str]:
             else f"blocked by {', '.join(blocked)}" if blocked
             else task.commit[:10]
         )
-        score = f" mut={task.mutation:.2f}" if task.mutation >= 0 else ""
         lines.append(
-            f"  {task.id}  {task.status:<9} attempts={task.attempts} rung={task.level}{score}  "
+            f"  {task.id}  {task.status:<9} attempts={task.attempts} rung={task.level}  "
             f"{','.join(task.reqs):<8} {task.goal[:48]}  {note}".rstrip()
         )
     for task in tasks:
         if task.status == "PARKED":
-            lines += [f"PARKED {task.id}: {task.reason}", f"  signature {task.last_signature}"]
-            lines += [f"  | {line}" for line in task.last_error.strip().splitlines()[-6:]]
+            lines += [f"PARKED {task.id}: {task.reason}", f"  files {', '.join(task.files)}"]
+            lines += [f"  | {line}" for line in _failure_lines(task.last_error)]
+            if task.human_hint:
+                lines += [f"  hint {line.removeprefix('- ')}"
+                          for line in task.human_hint.splitlines()]
+            lines += ["  next: orch hint " + task.id + ' "<what the builder should know>"'
+                      "   (retries with your guidance)",
+                      f"        orch take {task.id}   (finish it yourself, then"
+                      f" orch submit {task.id})",
+                      f"        orch retry {task.id}  (fresh attempts, same inputs)"]
     return lines
+
+
+def _failure_lines(report: str, limit: int = 12) -> list[str]:
+    """The failing checks and the end of their output, without the audit trailer."""
+    keep = [line for line in report.strip().splitlines()
+            if line.strip() and "=" not in line.split(" ", 1)[0]]
+    heads = [line for line in keep if line.startswith(("FAIL", "TIMEOUT"))]
+    rest = [line for line in keep if line not in heads]
+    return [*(line[:160] for line in heads[:3]), *(line[:160] for line in rest[-(limit - 3):])]
 
 
 def why_lines(state: OrchState, run: Run, req: str) -> list[str]:
@@ -156,15 +162,12 @@ def why_lines(state: OrchState, run: Run, req: str) -> list[str]:
     }
     if req not in texts:
         raise KeyError(f"{req} is not a requirement of run {run.id}")
-    marker = req[1:]
-    tests = [
-        test
-        for path, source in sorted(plan_files(run.plan).items())
-        if path.endswith(".py")
-        for test in unittest_ids(path, source)
-        if (match := REQ_TEST.fullmatch(test.rsplit(".", 1)[1])) and match.group(1) == marker
+    tests = [  # the checks of the tasks that accept this requirement
+        f"{task.id}: {check.command}"
+        for task in state.tasks(run.id) if req in task.reqs
+        for test in task.tests if (check := orch_verify.parse(test)) is not None
     ]
-    lines = [f"{req}: {texts[req]}", *[f"  test {test}" for test in tests]]
+    lines = [f"{req}: {texts[req]}", *[f"  check {test}" for test in tests]]
     for task in state.tasks(run.id):
         if req in task.reqs:
             lines.append(f"  task {task.id} {task.status} {task.commit[:10]}  {task.goal[:60]}")
@@ -257,10 +260,14 @@ def index_lines(repo: Path, revision: str, query: str) -> list[str]:
     return [line for line in lines if line.strip()]
 
 
-CANARY = (
-    "import unittest\n\n\nclass CanaryTest(unittest.TestCase):\n"
-    "    def test_ok(self) -> None:\n        self.assertEqual(1 + 1, 2)\n"
-)
+CANARY = Check("sh canary.sh", ("canary.sh",))
+
+
+def canary_reason(report: str) -> str:
+    """The first line of a failed canary's own output, not the run's audit trailer."""
+    lines = [line.strip() for line in report.split("\n\n--- ", 1)[-1].splitlines()[1:]
+             if line.strip() and "=" not in line.split(" ", 1)[0]]
+    return (lines[0] if lines else report.strip().splitlines()[0])[:160]
 
 
 def doctor_lines(
@@ -282,11 +289,17 @@ def doctor_lines(
         checks.append((False, f"repo {repo}: not a git repository with a commit (git init)"))
     canary = scratch / "canary"
     canary.mkdir(parents=True, exist_ok=True)
-    (canary / "test_canary.py").write_text(CANARY)
+    # The canary passes only when processes run and the network is closed.
+    (canary / "canary.sh").write_text(
+        'echo ok | grep -q ok || exit 1\n'
+        'if command -v python3 >/dev/null; then python3 -c "import socket\n'
+        'try:\n socket.create_connection((\'1.1.1.1\', 80), 3)\nexcept OSError: raise '
+        'SystemExit(0)\nraise SystemExit(1)"; fi\n')
     try:
-        passed, report = runner(canary, scratch, "doctor", ["test_canary.CanaryTest.test_ok"])
+        passed, report = runner(canary, scratch, "doctor", [CANARY.id])
         checks.append((passed, f"sandbox {sandbox_name()}: " + (
-            "canary test passed" if passed else report.strip().splitlines()[-1][:120]
+            "canary passed (processes run, network closed)" if passed
+            else canary_reason(report)
         )))
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         checks.append((False, f"sandbox {sandbox_name()}: {error}"))
@@ -477,51 +490,13 @@ def no_model(*args: object, **kwargs: object) -> NativeResult:
     raise RuntimeError("this command does not call models")
 
 
-def proxy_lines(orchestrator: Orchestrator) -> list[str]:
-    """How well the planner proxy predicts real outcomes (the design's periodic check)."""
-    trusted, rho, runs = orchestrator.proxy_trust()
-    history = orchestrator.state.planning_history()
-    lines = [
-        f"planner proxy vs real outcome over {runs} run(s): "
-        + (f"rho {rho:+.2f}, " if rho is not None else f"needs {PROXY_RUNS} runs, ")
-        + ("trusted" if trusted else "untrusted: planner rules are judged on real outcomes")
-    ]
-    lines += [f"  {run} proxy {score:.2f}  blocked {blocked:.2f}"
-              for run, score, blocked in history]
-    return lines
 
 
-def mutation_lines(state: OrchState, run: Run) -> list[str]:
-    """Mutation scores of the latest measurement per task, weakest first."""
-    latest: dict[str, dict[str, object]] = {}
-    for event in state.events(run.id):
-        if event.kind == "task.mutation":
-            latest[event.task_id] = event.data
-    if not latest:
-        return []
-    total = sum(cast(int, data["total"]) for data in latest.values())
-    killed = sum(cast(int, data["killed"]) for data in latest.values())
-    lines = [f"mutation score {killed / total if total else 1:.2f} ({killed}/{total} mutants "
-             f"killed across {len(latest)} task(s))"]
-    weakest = sorted(latest.items(), key=lambda item: (cast(float, item[1]["score"]), item[0]))
-    for task_id, data in weakest:
-        survivors = cast(list[dict[str, object]], data["survivors"])
-        if not survivors:
-            continue
-        gaps = cast(list[str], data["gaps"])
-        lines.append(f"  {task_id} {cast(float, data['score']):.2f}: {'; '.join(gaps[:2])}")
-        lines += [f"    {s['path']}:{s['line']} {s['symbol']}: {s['before']} -> {s['after']}"
-                  for s in survivors[:3]]
-    if any(cast(list[object], data["survivors"]) for data in latest.values()):
-        lines.append(f"  add tests that kill the survivors: orch harden --run {run.id}")
-    return lines
 
 
 def report_text(state: OrchState, run: Run) -> str:
     lines = [*status_lines(state, run, full=False), "", *cost_lines(state, run, "task"),
              "", *cost_lines(state, run, "model")]
-    scores = mutation_lines(state, run)
-    lines += ["", *scores] if scores else []
     if run.status == "done":
         lines += ["", f"merge when satisfied: git merge {run.branch}"]
     return "\n".join(lines) + "\n"
@@ -535,35 +510,6 @@ def parser() -> argparse.ArgumentParser:
         default=default_data_dir(),
     )
     commands = root.add_subparsers(dest="command", required=True)
-    bench = commands.add_parser("bench", help="evaluate strategies with held-out acceptance tests")
-    bench.add_argument("suite", nargs="?", type=Path, help="versioned suite JSON")
-    bench.add_argument("--output", type=Path, required=True, help="new output directory")
-    bench.add_argument("--report", action="store_true", help="read saved results; no model calls")
-    bench.add_argument("--json", action="store_true")
-    bench.add_argument("--live", action="store_true", help="use configured providers; default Mock")
-    bench.add_argument("--max-calls", type=int, default=20,
-                       help="suite-wide model dispatch cap, including planning and repairs")
-    bench.add_argument("--max-cny", type=float, default=0,
-                       help="optional suite-wide spend stop in CNY (0 = off, the default)")
-    bench.add_argument("--jobs", type=int, default=2)
-    bench.add_argument("--repeats", type=int, default=1)
-    bench.add_argument("--strategy", choices=(
-        "opus-dsf", "sonnet-dsf", "single-opus", "single-sonnet", "single-dsf"),
-                       default="opus-dsf")
-    bench.add_argument("--baseline-attempts", type=int, default=2)
-    bench.add_argument("--context-mode", choices=("full", "scoped"), default="full")
-    bench.add_argument("--context-bytes", type=int, default=16000,
-                       help="scoped single-model request limit, including schema")
-    bench.add_argument("--policy", default="", help="frozen policy id (or current) from --repo")
-    bench.add_argument("--distributed", action="store_true")
-    solve = commands.add_parser("solve", help="DSF-first task with bounded on-demand context")
-    solve.add_argument("spec", type=Path)
-    solve.add_argument("--model", choices=("dsf", "sonnet", "opus"), default="dsf")
-    solve.add_argument("--live", action="store_true", help="call the explicitly selected provider")
-    solve.add_argument("--max-calls", type=int, default=2,
-                       help="total dispatches, including file requests and repairs (1-10)")
-    solve.add_argument("--context-bytes", type=int, default=16000)
-    solve.add_argument("--json", action="store_true")
     policy = commands.add_parser("policy", help="version, evaluate, promote and roll back policies")
     policy_commands = policy.add_subparsers(dest="policy_command", required=True)
     enable = policy_commands.add_parser("enable", help="freeze current active rules as baseline")
@@ -579,28 +525,8 @@ def parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--cache-mode", choices=("auto", "off"))
     suggest = policy_commands.add_parser("suggest", help="stage a scheduling hypothesis from a run")
     suggest.add_argument("run_id")
-    promote = policy_commands.add_parser("promote", help="gate complete paired held-out reports")
-    promote.add_argument("policy_id")
-    promote.add_argument("--baseline", type=Path, required=True)
-    promote.add_argument("--candidate", type=Path, required=True)
     rollback = policy_commands.add_parser("rollback", help="restore a previously accepted version")
     rollback.add_argument("policy_id")
-    environment = commands.add_parser("env", help="pin an installed curated pytest bundle")
-    env_commands = environment.add_subparsers(dest="env_command", required=True)
-    for env_action in ("create", "inspect"):
-        env_command = env_commands.add_parser(env_action)
-        env_command.add_argument("path", type=Path)
-        if env_action == "create":
-            env_command.add_argument("--package", action="append", default=[],
-                                     help="include an installed pure-Python distribution")
-            env_command.add_argument("--source-root", action="append", default=[],
-                                     help="add a repository import root, e.g. src (root is first)")
-    verify = commands.add_parser("verify", help="sandbox pytest against an isolated Git revision")
-    verify.add_argument("names", nargs="*", help="pytest nodeids; default all tests")
-    verify.add_argument("--revision", default="HEAD")
-    verify.add_argument("--environment", type=Path, required=True)
-    verify.add_argument("--timeout", type=float, default=25)
-    verify.add_argument("--json", action="store_true")
     doctor = commands.add_parser("doctor", help="check logins, DSF budget, sandbox and repository")
     doctor.add_argument("--allow-unverified-auth", action="store_true",
                         help="allow configured first inference; known auth rejection still fails")
@@ -610,36 +536,20 @@ def parser() -> argparse.ArgumentParser:
     keys.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)  # no longer asked
     keys.add_argument("--key-stdin", action="store_true",
                       help="read the key from stdin (unattended setup); never pass it as an arg")
-    plan = commands.add_parser("plan", help="Claude plans; lint gates; stubs+tests checkpoint")
+    plan = commands.add_parser(
+        "plan", help="the planner drafts tasks and stubs; test designers freeze checks")
     plan.add_argument("spec", type=Path, nargs="?")
     plan.add_argument("--resume", default="", metavar="RUN_ID",
                       help="resume pinned distributed planning without regenerating saved phases")
     plan.add_argument("--ack-unknown-call", action="append", default=[], metavar="CALL_ID",
                       help="allow possible repeat billing for this unresolved planning call")
     plan.add_argument("--base", default="HEAD")
-    plan.add_argument("--strategy", choices=("opus-dsf", "sonnet-dsf"))
-    plan.add_argument("--distributed", action=argparse.BooleanOptionalAction, default=True,
-                      help="scoped boundary planning plus independent parallel DSF test design "
-                           "(default; --no-distributed selects the single-draft planner)")
     plan.add_argument("--reviewed-boundary", action="store_true",
                       help="DSF drafts boundaries; the configured planner reviews semantics")
     plan.add_argument("--test-jobs", type=int,
                       help="test-design concurrency (1..16, frozen tuning or default 16)")
     plan.add_argument("--integration-checks", action=argparse.BooleanOptionalAction, default=None,
                       help="independent tests for multi-upstream terminal tasks (default: on)")
-    plan.add_argument("--environment", type=Path,
-                      help="pin pytest project baseline/final gates through resume")
-    plan.add_argument("--samples", type=int, default=1,
-                      help="parallel plan drafts (1-4); a deterministic score picks one")
-    plan.add_argument("--modules", action="store_true",
-                      help="large builds: module boundaries first, then parallel sub-plans")
-    evolve = commands.add_parser(
-        "evolve", help="replay past specs to judge a planner candidate rule (or --check)"
-    )
-    evolve.add_argument("rule_id", nargs="?", default="")
-    evolve.add_argument("--replays", type=int, default=3)
-    evolve.add_argument("--check", action="store_true",
-                        help="only compare the planner proxy with real run outcomes")
     for name in ("run", "resume"):
         command = commands.add_parser(name, help="execute (or continue) a run")
         command.add_argument("run_id", nargs="?", default="")
@@ -649,10 +559,6 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--jev", choices=("auto", *JEV_MODES), default="auto",
             help="Jev triage/pre-screen: auto = on when configured; shadow only records",
-        )
-        command.add_argument(
-            "--mutants", type=int, default=12,
-            help="AST mutants per merged task to score its tests at the end (0 = off)",
         )
         command.add_argument("--verify-jobs", type=int,
                              help="concurrent sandbox runs (frozen tuning or CPU count)")
@@ -665,13 +571,6 @@ def parser() -> argparse.ArgumentParser:
     audit_command = commands.add_parser("audit", help="check a run's invariants (and tests)")
     audit_command.add_argument("run_id", nargs="?", default="")
     audit_command.add_argument("--no-tests", action="store_true")
-    mutate = commands.add_parser("mutate", help="score merged tasks' tests with AST mutants")
-    harden = commands.add_parser("harden", help="Claude adds tests that kill surviving mutants")
-    for command in (mutate, harden):
-        command.add_argument("tasks", nargs="*", help="task ids (default: every merged task)")
-        command.add_argument("--run", default="")
-        command.add_argument("--cap", type=int, default=12, help="mutants per task")
-    mutate.add_argument("--jobs", type=int, default=4)
     status = commands.add_parser("status", help="tasks, states and PARKED evidence")
     status.add_argument("run_id", nargs="?", default="")
     status.add_argument("--all", action="store_true", help="one line per task even when wide")
@@ -723,6 +622,19 @@ def parser() -> argparse.ArgumentParser:
                        help="authorize retry despite unresolved possibly billable calls")
     retry.add_argument("--discard-candidate", action="store_true",
                        help="discard saved code and authorize fresh generation")
+    hint = commands.add_parser(
+        "hint", help="give a task guidance for its next attempts (a parked task retries)")
+    hint.add_argument("task")
+    hint.add_argument("text", help="what the builder should know, in plain words")
+    hint.add_argument("--run", default="")
+    take = commands.add_parser(
+        "take", help="finish a task yourself: check out its best code to edit")
+    take.add_argument("task")
+    take.add_argument("--run", default="")
+    submit = commands.add_parser(
+        "submit", help="verify your edits with the task's frozen checks and merge them")
+    submit.add_argument("task")
+    submit.add_argument("--run", default="")
     providers_cmd = commands.add_parser(
         "providers", help="bring-your-own-key providers (any OpenAI-compatible API)")
     providers_commands = providers_cmd.add_subparsers(dest="providers_command")
@@ -779,7 +691,37 @@ def parser() -> argparse.ArgumentParser:
     watch.add_argument("--token", default="", help="web: bearer token (generated if needed)")
     watch.add_argument("--export", type=Path, default=None,
                        help="write one self-contained HTML file that replays offline")
+    studio = commands.add_parser(
+        "studio", help="interactive workbench API for the Orch Studio app (docs/STUDIO.md)")
+    studio.add_argument("--bind", default="127.0.0.1", help="listen address (default loopback)")
+    studio.add_argument("--port", type=int, default=8790, help="port (0 = any free port)")
+    studio.add_argument("--token", default="", help="bearer token (generated by default)")
+    studio.add_argument("--machine", action="store_true",
+                        help="print one JSON line {url, token, pid, version, api}; "
+                             "exit when stdin closes")
+    studio.add_argument("--demo", action="store_true",
+                        help="serve a scripted in-memory project (no repository, no spend)")
     return root
+
+
+def studio_command(args: argparse.Namespace, repo: Path, data_dir: Path) -> int:
+    from orchestragent import orch_studio_server
+    if args.demo:
+        from orchestragent.orch_studio_demo import DemoBackend
+        backend: orch_studio_server.Backend = DemoBackend()
+    else:
+        from orchestragent.orch_studio import RepoBackend
+        backend = cast(orch_studio_server.Backend, RepoBackend(repo, data_dir))
+    return orch_studio_server.serve(backend, args.bind, args.port, token=args.token,
+                                    machine=args.machine, version=package_version())
+
+
+def package_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version("orchestragent")
+    except PackageNotFoundError:
+        return "dev"
 
 
 def watch_command(args: argparse.Namespace, repo: Path) -> int:
@@ -843,6 +785,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "watch":
             return watch_command(args, repo)
+        if args.command == "studio":
+            return studio_command(args, repo, data_dir)
         if args.command == "models":
             from orchestragent import orch_models
             if args.models_command == "set":
@@ -871,60 +815,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             from orchestragent.orch_mcp import serve
             return serve()
-        if args.command == "solve":
-            if not args.live:
-                raise ValueError("solve requires --live; no provider was called")
-            if not 1 <= args.max_calls <= 10 or not 2048 <= args.context_bytes <= 32768:
-                raise ValueError("solve needs 1-10 calls and 2048-32768 context bytes")
-            spec = cast(Path, args.spec).read_text()
-            if not spec.strip():
-                raise ValueError("solve needs a nonempty specification")
-            route = {"dsf": DSF, "sonnet": SONNET_PLAN, "opus": CLAUDE_PLAN}[args.model]
-            solver_clients = providers(data_dir)
-            try:
-                orchestrator = Orchestrator(
-                    repo, solver_clients.call, LiveWorkspace.run_unittests,
-                    notify=lambda message: print(message, file=sys.stderr),
-                )
-                run_id, revision, status = baseline(
-                    orchestrator, spec, attempts=args.max_calls, route=route,
-                    context_mode="scoped", context_bytes=args.context_bytes,
-                )
-            finally:
-                solver_clients.close()
-            result = {"run_id": run_id, "status": status, "revision": revision,
-                      "branch": f"orch/{run_id}/single", "model": route.model,
-                      "context_bytes": args.context_bytes,
-                      "usage": usage_report(orchestrator.state.usage.calls(run_id), "model")}
-            print(dumps(result) if args.json else
-                  f"{status}: {run_id}\nmodel: {route.model}\nrevision: {revision}\n"
-                  f"candidate branch: {result['branch']}\nusage: orch cost --run {run_id}")
-            return EXIT.get(status, 3)
-        if args.command == "env":
-            environment = (PytestEnvironment.create(
-                args.path, packages=tuple(args.package), source_roots=(".", *args.source_root))
-                           if args.env_command == "create"
-                           else PytestEnvironment.load(args.path))
-            print(dumps({**asdict(environment), "root": str(environment.root)}))
-            return 0
-        if args.command == "verify":
-            environment = PytestEnvironment.load(args.environment)
-            revision = Workspace.git(repo, "rev-parse", "--verify", "--end-of-options",
-                                     f"{args.revision}^{{commit}}")
-            with tempfile.TemporaryDirectory(prefix="orch-pytest-verify-") as directory:
-                tree, scratch = Path(directory) / "tree", Path(directory) / "scratch"
-                scratch.mkdir()
-                Workspace.git(repo, "worktree", "add", "--detach", str(tree), revision)
-                try:
-                    passed, detail = LiveWorkspace.run_pytest(
-                        tree, scratch, revision, args.names or None,
-                        environment=environment, timeout=args.timeout)
-                finally:
-                    Workspace.git(repo, "worktree", "remove", "--force", str(tree))
-            print(dumps({"passed": passed, "revision": revision,
-                         "environment": environment.fingerprint, "report": detail})
-                  if args.json else detail)
-            return 0 if passed else 3
         if args.command == "policy":
             registry = PolicyStore(state_of(repo))
             if args.policy_command == "enable":
@@ -942,9 +832,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(dumps(asdict(candidate)))
             elif args.policy_command == "suggest":
                 print(dumps(asdict(registry.suggest(args.run_id))))
-            elif args.policy_command == "promote":
-                print(dumps(asdict(registry.promote(args.policy_id, read_report(args.baseline),
-                                                  read_report(args.candidate)))))
             elif args.policy_command == "rollback":
                 print(dumps(asdict(registry.rollback(args.policy_id))))
             elif args.policy_command == "show":
@@ -954,66 +841,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(dumps({"active": asdict(active) if active else None,
                              "history": registry.history()}))
             return 0
-        if args.command == "bench":
-            output = cast(Path, args.output).resolve()
-            if args.report:
-                result = read_report(output)
-            else:
-                if args.suite is None:
-                    raise ValueError("bench requires a suite JSON (or --report)")
-                if not math.isfinite(args.max_cny) or args.max_cny < 0:
-                    raise ValueError("bench --max-cny must be finite and not negative")
-                if (not 1 <= args.baseline_attempts <= 10
-                        or not 2048 <= args.context_bytes <= 32768):
-                    raise ValueError("bench needs 1-10 baseline calls and 2048-32768 context bytes")
-                if args.context_mode == "scoped" and not args.strategy.startswith("single-"):
-                    raise ValueError("scoped context is supported only for single-model strategies")
-                if args.strategy.startswith("single-") and not args.live:
-                    raise ValueError(f"{args.strategy} requires --live; "
-                                     "use Mock for scheduler tests")
-                frozen = None
-                if args.policy:
-                    registry = PolicyStore(state_of(repo))
-                    frozen = (registry.current() if args.policy == "current"
-                              else registry.get(args.policy))
-                    if frozen is None:
-                        raise ValueError("No active policy; use policy enable first")
-                clients = providers(data_dir) if args.live else None
-                def caller_factory(case: Case) -> Caller:
-                    if clients is not None and frozen is not None:
-                        # Future candidates must not reuse an already observed validation spec,
-                        # including runs that fail before reaching promotion.
-                        registry.observe_spec(case.spec)
-                    return (clients.call if clients is not None else
-                            mock_caller(case, args.strategy, distributed=args.distributed))
-
-                try:
-                    result = run_suite(
-                        args.suite, output, caller_factory,
-                        LiveWorkspace.run_unittests, mode="real" if clients else "mock",
-                        max_calls=args.max_calls, jobs=args.jobs, repeats=args.repeats,
-                        max_cents=round(args.max_cny * 100),
-                        policy=frozen, strategy=args.strategy, distributed=args.distributed,
-                        baseline_attempts=args.baseline_attempts,
-                        context_mode=args.context_mode, context_bytes=args.context_bytes,
-                        provider_timeout=getattr(clients, "timeout", None),
-                        transport=(dsf_transport()
-                                   if clients is not None
-                                   and (not args.strategy.startswith("single-")
-                                        or args.strategy == "single-dsf")
-                                   else ""),
-                    )
-                except KeyboardInterrupt:
-                    result = read_report(output)
-                finally:
-                    if clients:
-                        clients.close()
-            print(dumps(result) if args.json else "\n".join(report_lines(result)))
-            if args.report:
-                return 0
-            if result["passed_trials"] == result["expected_trials"]:
-                return 0
-            return 4 if result["success_rate"] is None else 3
         if args.command == "providers":
             from orchestragent import byok
             if args.providers_command == "add":
@@ -1063,7 +890,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 ok, lines = doctor_lines(
                     repo, clients.status(), clients.access.status("dsh"),
-                    LiveWorkspace.run_unittests, data_dir / "orch-doctor",
+                    orch_verify.run, data_dir / "orch-doctor",
                     allow_unverified_auth=args.allow_unverified_auth,
                 )
             finally:
@@ -1077,42 +904,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise ValueError("Provide a spec file or --resume RUN_ID, exclusively")
                 if args.ack_unknown_call and not args.resume:
                     raise ValueError("--ack-unknown-call requires --resume")
-                if args.reviewed_boundary and not (args.distributed or args.resume):
-                    raise ValueError("--reviewed-boundary requires --distributed")
                 if args.resume:
                     pending = PlanningStore(state_of(repo).store).session(args.resume)
-                    if (args.strategy is not None and args.strategy != pending.strategy
-                            or args.base != "HEAD" or args.modules or args.samples != 1
+                    if (args.base != "HEAD"
                             or args.test_jobs is not None and args.test_jobs != pending.test_jobs
                             or args.reviewed_boundary and not pending.reviewed_boundary):
                         raise ValueError("Resume uses the pinned strategy, base and planning mode")
                     if (args.integration_checks is not None
                             and args.integration_checks != pending.integration_checks):
                         raise ValueError("Resume uses the pinned integration test policy")
-            project_environment = (PytestEnvironment.load(args.environment)
-                                   if args.command == "plan" and args.environment else None)
-            saved = None if args.command == "plan" else pick(state_of(repo), args.run_id)
-            strategy = (args.strategy or "opus-dsf") if saved is None else saved.strategy
-            if pending is not None:
-                strategy = pending.strategy
-            requested_jev = str(getattr(args, "jev", "off"))
-            if strategy == "sonnet-dsf" and requested_jev not in {"off", "auto"}:
-                raise ValueError("sonnet-dsf uses only Sonnet and DSF; Jev must be off")
             clients = providers(data_dir)
             mode = str(getattr(args, "jev", "off"))
-            if strategy == "sonnet-dsf":
-                mode = "off"
             ready = clients.jev.status()["ready"] is True
             if mode != "off" and not ready:
                 if mode != "auto":
                     print("orch: Jev is not configured; continuing without it", file=sys.stderr)
                 mode = "off"
             orchestrator = Orchestrator(
-                repo, clients.call, LiveWorkspace.run_unittests,
+                repo, clients.call, orch_verify.run,
                 decide=clients.jev.decide,
                 jev_mode="on" if mode == "auto" else mode,
-                environment=project_environment,
-                strategy=strategy,
             )
             try:
                 if args.command == "plan":
@@ -1121,8 +932,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                                        ack_unknown_calls=args.ack_unknown_call)
                     else:
                         run = orchestrator.plan(
-                            cast(Path, args.spec).read_text(), args.base, samples=args.samples,
-                            modules=args.modules, distributed=args.distributed,
+                            cast(Path, args.spec).read_text(), args.base,
                             test_jobs=args.test_jobs,
                             reviewed_boundary=args.reviewed_boundary,
                             integration_checks=(args.integration_checks
@@ -1131,7 +941,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else:
                     run = pick(orchestrator.state, args.run_id)
                     run = orchestrator.execute(
-                        run.id, args.jobs, max(0, args.mutants), args.verify_jobs,
+                        run.id, args.jobs, args.verify_jobs,
                         max(0.0, args.rpm), round(max(0.0, args.max_cny) * 100),
                         cache_mode=args.cache_mode,
                     )
@@ -1144,49 +954,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                 from orchestragent.orch_desktop import notify
                 notify(f"orch {run.id}: {run.status}", f"{repo.name} → branch {run.branch}")
             return EXIT.get(run.status, 0)
+        if args.command in {"take", "submit"}:
+            orchestrator = Orchestrator(repo, no_model, orch_verify.run)
+            run = pick(orchestrator.state, args.run)
+            task = orchestrator.state.task(run.id, args.task)
+            if args.command == "take":
+                path = orchestrator.take(run.id, task.id)
+                checks = [check.command for test in task.tests
+                          if (check := orch_verify.parse(test)) is not None]
+                print("\n".join([
+                    f"{task.id} is yours: {path}",
+                    f"edit only: {', '.join(task.files)}",
+                    *(f"check: cd {path} && {command}" for command in checks),
+                    f"then: orch submit {task.id}   (verifies, merges, unblocks dependents)",
+                    *([f"last failure:\n{task.last_error.strip()[-1500:]}"]
+                      if task.last_error else []),
+                ]))
+                return 0
+            merged, report = orchestrator.submit(run.id, task.id)
+            print(report if merged else f"not merged:\n{report.strip()[-4000:]}")
+            return 0 if merged else 1
         if args.command == "audit":
-            orchestrator = Orchestrator(repo, no_model, LiveWorkspace.run_unittests)
+            orchestrator = Orchestrator(repo, no_model, orch_verify.run)
             run = pick(orchestrator.state, args.run_id)
             with orchestrator.exclusive(run.id):
                 findings = audit(orchestrator, run.id, run_tests=not args.no_tests)
             print("\n".join([f"audit {run.id}: {len(findings)} finding(s)",
                              *(f"  {line}" for line in findings)]))
             return 0 if not findings else 1
-        if args.command == "evolve":
-            claude = None if args.check else providers(data_dir)
-            orchestrator = Orchestrator(
-                repo, claude.call if claude else no_model, LiveWorkspace.run_unittests
-            )
-            try:
-                lines = proxy_lines(orchestrator) if args.check else orchestrator.evolve(
-                    args.rule_id, max(1, args.replays)
-                )
-            finally:
-                if claude:
-                    claude.close()
-            print("\n".join(lines))
-            return 0
-        if args.command in {"mutate", "harden"}:
-            claude = providers(data_dir) if args.command == "harden" else None
-            orchestrator = Orchestrator(
-                repo, claude.call if claude else no_model, LiveWorkspace.run_unittests,
-            )
-            run = pick(orchestrator.state, args.run)
-            only = list(args.tasks) or None
-            try:
-                with orchestrator.exclusive(run.id):
-                    if args.command == "mutate":
-                        orchestrator.mutation(run.id, args.cap, only or [
-                            t.id for t in orchestrator.state.tasks(run.id) if t.status == "DONE"
-                        ], args.jobs)
-                        lines = mutation_lines(orchestrator.state, run) or ["no merged tasks"]
-                    else:
-                        lines = orchestrator.harden(run.id, only, args.cap)
-            finally:
-                if claude:
-                    claude.close()
-            print("\n".join(lines))
-            return 0
         state = state_of(repo)
         if args.command == "progress":
             observed = progress_snapshot(state, args.run)
@@ -1271,23 +1066,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "context":
             task = state.task(run.id, args.task)
             context = RunContext.of(run, state.tasks(run.id))
-            store = Index(repo, orch_home(repo) / "index.sqlite")
-            if run.environment_root or run.environment_fingerprint:
-                environment = PytestEnvironment.load(Path(run.environment_root))
-                if environment.fingerprint != run.environment_fingerprint:
-                    raise ValueError("Pinned environment fingerprint changed")
-                store.source_roots = environment.source_roots
-            index = store.at(run.verified_head)
             selected = {"owned_files": sorted(task.files),
-                        "interface_files": list(context.interfaces_for(task, index)),
+                        "interface_files": list(context.interfaces_for(task)),
                         "test_files": sorted(context.tests_for(task))}
             if args.json:
                 print(dumps({"run_id": run.id, "task_id": task.id,
                              "revision": run.verified_head, **selected,
                              "context_requests": task.context_requests,
                              "requested_selectors": task.context_selectors,
-                             **({"interface_excerpts": context.interfaces_for(task, index),
-                                 "test_excerpts": context.tests_for(task, sliced=True)}
+                             **({"interface_excerpts": context.interfaces_for(task),
+                                 "test_excerpts": context.tests_for(task)}
                                 if args.show else {})}))
             else:
                 print(f"run {run.id} task {task.id} at {run.verified_head}\n"
@@ -1296,8 +1084,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                       + f"\ncontext requests: {task.context_requests}/3\n"
                       + f"requested: {', '.join(task.context_selectors) or '(none)'}")
                 if args.show:
-                    print(dumps({"interfaces": context.interfaces_for(task, index),
-                                 "tests": context.tests_for(task, sliced=True)}))
+                    print(dumps({"interfaces": context.interfaces_for(task),
+                                 "tests": context.tests_for(task)}))
             return 0
         if args.command == "status":
             lines = status_lines(state, run, full=args.all)
@@ -1305,6 +1093,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             lines = why_lines(state, run, args.req)
         elif args.command == "jev":
             lines = jev_lines(state, run)
+        elif args.command == "hint":
+            task = state.hint(run.id, args.task, args.text)
+            lines = [f"{task.id} {task.status}; its next attempts follow your guidance",
+                     f"continue with `orch run {run.id}`"]
         elif args.command == "retry":
             task = state.retry(run.id, args.task, ack_unknown=args.ack_unknown,
                                discard_candidate=args.discard_candidate)

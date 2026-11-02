@@ -22,7 +22,9 @@ from orchestragent.orch_usage import (
     usage_fields,
 )
 from tests.conftest import (
+    ADD_DESIGN,
     BAD_ADD,
+    DOUBLE_DESIGN,
     GOOD_ADD,
     GOOD_DOUBLE,
     Clock,
@@ -164,13 +166,13 @@ def test_inflight_receipt_is_visible_before_result_and_remains_unknown(
 
 def test_retry_and_jev_receipts_link_to_events_without_double_counting(
     orch_repo: Path, caller: ScriptedCaller, clock: Clock, math_plan: dict[str, object],
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], unsandboxed: None,
 ) -> None:
     caller.responses = {
         "plan": [NativeResult("ok", math_plan, usage=USAGE)],
-        "dsh:T-001": [replace(BAD_ADD, usage=USAGE)],
+        "dsh:T-001": [replace(ADD_DESIGN, usage=USAGE), replace(BAD_ADD, usage=USAGE)],
         "claude:T-001": [replace(GOOD_ADD, usage=USAGE)],
-        "dsh:T-002": [replace(GOOD_DOUBLE, usage=USAGE)],
+        "dsh:T-002": [replace(DOUBLE_DESIGN, usage=USAGE), replace(GOOD_DOUBLE, usage=USAGE)],
     }
     jev_usage: dict[str, object] = {"input_tokens": 50, "output_tokens": 0, "cost_usd": 0.00001}
     jev = ScriptedJev(
@@ -182,18 +184,19 @@ def test_retry_and_jev_receipts_link_to_events_without_double_counting(
     run = orch.execute(orch.plan("spec").id)
     calls = orch.state.usage_calls(run.id)
     events = [e for e in orch.state.events(run.id) if e.kind in {"attempt.result", "jev.call"}]
-    assert run.status == "done" and len(calls) == 6
-    assert {e.data["call_id"] for e in events} == {c.id for c in calls if c.task_id}
-    assert cast(dict[str, int], summary(calls)["known_tokens"])["total_tokens"] == 980
+    assert run.status == "done" and len(calls) == 8  # planner, 2 designers, 3 builds, 2 Jev
+    assert {e.data["call_id"] for e in events} == {
+        c.id for c in calls if c.task_id and c.scope == "execution"}
+    assert cast(dict[str, int], summary(calls)["known_tokens"])["total_tokens"] == 1420
     assert all(not c.legacy for c in calls)
     task_calls = [c for c in calls if c.task_id == "T-001"]
-    assert {c.purpose for c in task_calls} == {"build", "triage", "patch"}
+    assert {c.purpose for c in task_calls} == {"test-design", "build", "triage", "patch"}
     assert {c.attempt for c in task_calls} == {1, 2}
     capsys.readouterr()
     assert main(["--repo", str(orch_repo), "cost", "--task", "T-001", "--json"]) == 0
     filtered = json.loads(capsys.readouterr().out)
-    assert filtered["totals"]["known_tokens"]["total_tokens"] == 490
-    assert len(filtered["calls"]) == 3
+    assert filtered["totals"]["known_tokens"]["total_tokens"] == 710
+    assert len(filtered["calls"]) == 4
     assert main(["--repo", str(orch_repo), "cost", "--call", task_calls[0].id, "--json"]) == 0
     exact = json.loads(capsys.readouterr().out)
     assert [c["id"] for c in exact["calls"]] == [task_calls[0].id]

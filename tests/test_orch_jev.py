@@ -16,7 +16,13 @@ from tests.conftest import (
     cheat,
     local_runner,
     rung,
+    scripted,
 )
+
+
+@pytest.fixture(autouse=True)
+def local_red(unsandboxed: None) -> None:
+    """Every test here plans: the red gate runs without the OS sandbox."""
 
 
 def run_with(
@@ -45,18 +51,17 @@ def events(orchestrator: Orchestrator, kind: str) -> list[OrchEvent]:
     ids=["applied", "shadow-records-only", "low-confidence-falls-back"],
 )
 def test_jev_triage_picks_the_next_rung_only_when_confident_and_on(
-    orch_repo: Path, caller: ScriptedCaller, clock: Clock,
+    orch_repo: Path, math_plan: dict[str, object], clock: Clock,
     mode: str, answer: Decision, routes: list[str], applied: bool,
 ) -> None:
-    caller.responses.update(
-        {"dsh:T-001": [BAD_ADD, GOOD_ADD], "claude:T-001": [GOOD_ADD],
-         "dsh:T-002": [GOOD_DOUBLE]}
-    )
+    caller = scripted(math_plan, {"dsh:T-001": [BAD_ADD, GOOD_ADD],
+                                  "claude:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
     jev = ScriptedJev(triage=[answer])
     orchestrator = run_with(orch_repo, caller, jev, mode, clock)
     [triage] = events(orchestrator, "jev.triage")
     assert orchestrator.state.latest().status == "done"
-    assert [key.split(":")[0] for key in caller.keys()[1:]] == routes
+    # after the planner and the two test designers
+    assert [key.split(":")[0] for key in caller.keys()[3:]] == routes
     assert (triage.data["deterministic"], triage.data["applied"]) == (1, applied)
     assert set(cast(dict[str, object], jev.states[0])) == {
         "goal", "contract", "failure", "error", "diff"
@@ -64,9 +69,9 @@ def test_jev_triage_picks_the_next_rung_only_when_confident_and_on(
 
 
 def test_pre_screen_rejects_a_diff_flagged_as_special_casing(
-    orch_repo: Path, caller: ScriptedCaller, clock: Clock
+    orch_repo: Path, math_plan: dict[str, object], clock: Clock
 ) -> None:
-    caller.responses.update({"dsh:T-001": [GOOD_ADD, GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
+    caller = scripted(math_plan, {"dsh:T-001": [GOOD_ADD, GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
     jev = ScriptedJev(triage=[rung("retry", 0.3)], screen=[cheat(0.95)])
     orchestrator = run_with(orch_repo, caller, jev, "on", clock)
     failed = [e.data["category"] for e in events(orchestrator, "task.failed")]
@@ -76,9 +81,9 @@ def test_pre_screen_rejects_a_diff_flagged_as_special_casing(
 
 
 def test_unavailable_jev_switches_itself_off_and_the_rules_continue(
-    orch_repo: Path, caller: ScriptedCaller, clock: Clock
+    orch_repo: Path, math_plan: dict[str, object], clock: Clock
 ) -> None:
-    caller.responses.update({"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
+    caller = scripted(math_plan, {"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
     jev = ScriptedJev(screen=[Decision("quota_exhausted", message="budget")])
     orchestrator = run_with(orch_repo, caller, jev, "on", clock)
     calls = [e.data["outcome"] for e in events(orchestrator, "jev.call")]

@@ -1,4 +1,3 @@
-import ast
 import copy
 from collections.abc import Callable
 from pathlib import Path
@@ -6,7 +5,7 @@ from typing import cast
 
 import pytest
 
-from orchestragent.codeindex import signatures
+from orchestragent import orch_generic
 from orchestragent.orch_build import (
     BUILDER_INSTRUCTIONS,
     MAX_FILE_BYTES,
@@ -16,29 +15,20 @@ from orchestragent.orch_build import (
     commit_message,
     context_pack,
     contract_hash,
-    diagnose_failure,
-    implementation_errors,
-    interface_errors,
     parse_trailers,
     render_files,
     signature,
     substitute,
 )
-from orchestragent.orch_excerpt import excerpt
-from orchestragent.orch_index import RepoIndex, is_stub
-from orchestragent.orch_plan import (
-    chain_depths,
-    lint,
-    tasks_from,
-    unittest_ids,
-    unittest_shape_errors,
-)
+from orchestragent.orch_index import RepoIndex
+from orchestragent.orch_plan import chain_depths, dependency_errors, tasks_from
 from orchestragent.orch_run import RunContext
 from orchestragent.orch_state import OrchTask
-from tests.conftest import ADDER_STUB, MATH_TESTS
+from tests.conftest import ADD_TEST, ADD_TESTS, ADDER_STUB, DOUBLE_TEST, DOUBLE_TESTS
 
 Plan = dict[str, object]
 ContextArgs = tuple[OrchTask, dict[str, str], str, dict[str, str], dict[str, str], dict[str, str]]
+ADD_VIEW = "def add(a: int, b: int) -> int:\n    return a - b + helper()\n"
 
 
 @pytest.mark.parametrize("graph", [{"A": ["missing"]}, {"A": ["B"], "B": ["A"]}])
@@ -54,55 +44,6 @@ def test_deep_dependency_chains_do_not_need_recursive_graph_walks() -> None:
     assert (depths["0"], depths["1499"], depths["independent"]) == (1500, 1, 1)
 
 
-@pytest.mark.parametrize(("body", "stub"), [
-    ("raise NotImplementedError", True),
-    ('"doc"\n    raise builtins.NotImplementedError("todo")', True),
-    ('raise ValueError("NotImplementedError is not supported")', False),
-    ('raise CustomNotImplementedError', False),
-    ('return NotImplemented', False),
-])
-def test_stub_recognition_uses_exception_ast_not_substrings(body: str, stub: bool) -> None:
-    assert is_stub(ast.parse(f"def f():\n    {body}\n").body[0]) == stub
-
-
-@pytest.mark.parametrize(("before", "current", "required", "problem"), [
-    (ADDER_STUB, ADDER_STUB.replace("raise NotImplementedError", "return a + b") + ADDER_STUB,
-     ADDER_STUB, "duplicate definitions"),
-    (ADDER_STUB, ADDER_STUB, ADDER_STUB, "unimplemented concrete body"),
-    ("", "async def f():\n    raise NotImplementedError\n",
-     "async def f():\n    raise NotImplementedError\n", "unimplemented concrete body"),
-    ("", "class Base:\n def hook(self): raise NotImplementedError\n"
-     "class Concrete(Base):\n def hook(self): return 1\n", "", ""),
-    ("", "class C:\n def f(self): return 1\n def f(self): return 2\n", "", "C.f: duplicate"),
-    ("", "class C: pass\nclass C: pass\n", "", "C: duplicate"),
-    ("", "return 1\n", "", "invalid Python"),
-    ("def unfinished(", "def repaired(): return 1\n", "", ""),
-    ("", "def f():\n nonlocal absent\n", "", "invalid Python"),
-    (ADDER_STUB, "from typing import overload\n" +
-     ADDER_STUB.replace("def add", "@overload\ndef add"),
-     ADDER_STUB, "became declarative"),
-    (ADDER_STUB, ADDER_STUB + "\n# unrelated change\n", "", ""),
-    (ADDER_STUB, ADDER_STUB.replace("Return a + b.", "Updated extension documentation."), "", ""),
-    ("", 'def f():\n raise ValueError("NotImplementedError")\n', "", ""),
-    ("", "from abc import abstractmethod as am\nclass C:\n @am\n def f(self):\n"
-     "  raise NotImplementedError\n", "", ""),
-    ("", "from typing import Protocol as P\nclass C(P):\n def f(self):\n"
-     "  raise NotImplementedError\n", "", ""),
-    ("", "from typing import overload as ov\n@ov\ndef f(x: int): ...\n"
-     "@ov\ndef f(x: str): ...\ndef f(x): return x\n", "", ""),
-    ("", "class C:\n @property\n def x(self): return self._x\n @x.setter\n"
-     " def x(self, value): self._x = value\n", "", ""),
-    ("def f(): return 1\ndef f(): return 2\n", "def f(): return 1\ndef f(): return 2\n",
-     "", ""),
-    ("", "if condition:\n def f(): return 1\nelse:\n def f(): return 2\n", "", ""),
-])
-def test_candidate_structure_compares_pinned_code_and_preserves_declarations(
-    before: str, current: str, required: str, problem: str,
-) -> None:
-    errors = implementation_errors(before, current, required)
-    assert (any(problem in item for item in errors) if problem else not errors)
-
-
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 def test_partial_owned_edits_preserve_large_unseen_source_bytes(
     tmp_path: Path, large_owned_source: str, newline: str,
@@ -110,11 +51,10 @@ def test_partial_owned_edits_preserve_large_unseen_source_bytes(
     source = large_owned_source.replace("\n", newline)
     target = tmp_path / "adder.py"
     target.write_bytes(source.encode())
-    view = excerpt("adder.py", source, {"add"})
     apply_edits(tmp_path, ["adder.py"], [
         {"path": "adder.py", "search": "return a - b + helper()",
          "replace": "return a + b + helper()"},
-    ], visible={"adder.py": view})
+    ], visible={"adder.py": ADD_VIEW})
     assert target.read_bytes() == source.replace("a - b", "a + b").encode()
 
 
@@ -127,7 +67,7 @@ def test_partial_owned_views_cannot_replace_the_file_or_edit_unseen_code(
     with pytest.raises(EditError, match="NEED_FILES"):
         apply_edits(tmp_path, ["adder.py"], [
             {"path": "adder.py", "search": search, "replace": "def add(a,b): return a+b\n"},
-        ], visible={"adder.py": excerpt("adder.py", large_owned_source, {"add"})})
+        ], visible={"adder.py": ADD_VIEW})
     assert target.read_bytes() == large_owned_source.encode()
 
 
@@ -148,52 +88,16 @@ def test_file_growth_budget_applies_to_the_whole_edit_batch_before_writing(
         assert target.read_bytes() == source.encode()
 
 
-@pytest.mark.parametrize("invalid", ["return 1", "break", "def f():\n nonlocal missing"])
-def test_edits_compile_all_files_before_writing_any(tmp_path: Path, invalid: str) -> None:
-    (tmp_path / "a.py").write_text("original = 1\n")
-    with pytest.raises(EditError, match="syntax error"):
-        apply_edits(tmp_path, ["a.py", "b.py"], [
-            {"path": "a.py", "search": "", "replace": "changed = 2\n"},
-            {"path": "b.py", "search": "", "replace": invalid},
+def test_a_failing_edit_writes_no_file_of_the_batch(tmp_path: Path) -> None:
+    (tmp_path / "a.go").write_text("package a\n")
+    with pytest.raises(EditError, match="found 0 times"):
+        apply_edits(tmp_path, ["a.go", "b.ts"], [
+            {"path": "a.go", "search": "", "replace": "package changed\n"},
+            {"path": "b.ts", "search": "", "replace": "export const b = 1;\n"},
+            {"path": "a.go", "search": "missing", "replace": "x"},
         ])
-    assert (tmp_path / "a.py").read_text() == "original = 1\n"
-    assert not (tmp_path / "b.py").exists()
-
-
-@pytest.mark.parametrize(("kind", "origin", "exception", "dispute"), [
-    ("ERROR", "/work/test_mathops.py", "NameError", True),
-    ("ERROR", "/repo/.git/orch/r1/work/task-abc/test_mathops.py", "UnboundLocalError", True),
-    ("ERROR", "/work/adder.py", "NameError", False),
-    ("ERROR", "/usr/lib/python3/unittest/mock.py", "NameError", False),
-    ("ERROR", "/work/test_mathops.py", "AttributeError", False),
-    ("ERROR", "/work/test_mathops.py", "ImportError", False),
-    ("FAIL", "/work/test_mathops.py", "AssertionError", False),
-])
-def test_fixture_diagnosis_requires_name_error_in_innermost_frozen_frame(
-    kind: str, origin: str, exception: str, dispute: bool,
-) -> None:
-    report = (f"{kind}: test_r1_adds (test_mathops.AddTest.test_r1_adds)\n"
-              'Traceback (most recent call last):\n'
-              '  File "/work/test_mathops.py", line 1, in test_r1_adds\n'
-              f'  File "{origin}", line 2, in broken\n{exception}: undefined\n')
-    assert (diagnose_failure(report, {"test_mathops.py"}, {})[0] == "fixture") == dispute
-
-
-@pytest.mark.parametrize(("source", "origin", "category"), [
-    ("def hook():\n raise NotImplementedError\n", "/work/owned.py", "structure"),
-    ("async def hook():\n raise builtins.NotImplementedError()\n", "/work/owned.py", "structure"),
-    ("def hook():\n if unavailable: raise NotImplementedError\n", "/work/owned.py", "test"),
-    ("def hook():\n raise NotImplementedError\n", "/work/dependency.py", "test"),
-    ("def hook():\n raise NotImplementedError\n", "/usr/lib/library.py", "test"),
-])
-def test_runtime_diagnosis_requires_executed_owned_stub(
-    source: str, origin: str, category: str,
-) -> None:
-    report = ('ERROR: test_hook (test_hooks.Hooks.test_hook)\n'
-              'Traceback (most recent call last):\n'
-              '  File "/work/test_hooks.py", line 1, in test_hook\n'
-              f'  File "{origin}", line 2, in hook\nNotImplementedError\n')
-    assert diagnose_failure(report, {"test_hooks.py"}, {"owned.py": source})[0] == category
+    assert (tmp_path / "a.go").read_text() == "package a\n"
+    assert not (tmp_path / "b.ts").exists()
 
 
 def task_entry(plan: Plan, index: int) -> dict[str, object]:
@@ -204,129 +108,67 @@ def file_entry(plan: Plan, index: int) -> dict[str, str]:
     return cast(list[dict[str, str]], plan["files"])[index]
 
 
-def test_canonical_plan_passes_lint(math_plan: Plan) -> None:
-    assert lint(math_plan) == []
+@pytest.fixture
+def frozen_plan(math_plan: Plan) -> Plan:
+    """The boundary plus each task's frozen test file and declared check."""
+    return orch_generic.assemble(math_plan, [
+        ("T-001", [{"path": "test_add.py", "content": ADD_TESTS}], ADD_TEST),
+        ("T-002", [{"path": "test_double.py", "content": DOUBLE_TESTS}], DOUBLE_TEST),
+    ], frozenset())
+
+
+def test_canonical_boundary_and_frozen_plan_pass_structure_checks(
+    math_plan: Plan, frozen_plan: Plan,
+) -> None:
+    assert orch_generic.boundary_errors(math_plan, frozenset()) == []
+    assert orch_generic.plan_errors(frozen_plan) == []
 
 
 @pytest.mark.parametrize(
     ("mutate", "expected"),
     [
-        (lambda p: task_entry(p, 1).update(files=["adder.py"]), "adder.py already owned by T-001"),
-        (
-            lambda p: file_entry(p, 2).update(content=MATH_TESTS.replace("test_r1_", "test_")),
-            "lacks a test_r<N>_ requirement marker",
-        ),
-        (
-            lambda p: cast(list[object], p["requirements"]).append({"id": "R3", "text": "x"}),
-            "R3: no test proves it",
-        ),
-        (lambda p: task_entry(p, 0).update(depends_on=["T-002"]), "dependency cycle"),
-        (lambda p: task_entry(p, 1).update(depends_on=["T-009"]), "unknown dependency T-009"),
-        (
-            lambda p: task_entry(p, 0).update(files=["adder.py", "test_mathops.py"]),
-            "may not own 'test_mathops.py'",
-        ),
-        (
-            lambda p: task_entry(p, 0).update(
-                tests=[
-                    "test_mathops.AddTest.test_r1_adds",
-                    "test_mathops.DoubleTest.test_r2_doubles",
-                ]
-            ),
-            "does not prove one of its reqs",
-        ),
-        (lambda p: task_entry(p, 1).update(files=["other.py"]), "stub doubler.py has no owning"),
-        (lambda p: file_entry(p, 0).update(content="def add(:\n"), "adder.py does not parse"),
-        (lambda p: task_entry(p, 0).update(contract=""), "goal, contract, reqs"),
-        (lambda p: task_entry(p, 1).update(tests=["test_mathops.No.test_r2_x"]), "not in a frozen"),
-        (lambda p: p.update(files=[]), "files: Expected 1–2000 generated files"),
-        (
-            lambda p: file_entry(p, 2).update(path="unit-tests/test_mathops.py"),
-            "unit-tests/test_mathops.py is not importable",
-        ),
-        (
-            lambda p: (file_entry(p, 0).update(path="string.py"),
-                       task_entry(p, 0).update(files=["string.py"])),
-            "string.py would shadow the standard library module 'string'",
-        ),
+        (lambda p: task_entry(p, 1).update(files=["adder.py"]),
+         "adder.py: written by both T-001 and T-002"),
+        (lambda p: cast(list[object], p["requirements"]).append({"id": "R3", "text": "x"}),
+         "requirements without an accepting task: R3"),
+        (lambda p: task_entry(p, 0).update(depends_on=["T-002"]), "depends_on must be acyclic"),
+        (lambda p: task_entry(p, 1).update(depends_on=["T-009"]), "depends on unknown task T-009"),
+        (lambda p: task_entry(p, 1).update(files=["other.py"]),
+         "stub files without a writer task: doubler.py"),
+        (lambda p: task_entry(p, 0).update(tests=[ADD_TEST]), "must be [] before test design"),
+        (lambda p: task_entry(p, 1).update(reqs=["R1"]), "R1: accepted by both"),
+        (lambda p: file_entry(p, 0).update(content=" \n"), "adder.py: empty stub file"),
+        (lambda p: (file_entry(p, 0).update(path="../adder.py"),
+                    task_entry(p, 0).update(files=["../adder.py"])), "not a safe relative path"),
+        (lambda p: task_entry(p, 0).pop("contract"), "each task has exactly"),
     ],
 )
-def test_lint_rejects_unbuildable_plans(
+def test_boundary_checks_reject_unbuildable_plans(
     math_plan: Plan, mutate: Callable[[Plan], None], expected: str
 ) -> None:
     plan = copy.deepcopy(math_plan)
     mutate(plan)
-    assert any(expected in error for error in lint(plan)), lint(plan)
+    errors = orch_generic.boundary_errors(plan, frozenset())
+    assert any(expected in error for error in errors), errors
 
 
-def test_unowned_files_without_stub_bodies_are_allowed(math_plan: Plan) -> None:
-    files = cast(list[dict[str, str]], math_plan["files"])
-    files.append({"path": "pkg/__init__.py", "content": "VERSION = 1\n"})
-    assert lint(math_plan) == []
-
-
-def test_lint_forbids_overwriting_repository_files(math_plan: Plan) -> None:
-    assert lint(math_plan, frozenset({"adder.py", "README.md"})) == [
-        "files: adder.py already exists; the plan may only add files"
-    ]
-
-
-def test_tasks_and_test_ids_come_from_the_plan(math_plan: Plan) -> None:
-    tasks = tasks_from(math_plan)
-    assert ([t.id for t in tasks], tasks[1].depends_on) == (["T-001", "T-002"], ["T-001"])
-    assert unittest_ids("test_mathops.py", MATH_TESTS) == [
-        "test_mathops.AddTest.test_r1_adds",
-        "test_mathops.DoubleTest.test_r2_doubles",
-    ]
-
-
-MIXIN = ("import unittest\nclass _Shared:\n    def setUp(self):\n        self.items = []\n"
-         "    def test_r1_a(self):\n        pass\n    def test_r1_b(self):\n        pass\n"
-         "class HeapCase(_Shared, unittest.TestCase):\n    pass\n"
-         "class SortedCase(_Shared, unittest.TestCase):\n    def test_r1_c(self):\n        pass\n")
-
-
-@pytest.mark.parametrize(("source", "ids", "problem"), [
-    (MIXIN, ["HeapCase.test_r1_a", "HeapCase.test_r1_b", "SortedCase.test_r1_c",
-             "SortedCase.test_r1_a", "SortedCase.test_r1_b"], ""),
-    ("from unittest import TestCase as Case\nclass T(Case):\n    def test_r1_a(self):\n"
-     "        pass\n", ["T.test_r1_a"], ""),
-    ("import unittest as ut\nclass Base(ut.TestCase):\n    def test_r1_a(self):\n        pass\n"
-     "class Child(Base):\n    def test_r1_b(self):\n        pass\n",
-     ["Base.test_r1_a", "Child.test_r1_b", "Child.test_r1_a"], ""),
-    ("import unittest\nclass M:\n    def test_r1_a(self):\n        pass\n"
-     "class T(M, unittest.TestCase):\n    def test_r1_a(self):\n        pass\n",
-     ["T.test_r1_a"], ""),
-    ("import unittest\nclass Orphan:\n    def test_r1_a(self):\n        pass\n", [],
-     "class Orphan defines tests but is not a unittest.TestCase"),
-    ("from helpers import Base\nclass T(Base):\n    def test_r1_a(self):\n        pass\n",
-     ["T.test_r1_a"], "class T: base Base is not unittest.TestCase"),
-    ("import unittest\nclass T(unittest.TestCase):\n    def test_r1_a(self):\n        pass\n"
-     "    test_r1_b = test_r1_a\n", ["T.test_r1_a"], "class T: test_r1_b is assigned"),
-    ("class Helper:\n    def build(self):\n        pass\n", [], ""),
-    ("import io\nfrom boltons.cacheutils import LRU\nclass BoomError(Exception):\n    pass\n"
-     "class Counting(LRU):\n    def get(self, k):\n        return 1\n"
-     "class Tracking(io.BytesIO):\n    pass\n", [], ""),
-    ("from tests.base import SharedTests\nclass T(SharedTests):\n    pass\n",
-     [], "class T: base SharedTests is not unittest.TestCase"),
-], ids=["mixin", "alias-import", "chained-case", "override", "orphan-mixin", "external-base",
-        "assigned-test", "plain-helper", "helper-subclasses", "external-test-base"])
-def test_unittest_ids_list_only_runnable_cases_and_shapes_name_what_cannot_be_listed(
-    source: str, ids: list[str], problem: str,
+def test_boundary_may_not_overwrite_repository_files_unless_edits_are_allowed(
+    math_plan: Plan,
 ) -> None:
-    assert unittest_ids("test_shape.py", source) == [f"test_shape.{name}" for name in ids]
-    problems = unittest_shape_errors(source)
-    assert (any(problem in item for item in problems) if problem else problems == [])
+    assert orch_generic.boundary_errors(math_plan, frozenset({"adder.py", "README.md"})) == [
+        "adder.py: already exists; describe changes in a task contract"
+    ]
+    assert orch_generic.boundary_errors(math_plan, frozenset({"adder.py"}),
+                                        existing_edits=True) == []
 
 
-def test_plan_lint_rejects_test_shapes_that_would_not_run(math_plan: Plan) -> None:
-    files = cast(list[dict[str, str]], math_plan["files"])
-    files[2]["content"] = files[2]["content"].replace(
-        "(unittest.TestCase)", "", 1)  # the first class loses its TestCase base
-    errors = lint(math_plan)
-    assert any("defines tests but is not a unittest.TestCase" in error for error in errors)
-    assert any("no test proves it" in error or "is not in a frozen test file" in error
-               for error in errors)
+def test_tasks_and_checks_come_from_the_frozen_plan(frozen_plan: Plan) -> None:
+    tasks = tasks_from(frozen_plan)
+    assert ([t.id for t in tasks], tasks[1].depends_on) == (["T-001", "T-002"], ["T-001"])
+    assert [t.tests for t in tasks] == [[ADD_TEST], [DOUBLE_TEST]]
+    context = RunContext.of_plan(frozen_plan)
+    assert set(context.stubs) == {"adder.py", "doubler.py"}
+    assert context.tests_for(tasks[0]) == {"test_add.py": ADD_TESTS}
 
 
 @pytest.mark.parametrize(("edges", "valid"), [
@@ -338,8 +180,10 @@ def test_interface_dependencies_are_explicit_validated_and_round_trip(
 ) -> None:
     original = tasks_from(math_plan)[1]
     task_entry(math_plan, 1)["interface_depends_on"] = edges
-    assert (not lint(math_plan)) == valid
+    graph = {"T-001": [], "T-002": ["T-001"]}
+    assert (not dependency_errors(graph, {"T-002": edges})) == valid
     if valid:
+        assert orch_generic.boundary_errors(math_plan, frozenset()) == []
         parsed = tasks_from(math_plan)[1]
         assert parsed.interface_depends_on == edges
         assert parsed.entry().get("interface_depends_on", []) == edges
@@ -351,10 +195,10 @@ def test_interface_dependencies_are_explicit_validated_and_round_trip(
     ("tests", False), ("implementation", False),
 ])
 def test_dependency_contract_versions_track_promises_not_build_progress(
-    math_plan: Plan, change: str, changed: bool,
+    frozen_plan: Plan, change: str, changed: bool,
 ) -> None:
-    task_entry(math_plan, 1)["interface_depends_on"] = ["T-001"]
-    context = RunContext.of_plan(math_plan)
+    task_entry(frozen_plan, 1)["interface_depends_on"] = ["T-001"]
+    context = RunContext.of_plan(frozen_plan)
     task = context.tasks["T-002"]
     before = context.dependency_contracts(task, "base")
     if change == "contract":
@@ -364,7 +208,7 @@ def test_dependency_contract_versions_track_promises_not_build_progress(
     elif change == "interface":
         context.stubs["adder.py"] += "# Published invariant changed\n"
     elif change == "tests":
-        context.files["test_mathops.py"] += "# corrected fixture\n"
+        context.files["test_add.py"] += "# corrected fixture\n"
     elif change == "implementation":
         context.tasks["T-001"].status = "DONE"
         context.tasks["T-001"].commit = "a" * 40
@@ -372,13 +216,7 @@ def test_dependency_contract_versions_track_promises_not_build_progress(
             != before) == changed
 
 
-def test_signatures_and_repo_map_are_signature_level() -> None:
-    source = "class A(B):\n    def m(self, x: int = 1) -> str:\n        return ''\n" + ADDER_STUB
-    assert signatures(source) == [
-        "class A(B)",
-        "def A.m(self, x: int=1) -> str",
-        "def add(a: int, b: int) -> int",
-    ]
+def test_repo_map_is_signature_level_and_truncates_by_budget() -> None:
     sources = {"b.py": ADDER_STUB, "a.md": "x", "a.py": "def f(): pass\n"}
     assert RepoIndex.from_sources(sources).repo_map(1000) == (
         "a.py\n  def f()\nb.py\n  def add(a: int, b: int) -> int\n"
@@ -395,7 +233,6 @@ def test_signatures_and_repo_map_are_signature_level() -> None:
         ([{"path": "b.py", "search": "", "replace": "y = 1\n"}], {"b.py": "y = 1\n"}),
         ([{"path": "c.py", "search": "", "replace": "z\n"}], "edit outside owned files: c.py"),
         ([{"path": "a.py", "search": "nope", "replace": "q"}], "found 0 times"),
-        ([{"path": "a.py", "search": "x", "replace": "x = ("}], "syntax error in a.py"),
         ([{"path": "a.py"}], "malformed edit"),
         ([], "no edits returned"),
     ],
@@ -438,24 +275,13 @@ def test_substitute_tolerates_whitespace_but_never_guesses(
         assert substitute(content, search, replace, "f.py") == expected
 
 
-def test_failure_signatures_ignore_line_numbers_but_not_tests() -> None:
-    first = (
-        "FAIL: test_r1_adds (m.AddTest.test_r1_adds)\n"
-        '  File "a.py", line 3\nAssertionError: 1 != 5'
-    )
+def test_failure_signatures_ignore_line_numbers_but_not_checks() -> None:
+    first = (f"FAIL (exit 1): {ADD_TEST}\n\n--- python3 -m unittest -q test_add\n"
+             '  File "a.py", line 3\nAssertionError: 1 != 5\n\nrevision=abc\n')
     moved = first.replace("line 3", "line 9").replace("1 != 5", "2 != 5")
-    other = first.replace("test_r1_adds", "test_r1_other")
+    other = first.replace(ADD_TEST, DOUBLE_TEST)
     assert signature("test", first) == signature("test", moved) != signature("test", other)
     assert signature("edit", "x") != signature("test", "x")
-
-
-def test_interface_check_allows_bodies_but_not_signatures() -> None:
-    body = ADDER_STUB.replace("raise NotImplementedError", "return a + b")
-    renamed = ADDER_STUB.replace("b: int", "c: int")
-    assert interface_errors(ADDER_STUB, body) == []
-    assert interface_errors(ADDER_STUB, renamed) == [
-        "interface changed: def add(a: int, b: int) -> int"
-    ]
 
 
 @pytest.fixture
@@ -466,7 +292,7 @@ def add_task(math_plan: Plan) -> OrchTask:
 @pytest.fixture
 def context_args(add_task: OrchTask) -> ContextArgs:
     return (add_task, {"R1": "add"}, "MAP" * 50, {"adder.py": ADDER_STUB},
-            {"adder.py": ADDER_STUB}, {"test_mathops.py": MATH_TESTS})
+            {"adder.py": ADDER_STUB}, {"test_add.py": ADD_TESTS})
 
 
 def test_context_pack_orders_layers_and_sheds_shared_context(context_args: ContextArgs) -> None:
@@ -542,22 +368,17 @@ def test_project_prefix_survives_dependency_changes_but_not_spec_changes(
 
 
 @pytest.mark.parametrize(("task_index", "expected"), [
-    (0, {"adder.py", "shared.py"}),
-    (1, {"adder.py", "doubler.py", "shared.py"}),
+    (0, {"adder.py"}),
+    (1, {"adder.py", "doubler.py"}),
 ])
-def test_interfaces_follow_task_dependencies_and_imports_not_the_whole_project(
-    math_plan: Plan, task_index: int, expected: set[str],
+def test_interfaces_follow_task_dependencies_not_the_whole_project(
+    frozen_plan: Plan, task_index: int, expected: set[str],
 ) -> None:
-    files = cast(list[dict[str, str]], math_plan["files"])
-    files[0]["content"] = "from shared import LIMIT\n" + files[0]["content"]
-    files.extend([
-        {"path": "shared.py", "content": "LIMIT = 10\n"},
-        {"path": "unrelated.py", "content": "# unrelated interface\n" * 2000},
-    ])
-    context = RunContext.of_plan(math_plan)
-    selected = context.interfaces_for(tasks_from(math_plan)[task_index],
-                                      RepoIndex.from_sources(context.stubs))
-    assert set(selected) == expected
+    cast(list[dict[str, str]], frozen_plan["files"]).append(
+        {"path": "web/unrelated.ts", "content": "// unrelated interface\n" * 2000})
+    context = RunContext.of_plan(frozen_plan)
+    selected = context.interfaces_for(tasks_from(frozen_plan)[task_index])
+    assert set(selected) == expected  # whole stubs; frozen tests are never interfaces
     assert all(source == context.stubs[path] for path, source in selected.items())
 
 
