@@ -14,7 +14,7 @@ from typing import cast
 from orchestragent.codeindex import Definition, definitions, signatures
 from orchestragent.envelope import digest
 from orchestragent.live import TEXT, object_schema
-from orchestragent.live_workspace import LiveWorkspace
+from orchestragent.live_workspace import safe_relative
 from orchestragent.orch_index import is_stub
 from orchestragent.orch_state import OrchTask
 from orchestragent.serialization import dumps
@@ -109,9 +109,13 @@ def spec_context(spec: str) -> str:
     return f"\n## ORIGINAL SPECIFICATION\n{spec}\n" if spec else ""
 
 
-def shared_context(repo_map: str, rules: str, original_spec: str = "") -> str:
+def shared_context(repo_map: str, rules: str, original_spec: str = "",
+                   language_note: str = "") -> str:
     """Project prefix: selected task dependencies must not fragment this boundary."""
     return (BUILDER_INSTRUCTIONS
+            + (f"\n## LANGUAGE\n{language_note}\nThe stdlib-only rule above means: use "
+               "only dependencies the project already declares. need_files takes any tracked "
+               "path or path::Symbol.\n" if language_note else "")
             + (f"\n## LEARNED RULES\n{rules}" if rules else "")
             + spec_context(original_spec)
             + f"\n## REPO MAP\n{repo_map or '(omitted)\n'}")
@@ -134,6 +138,7 @@ def context_pack(
     *,
     original_spec: str = "",
     dependency_contracts: dict[str, object] | None = None,
+    language_note: str = "",
 ) -> Pack:
     """Assemble layers in fixed order, retaining whole dependencies in priority order.
 
@@ -196,7 +201,7 @@ def context_pack(
         ("", {}),
     )
     for map_text, called in candidates:
-        shared = shared_context(map_text, rules, original_spec)
+        shared = shared_context(map_text, rules, original_spec, language_note)
         pack = Pack(shared, task_layer(called), retry_layer, requested=tuple(requested))
         if len(pack.text.encode()) <= budget:
             return pack
@@ -280,7 +285,7 @@ def apply_edits(
             raise EditError(f"edit outside owned files: {path}")
         target = root / path
         if (
-            not LiveWorkspace.safe_path(path)
+            not safe_relative(path)  # ownership, checked above, is the real boundary
             or target.is_symlink()
             or not target.resolve().is_relative_to(root)
             or any(parent.is_symlink() for parent in target.parents

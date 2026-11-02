@@ -21,6 +21,7 @@ from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 
+from orchestragent import orch_generic, orch_verify
 from orchestragent.dsh import EXTENDED, DshClient, json_failure
 from orchestragent.envelope import digest
 from orchestragent.jev import Decision
@@ -344,6 +345,9 @@ def orch_home(repo: Path) -> Path:
     return Path(common) / "orch"
 
 
+GENERIC_SOURCE_BYTES = 200_000  # larger tracked files (lockfiles, data) are not prompt context
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -370,7 +374,10 @@ class Orchestrator:
             raise ValueError(f"jev mode must be one of {JEV_MODES}")
         self.repo = repo.resolve()
         self.call = call
-        self.runner = runner
+        # Pure Python projects keep the tuned unittest/pytest pipeline; every other project
+        # (any language, or several) runs the checks its own test designers declared.
+        self.generic = orch_verify.engine(self.repo) == "generic"
+        self.runner = orch_verify.run if self.generic else runner
         self.notify = notify
         self.clock = clock
         self.sleep = sleep
@@ -468,7 +475,12 @@ class Orchestrator:
             raise RuntimeError(f"git {' '.join(args[:3])} failed: {detail}") from None
 
     def sources(self, revision: str) -> dict[str, str]:
-        """Every Python file at `revision`, read in one git batch."""
+        """Every source file of the project's language at `revision`, in one git batch."""
+        if self.generic:  # every tracked text file of a reasonable size, in any language
+            sizes = self.git(self.repo, "ls-tree", "-r", "-l", revision).splitlines()
+            paths = [line.split("\t", 1)[1] for line in sizes
+                     if line.split()[3].isdigit() and int(line.split()[3]) <= GENERIC_SOURCE_BYTES]
+            return self.index.read(revision, paths)
         return self.index.read(revision, suffix=".py")
 
     def run_dir(self, run_id: str) -> Path:
@@ -515,6 +527,8 @@ class Orchestrator:
             with self.git_lock:
                 self.git(self.repo, "worktree", "add", "--detach", str(path), revision)
             self._count("worktrees_created")
+        if self.generic:
+            orch_verify.link_ignored(self.repo, path)
         try:
             yield path
         finally:
@@ -585,6 +599,12 @@ class Orchestrator:
                     self.verifying -= 1
         finally:
             self.verify_slots.release()
+
+    def _language_note(self) -> str:
+        if not self.generic:
+            return ""
+        return ("Write each owned file in its own language. Stub bodies fail with 'not "
+                "implemented'; replace every one in your owned files. " + orch_verify.SANDBOX_NOTE)
 
     def elapsed(self) -> float:
         """Seconds this thread's last sandbox run took (its wait for a slot excluded)."""
@@ -997,7 +1017,7 @@ class Orchestrator:
                         f"for boundaries only (attempt {number})")
             feedback = list(dict.fromkeys([*review_feedback, *structural_feedback, *errors]))
             prompt = boundary_prompt(inputs.spec, inputs.repo_map, feedback,
-                                     existing_edits=distributed,
+                                     existing_edits=distributed, generic=self.generic,
                                      coupling=inputs.coupling if reviewed_boundary else "",
                                      previous=reviewed_draft, rules=inputs.rules)
             if reviewed_boundary:
@@ -1028,9 +1048,16 @@ class Orchestrator:
                 stop = "repeated_boundary"
                 break
             rejected.add(draft)
-            errors = boundary_errors(answer, inputs.existing, existing_edits=distributed)
+            if not self.generic:
+                errors = boundary_errors(answer, inputs.existing, existing_edits=distributed)
+            elif not distributed:
+                return PlanError("projects outside the Python pipeline plan distributed")
+            else:
+                errors = orch_generic.boundary_errors(answer, inputs.existing,
+                                                      existing_edits=distributed)
             if not errors:
-                errors = self._pack_errors(answer, inputs.base, inputs.spec)
+                errors = self._pack_errors({**answer, **self._engine_key()}, inputs.base,
+                                           inputs.spec)
             if errors:
                 structural_failures += 1
                 fingerprint = boundary_fingerprint(errors)
@@ -1057,7 +1084,8 @@ class Orchestrator:
                     review_feedback = list(dict.fromkeys([*review_feedback, *errors]))
             if not errors and not distributed:
                 request = DshClient.task_text(
-                    test_prompt(inputs.spec, answer, repo, []), TEST_SCHEMA)
+                    test_prompt(inputs.spec, answer, repo, [], generic=self.generic),
+                    self._test_schema())
                 if len(request.encode()) > DshClient.input_limit:
                     errors = ["Boundary/spec/interfaces exceed the DSF test-design request limit"]
             if not errors:
@@ -1087,11 +1115,12 @@ class Orchestrator:
         for number in range(1, attempts + 1):
             if self.cancel.is_set():
                 return PlanError("thin test design cancelled")
-            prompt = test_prompt(inputs.spec, boundary, repo, errors)
-            if len(DshClient.task_text(prompt, TEST_SCHEMA).encode()) > DshClient.input_limit:
+            prompt = test_prompt(inputs.spec, boundary, repo, errors, generic=self.generic)
+            request = DshClient.task_text(prompt, self._test_schema())
+            if len(request.encode()) > DshClient.input_limit:
                 return PlanError("DSF test-design request exceeds input limit; nothing dispatched")
             result = self._call_planning(
-                run_id, DSF, prompt, TEST_SCHEMA,
+                run_id, DSF, prompt, self._test_schema(),
                 f"orch-{run_id}-test-design-{number}-{uuid.uuid4().hex[:12]}",
                 purpose="test-design", attempt=number, base=inputs.base,
             )
@@ -1138,16 +1167,20 @@ class Orchestrator:
             selected = set(integration_targets(graph, scope)) | citing_tasks(boundary)
             assignments += [(task, True) for task in tasks if task["id"] in selected]
         shard_sources: dict[str, dict[str, str]] = {}
+        checks: dict[tuple[str, bool], str] = {}  # generic engine: each shard's check id
         for task in tasks:
             related = closure(graph, task["id"]) | {task["id"]}
             paths = {path for other in tasks if other["id"] in related for path in other["files"]}
             # Read the pre-task revision once, before any builders exist. New modules also
             # receive their declared dependencies' old implementations; never candidate code.
-            shard_sources[task["id"]] = planning_sources(self.index, inputs.base, paths)
+            shard_sources[task["id"]] = planning_sources(self.index, inputs.base, paths,
+                                                           any_file=self.generic)
         for task, integration in assignments:
-            prompt = test_prompt(inputs.spec, boundary, inputs.repo_map, [], task_id=task["id"],
+            prompt = test_prompt(inputs.spec, boundary, inputs.repo_map, [],
+                                 generic=self.generic, task_id=task["id"],
                                  sources=shard_sources[task["id"]], integration=integration)
-            if len(DshClient.task_text(prompt, TEST_SCHEMA).encode()) > DshClient.input_limit:
+            request = DshClient.task_text(prompt, self._test_schema())
+            if len(request.encode()) > DshClient.input_limit:
                 return PlanError("Distributed test-design request exceeds input limit")
         self.notify(f"[plan] {len(assignments)} test-design shards "
                     f"({len(assignments) - len(tasks)} independent integration), "
@@ -1187,13 +1220,15 @@ class Orchestrator:
                 if self.cancel.is_set() or stopped.is_set():
                     raise PlanError("distributed test design cancelled")
                 local, draft = draft, ""
-                schema = EDIT_SCHEMA if local else TEST_SCHEMA
+                schema = EDIT_SCHEMA if local else self._test_schema()
                 stage = purpose.removesuffix("-design") + "-repair" if local else purpose
                 prompt = (test_edit_prompt(
-                    test_prompt(inputs.spec, boundary, inputs.repo_map, [], task_id=tid,
+                    test_prompt(inputs.spec, boundary, inputs.repo_map, [], generic=self.generic,
+                                task_id=tid,
                                 sources=shard_sources[tid], integration=integration),
                     path, local, errors) if local else
-                    test_prompt(inputs.spec, boundary, inputs.repo_map, errors, task_id=tid,
+                    test_prompt(inputs.spec, boundary, inputs.repo_map, errors,
+                                generic=self.generic, task_id=tid,
                                 sources=shard_sources[tid], integration=integration))
                 if len(DshClient.task_text(prompt, schema).encode()) > DshClient.input_limit:
                     stopped.set()
@@ -1257,11 +1292,20 @@ class Orchestrator:
                         if result.data.get("status") != "DONE":
                             raise EditError("a local draft repair must return DONE with edits")
                         design_data = revise_draft(path, local, result.data.get("edits"))
-                    files = test_shard(boundary, tid, design_data, integration=integration)
-                    tests = [name for file in files
-                             for name in unittest_ids(file["path"], file["content"])]
+                    if not self.generic:
+                        files = test_shard(boundary, tid, design_data, integration=integration)
+                        tests = [name for file in files
+                                 for name in unittest_ids(file["path"], file["content"])]
+                    else:
+                        files, check = orch_generic.test_shard(boundary, tid, design_data,
+                                                               existing=inputs.existing)
+                        problem = self._red_problem(run_id, inputs.base, boundary, files, check)
+                        if problem:
+                            raise ValueError(problem)
+                        tests = [check.id]
+                        checks[(tid, integration)] = check.id
                     candidate = {
-                        **boundary,
+                        **boundary, **self._engine_key(),
                         "files": [*cast(list[dict[str, str]], boundary["files"]), *files],
                         "tasks": [{**item, "tests": tests} if item["id"] == tid else item
                                   for item in tasks],
@@ -1276,7 +1320,7 @@ class Orchestrator:
                         "source_bytes": sum(len(text.encode())
                                             for text in shard_sources[tid].values()),
                     }))
-                    if not errors and reviews < MAX_TEST_REVIEWS_PER_SHARD:
+                    if not errors and reviews < MAX_TEST_REVIEWS_PER_SHARD and not self.generic:
                         reviews += 1  # a revised draft is linted again before its review
                         gaps = self._coverage_gaps(run_id, inputs.base, boundary, graph, task,
                                                    integration, files, number)
@@ -1342,8 +1386,14 @@ class Orchestrator:
                 finished = list(pool.map(design, [assignments[index] for index in order]))
             shards = [shard for _, shard in sorted(zip(order, finished, strict=True),
                                                    key=lambda pair: pair[0])]
-            plan = assemble(boundary, {"files": [f for files, _ in shards for f in files]},
-                            inputs.existing, existing_edits=True)
+            if not self.generic:
+                plan = assemble(boundary, {"files": [f for files, _ in shards for f in files]},
+                                inputs.existing, existing_edits=True)
+            else:
+                plan = orch_generic.assemble(boundary, [
+                    (task["id"], files, checks[(task["id"], integration)])
+                    for (task, integration), (files, _) in zip(assignments, shards, strict=True)
+                ], inputs.existing, existing_edits=True)
             problems = self._pack_errors(plan, inputs.base, inputs.spec)
         except PlanError as error:
             return error
@@ -1519,6 +1569,24 @@ class Orchestrator:
         draft.score, draft.parts = plan_score(
             draft.plan, len(draft.vacuous), len(draft.splits), draft.repairs
         )
+
+    def _engine_key(self) -> dict[str, str]:
+        return {"engine": "generic"} if self.generic else {}
+
+    def _test_schema(self) -> dict[str, object]:
+        return orch_generic.GENERIC_TEST_SCHEMA if self.generic else TEST_SCHEMA
+
+    def _red_problem(self, run_id: str, base: str, boundary: dict[str, object],
+                     files: list[dict[str, str]], check: "orch_verify.Check") -> str:
+        """A designed check must run and fail on the stubs; "" when it does."""
+        tree = {f["path"]: f["content"]
+                for f in [*cast(list[dict[str, str]], boundary["files"]), *files]}
+        with self.worktree(run_id, "red", base) as path:
+            apply_edits(path, list(tree), [
+                {"path": name, "search": "", "replace": content}
+                for name, content in tree.items()])
+            usable, problem = orch_verify.red(path, check)
+        return "" if usable else problem
 
     def _probe_plan(
         self, run_id: str, base: str, plan: dict[str, object]
@@ -1725,6 +1793,8 @@ class Orchestrator:
                 raise PlanError("Planning branch already exists; preserve it for inspection")
             elif not integration.exists():
                 self.git(self.repo, "worktree", "add", str(integration), branch)
+        if self.generic:
+            orch_verify.link_ignored(self.repo, integration)
         if integration.is_symlink() or any(
             (integration / path).is_symlink()
             or not (integration / path).resolve().is_relative_to(integration.resolve())
@@ -1808,6 +1878,8 @@ class Orchestrator:
 
     def _baseline(self, run_id: str, base: str) -> tuple[list[str], str]:
         """Pre-existing unittest ids that pass at the base; the final gate keeps them green."""
+        if self.generic:  # project-wide checks come from the plan's own test designers
+            return [], "no pre-existing checks declared"
         ids: list[str] = []
         for path, source in sorted(self.sources(base).items()):
             if LiveWorkspace.is_test_file(path):
@@ -2282,7 +2354,8 @@ class Orchestrator:
                 return True
             tests, good = run.baseline, -1  # checkpoint is green: stubs touch no old code
         else:
-            failing = failed_in(report, merged) or []
+            failing = (failed_in(report, merged) if not self.generic
+                       else orch_verify.failed(report, merged)) or []
             start = self._proven(run_id, done, commits).get(failing[0], "") if failing else ""
             if start not in commits:
                 self.gate_failure = f"merged tests fail at the end: {report.strip()[-200:]}"
@@ -3341,14 +3414,15 @@ class Orchestrator:
         own = list(task.context_selectors)
         chosen = list(dict.fromkeys([*own, *self._dependency_files(context, task, base)]))
         try:
-            requested = requested_sources(self.index, path, base, chosen) if chosen else {}
+            requested = requested_sources(self.index, path, base, chosen,
+                                          any_file=self.generic) if chosen else {}
         except ValueError:
             chosen = own
             requested = {}
         selectors = [item for item in chosen
                      if "::" not in item or item.split("::", 1)[0] not in chosen]
         if chosen == own and own:
-            requested = requested_sources(self.index, path, base, selectors)
+            requested = requested_sources(self.index, path, base, selectors, any_file=self.generic)
         index = self.index.at(base)
         originals = self.index.read(base, task.files)
         owned = owned_sources(index, originals, task.tests, selectors)
@@ -3365,6 +3439,7 @@ class Orchestrator:
         contracts = context.dependency_contracts(task, run.base)
         try:
             return replace(context_pack(*arguments, requested=requested, original_spec=run.spec,
+                                        language_note=self._language_note(),
                                         dependency_contracts=contracts),
                            partial_owned=partial_owned)
         except ContextTooLarge:
@@ -3372,9 +3447,11 @@ class Orchestrator:
                 raise
         # Keep requested definitions exact. Only full-file reads become explicit catalogs.
         for size in (8192, 2048, 512, 128):
-            compact = requested_sources(self.index, path, base, chosen, catalog_bytes=size)
+            compact = requested_sources(self.index, path, base, chosen, catalog_bytes=size,
+                                        any_file=self.generic)
             try:
                 packed = context_pack(*arguments, requested=compact, original_spec=run.spec,
+                                      language_note=self._language_note(),
                                       dependency_contracts=contracts)
                 return replace(packed, partial_owned=partial_owned,
                                partial_reads=tuple(s for s in selectors
@@ -3390,10 +3467,11 @@ class Orchestrator:
         paths = sorted({
             path for tid in task.depends_on if tid in context.tasks
             for path in context.tasks[tid].files
-            if path.endswith(".py") and not LiveWorkspace.is_test_file(path)
+            if (self.generic or (path.endswith(".py") and not LiveWorkspace.is_test_file(path)))
             and path not in task.files
         })
-        present = set(self.index.at(base).files)
+        present = (set(self.index.at(base).files) if not self.generic
+                   else set(self.index.tree(base)))
         paths = [path for path in paths if path in present]
         return paths if len(paths) <= DEPENDENCY_READS else []
 
@@ -3541,7 +3619,7 @@ class Orchestrator:
                     if (result.data.get("edits") != [] or not isinstance(reads, list)
                             or not 1 <= len(reads) <= 8):
                         raise ValueError("NEED_FILES requires no edits and 1-8 selectors")
-                    requested_sources(self.index, path, base, reads)
+                    requested_sources(self.index, path, base, reads, any_file=self.generic)
                     selectors = [str(item) for item in reads]
                 except ValueError as error:
                     context_feedback = str(error)
@@ -3577,7 +3655,9 @@ class Orchestrator:
                 raise Signal(str(status), str(result.data.get("reason", "")))
             if status != "DONE":
                 raise AttemptFailed("edit", "Expected DONE, NEED_FILES, BLOCKED or TEST_DISPUTE")
-            self.git(path, "add", "-A")
+            # The sandbox's scratch tree and linked dependencies are never part of a change.
+            self.git(path, "add", "-A", "--", ".",
+                     *(orch_verify.excludes(path) if self.generic else ()))
             present = [owned for owned in task.files if (path / owned).exists()]
             if present:  # owned files may sit under a .gitignore pattern
                 self.git(path, "add", "-f", "--", *present)
@@ -3691,11 +3771,11 @@ class Orchestrator:
         outside = sorted(changed - set(task.files))
         if outside:
             return AttemptFailed("scope", f"changed files outside ownership: {outside}", diff)
-        current = self.index.read(commit, task.files, suffix=".py")
+        current = self.index.read(commit, task.files, suffix="" if self.generic else ".py")
         missing = [owned for owned in task.files if owned in context.stubs and owned not in current]
         if missing:
             return AttemptFailed("interface", f"missing implementation files: {missing}", diff)
-        problems = [
+        problems = [] if self.generic else [
             problem
             for owned in task.files
             if owned in context.stubs
@@ -3704,7 +3784,7 @@ class Orchestrator:
         if problems:
             return AttemptFailed("interface", "\n".join(problems), diff)
         original = self.index.read(base, task.files)
-        problems = [
+        problems = [] if self.generic else [
             f"{owned}: {problem}"
             for owned in current
             for problem in implementation_errors(original.get(owned, ""),
@@ -3721,14 +3801,16 @@ class Orchestrator:
                        != tasks[tid].commit]
             if waiting:
                 return Waiting(waiting, "await dependency implementations in snapshot", diff)
-        imported = self._imports(run.id, task, commit, diff)
+        imported = None if self.generic else self._imports(run.id, task, commit, diff)
         if imported is not None:
             return imported
         if self.git(path, "status", "--porcelain"):
             return AttemptFailed("scope", "worktree is not clean after commit", diff)
         passed, report = self.verify(path, self.scratch(run.id), commit, task.tests)
         if not passed:
-            category, evidence = diagnose_failure(report, set(context.tests_for(task)), current)
+            category, evidence = (
+                diagnose_failure(report, set(context.tests_for(task)), current)
+                if not self.generic else ("test", report[-4000:]))
             if category == "fixture":
                 self.state.record(run.id, "task.fixture_dispute", {
                     "candidate": commit, "evidence": evidence,
@@ -4011,6 +4093,13 @@ class Candidate:
     lesson: str = ""
 
 
+def test_modules(test: str) -> list[str]:
+    """Module keys of a test id: a dotted Python `pkg.mod.Class.method`, or a declared
+    check's test files."""
+    check = orch_verify.parse(test)
+    return list(check.files) if check is not None else [test.rsplit(".", 2)[0]]
+
+
 @dataclass(frozen=True)
 class RunContext:
     """Inputs every attempt of a run derives from its (possibly revised) plan."""
@@ -4031,11 +4120,19 @@ class RunContext:
     @classmethod
     def of_plan(cls, plan: dict[str, object]) -> "RunContext":
         files = plan_files(plan)
-        is_test = LiveWorkspace.is_test_file
+        checked = set(orch_verify.files_of(
+            [test for task in tasks_from(plan) for test in task.tests]))
+
+        def is_test(path: str) -> bool:
+            return path in checked or LiveWorkspace.is_test_file(path)
+
         return cls(
             files=files,
-            stubs={p: c for p, c in files.items() if p.endswith(".py") and not is_test(p)},
-            modules={python_module(p): p for p in files if is_test(p)},
+            stubs={p: c for p, c in files.items() if not is_test(p)
+                   and (p.endswith(".py") or plan.get("engine") == "generic")},
+            # Python tests are addressed by dotted module ids; declared checks by their files.
+            modules={(python_module(p) if p.endswith(".py") and p not in checked else p): p
+                     for p in files if is_test(p)},
             requirements={
                 str(item["id"]): str(item["text"])
                 for item in cast(list[dict[str, str]], plan["requirements"])
@@ -4086,13 +4183,15 @@ class RunContext:
     def tests_for(self, task: OrchTask, *, sliced: bool = False) -> dict[str, str]:
         """Frozen test files that hold this task's tests."""
         paths = {
-            self.modules[test.rsplit(".", 2)[0]]
+            self.modules[module]
             for test in task.tests
-            if test.rsplit(".", 2)[0] in self.modules
+            for module in test_modules(test)
+            if module in self.modules
         }
         if not sliced:
             return {path: self.files[path] for path in sorted(paths)}
-        return {path: excerpt(path, self.files[path], {
-            ".".join(test.rsplit(".", 2)[1:]) for test in task.tests
-            if self.modules.get(test.rsplit(".", 2)[0]) == path
-        }) for path in sorted(paths)}
+        return {path: (self.files[path] if not path.endswith(".py") else excerpt(
+            path, self.files[path], {
+                ".".join(test.rsplit(".", 2)[1:]) for test in task.tests
+                if path in {self.modules.get(m) for m in test_modules(test)}
+            })) for path in sorted(paths)}

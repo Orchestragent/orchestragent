@@ -1,73 +1,83 @@
-# Any-language orch: design
+# Any language, and several at once
 
-Status: design, 2026-11-02. Goal: orch builds features in projects of any language, with the
-same guarantee it gives Python projects today — a task merges only when its frozen tests
-pass in an offline sandbox. Python becomes one adapter, not the core.
+orch does not decide which languages a project uses. A real project mixes them: a Go service,
+a TypeScript web app, a Rust core, Python scripts, SQL, shell. The models already write all of
+them, so orch leaves those choices to the models and keeps deterministic gates only where they
+protect correctness and safety.
 
-## What is language-bound today
+## What the models decide
 
-An audit found ~90 Python-specific places in seven groups:
+- **Planner (Opus):** the requirements and tasks, and for each task the files it owns and the
+  stub interfaces. Stubs can be written in any language. Their bodies only fail with "not
+  implemented".
+- **Test designer (one per task):** the frozen test files, in whatever framework the tested
+  component uses, plus **the shell command that runs exactly those tests**. Examples:
+  - `cd web && npx vitest run test/cart.test.ts`
+  - `go test ./api/...`
+  - `CARGO_TARGET_DIR="$TMPDIR/t" cargo test --test orch_t_005`
+  - `cd tools && python3 -m unittest -q test_slug`
+- **Builder:** the implementation of the files it owns, in their languages.
 
-| group | examples | approach |
-|---|---|---|
-| sandbox | seccomp and Seatbelt forbid fork/exec; the command is always `python -c` | **blocker**: run an argv; allow processes, keep the network denied |
-| test execution and reports | unittest/pytest runners, traceback parsing, dotted ids | adapter `run()` + JUnit XML / native JSON reports |
-| test identity | `test_r<N>_` names, `test_*.py`, `module.Class.method` ids | adapter `list_tests / file_of / req_of / shard_path` |
-| stub and interface gates | `raise NotImplementedError`, AST shape rules, `compile()` | the toolchain is the linter (`tsc --noEmit`, `go vet`, `cargo check`) + tree-sitter signatures |
-| test lints | AST fixture and constant-assertion lints | language-neutral gates (below); AST lints stay as Python extras |
-| prompts | "stdlib unittest", "Python boundary plan" | adapter-supplied prompt fragments |
-| paths and index | suffix allow-list `.py/.md/.txt/.json`; imports resolved for Python/JS only | adapter-supplied suffixes; tree-sitter imports per language; "all tests" when unsure |
+## What orch enforces (language-neutral)
 
-## The adapter
+1. **Sandbox.** Every command runs from the repository root under `/bin/sh -c`.
+   - It has no network.
+   - It cannot see users' home directories, except the toolchains it is given.
+   - It can write only inside its worktree and `$TMPDIR`.
+   - Installed toolchains are mounted read-only, and so are the repository's ignored
+     dependency directories (`node_modules`, `.venv`, `vendor`, …).
+2. **Ownership.** A task edits only the files it owns.
+3. **Frozen checks.** Test files and their commands are frozen with the plan. A check's id is
+   `cmd:{command, files}`, so it carries everything needed to run it again in any worktree.
+4. **Red, then green.**
+   - At design time, a check must run on the stubs and fail. A command that cannot run
+     (exit 126/127) or that passes on stubs is sent back to the designer.
+   - After the build, the check must exit 0.
+5. **Merge only on green.** A final gate runs every task's check together. A regression is
+   bisected to one task and that task is rebuilt.
+6. **Builds stay clean.** Sandbox scratch space and linked dependency directories never enter
+   a commit.
 
-```text
-LanguageAdapter
-  detect(repo) -> confidence           # files, manifests, lockfiles
-  toolchain() -> Toolchain             # binaries + read-only caches to mount, env, rlimits
-  stub_fragment / test_fragment / builder_fragment   # prompt text
-  stub_check(files) -> errors          # compile/typecheck the boundary with the toolchain
-  shard_path(task) / test_ids(file) / req_of(test_id) / file_of(test_id)
-  run(workdir, ids|None, timeout) -> Report   # argv in the sandbox, native report parsed
-  report: per-test outcome, failure message, file:line frames
-```
+None of these gates parses a language. Reports such as JUnit XML may still be shown to the
+models to help them, but a report never decides pass or fail.
 
-Adapters, in order: **python** (today's code, moved behind the interface), **typescript /
-javascript** (vitest or jest; npm, pnpm or yarn), **go** (`go test -json`), **rust**
-(`cargo test`, nextest JUnit when present), **java/kotlin** (Gradle/Maven, Surefire JUnit XML),
-and **generic**: the user gives a test command in `orch.toml` with `{files}` / `{tests}`
-placeholders and a JUnit XML path; orch then works for any language at whole-suite precision.
+## Which pipeline runs
 
-## Language-neutral gates that keep tests honest
+- **Pure Python projects** keep the tuned unittest/pytest pipeline. It is benchmarked, and its
+  AST lints catch Python-specific test mistakes.
+- **Everything else** uses the generic pipeline above:
+  - a project with another build manifest anywhere (`package.json`, `go.mod`, `Cargo.toml`,
+    Maven/Gradle files, `*.csproj`, …);
+  - a Python project that also has such a manifest;
+  - a brand-new, empty project.
+- `ORCH_ENGINE=python|generic` overrides the choice.
 
-These replace the Python AST lints for every language:
+This is routing only. The generic pipeline is free to use Python too. Once it matches the
+Python pipeline on the Python benchmarks, the two converge.
 
-1. **Compiles**: the shard compiles and type-checks against the frozen stubs.
-2. **Red on stubs**: every frozen test fails while the code under test is a stub. A test
-   that passes on stubs constrains nothing and is rejected.
-3. **Requirement ids**: every test name carries its requirement (`R3` in the test or
-   describe name); every requirement has at least one test.
-4. **Integration shards** for tasks that cite another task's requirement (as today).
-5. **Contract fidelity** in the planner: each spec-stated error at the operation the spec
-   names; upstream conventions kept exactly.
+## Toolchains in the sandbox
 
-## Sandbox
+Toolchains are discovered rather than tabulated: orch mounts read-only
 
-- Linux: bubblewrap with `--unshare-all` (no network namespace route), the toolchain and
-  dependency caches bind-mounted read-only, a writable temp/home, rlimits per toolchain;
-  seccomp keeps denying sockets other than AF_UNIX but allows fork/exec (passed with
-  `--seccomp`), so compilers and test runners work.
-- macOS: Seatbelt allows process-fork and process-exec only for the toolchain paths, denies
-  the network and writes outside the workdir.
-- Dependencies are never fetched inside the sandbox. `orch doctor` checks that the project's
-  own tests pass offline (dependencies already installed: `node_modules`, Go module cache,
-  `cargo fetch`, Maven/Gradle cache) and says how to prepare it if not.
+- the install roots of PATH entries;
+- `*_HOME`, `*_ROOT` and `GOPATH` directories;
+- common toolchain homes, such as rustup's toolchains or Go/Maven/Gradle caches;
+- anything listed in `ORCH_SANDBOX_READ` (colon-separated).
 
-## Plan
+It never mounts the home directory itself or private directories (`.ssh`, `.config`, cloud
+credentials, agent logins).
 
-1. Sandbox runs an argv with processes allowed and network denied (Linux + macOS), with the
-   existing Python runner moved onto it. All existing tests stay green.
-2. Adapter interface; Python moved behind it with no behaviour change.
-3. TypeScript/JavaScript adapter + generic adapter; a TypeScript benchmark case with hidden
-   acceptance tests, compared with a single Opus agent.
-4. Go and Rust adapters + benchmark cases. Then Java/Kotlin.
-5. README: supported languages and how to prepare a project; fresh-user trial on a TS repo.
+Dependencies are never downloaded during a run. The project must already be installed and
+able to run its tests offline: `npm ci`, `go mod download`, `cargo fetch`, a populated
+`.venv`, and so on.
+
+## Status (2026-11-02)
+
+- The generic pipeline runs end to end with scripted models on a mixed shell + Python
+  project: plan → red gate → build → green → merge.
+- The sandbox and checks were exercised by hand on vitest + tsc, go test, cargo test and
+  unittest, side by side in one repository.
+- Next:
+  - a project-level check declared by the planner (pre-existing tests as a baseline);
+  - integration checks across components;
+  - a real multi-language benchmark against a single Opus agent.

@@ -85,6 +85,9 @@ def _keychain_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     whether this machine has the DSH CLI (tests of the direct API transport opt in)."""
     monkeypatch.setenv("ORCHESTRA_KEYCHAIN", "0")
     monkeypatch.setenv("ORCHESTRA_DSF_TRANSPORT", "cli")
+    # Scripted Python cases run in seed repos holding only a README, which a real run
+    # would route to the generic engine; generic-engine tests set ORCH_ENGINE themselves.
+    monkeypatch.setenv("ORCH_ENGINE", "python")
 
 
 @dataclass

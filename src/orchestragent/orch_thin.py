@@ -27,6 +27,7 @@ from orchestragent.orch_plan import (
     unittest_shape_errors,
 )
 from orchestragent.orch_testlint import fixture_errors
+from orchestragent.orch_verify import SANDBOX_NOTE
 from orchestragent.serialization import dumps
 
 TEST_SCHEMA = object_schema(
@@ -63,6 +64,24 @@ BOUNDARY_STAGE = (
 
 # The same structural rules for the author, any reviewer and controller feedback. Acceptance
 # owner, file writer and dependency are separate: only reqs route frozen tests and failures.
+PYTHON_STUB_RULES = (
+    "Empty package markers are "
+    "allowed. Module/class bodies may contain only imports, interface declarations, docstrings "
+    "and literal constants/field defaults. Use direct type annotations, not type-alias "
+    "assignments. No module/class control flow, executable expressions, field factory calls "
+    "or call-valued declaration defaults/decorators/annotations. Function/method bodies must "
+    "only raise NotImplementedError after an optional docstring. Do not provide implementation "
+    "bodies or test files. "
+)
+
+
+GENERIC_LAYOUT = (
+    "Use whatever languages the project and the spec call for, per component; one project "
+    "may mix several. Follow each component's existing layout, module system and import "
+    "style, and put new source files where its build and tests find them. The files array "
+    "adds new source files only (never tests); ")
+
+
 # Contracts drive test design and building, so a contract that drifts from the spec is
 # frozen into the tests: rollout (7ccc8a8) R7 "reopening with a different plan/config raises
 # ValueError" became "raised by the mutating and snapshot calls", and hidden acceptance
@@ -243,13 +262,22 @@ def review_verdict(value: object) -> list[str]:
 def boundary_prompt(
     spec: str, repo: str, errors: list[str], *, existing_edits: bool = False, coupling: str = "",
     previous: dict[str, object] | None = None, rules: str = "",
+    generic: bool = False,
 ) -> str:
+    if not generic:
+        head = ("Return a compact Python boundary plan matching PLAN_SCHEMA. Use stdlib and only "
+                "explicitly pinned dependencies. ")
+        stubs = "final typed interface stubs (raise NotImplementedError)"
+    else:
+        head = ("Return a compact boundary plan matching PLAN_SCHEMA. Use only dependencies "
+                "the project already has installed; nothing can be downloaded. ")
+        stubs = ("final typed interface stubs in each file's language whose bodies only fail "
+                 "at runtime (throw/raise/panic 'not implemented') and that still build")
     return ContextPrompt(
         SPEC_AUTHORITY
-        + "Return a compact Python boundary plan matching PLAN_SCHEMA. Use stdlib and only "
-        "explicitly pinned dependencies. No tests yet: "
-        "every task.tests must be []. Define all distinct requirements R1,R2,..., final typed "
-        "interface stubs (raise NotImplementedError), and disjoint T-001,... tasks with reqs, "
+        + head + "No tests yet: "
+        "every task.tests must be []. Define all distinct requirements R1,R2,..., " + stubs
+        + ", and disjoint T-001,... tasks with reqs, "
         "depends_on and concise contracts covering inputs/outputs, exceptions, mutation and "
         "ordering guarantees. " + CONTRACT_FIDELITY + " interface_depends_on is a subset of "
         "depends_on: use it only "
@@ -258,20 +286,19 @@ def boundary_prompt(
         + BOUNDARY_RULES + " For a requirement listed in spec_requirement_ids that you keep "
         "unchanged, return its text as \"\": the controller copies that labelled block of the "
         "original spec verbatim. Write text only for new or deliberately split requirements. "
-        "Use cohesive "
-        "module ownership, root packages and absolute imports. The files array adds new Python "
-        "files only; preserve "
+        + (GENERIC_LAYOUT if generic else
+           "Use cohesive module ownership, root packages and absolute imports. The files array "
+           "adds new Python files only; ")
+        + "preserve "
         + ("all existing tests. Tasks may own existing source files; describe their new interfaces "
            "in contracts, but do not return copies of existing files in files. "
            if existing_edits else
            "all existing seed code/tests and never own an existing file. ")
-        + "Empty package markers are "
-        "allowed. Module/class bodies may contain only imports, interface declarations, docstrings "
-        "and literal constants/field defaults. Use direct type annotations, not type-alias "
-        "assignments. No module/class control flow, executable expressions, field factory calls "
-        "or call-valued declaration defaults/decorators/annotations. Function/method bodies must "
-        "only raise NotImplementedError after an optional docstring. Do not provide implementation "
-        "bodies or test files. Another independent "
+        + (PYTHON_STUB_RULES if not generic else
+           "Stub files hold only declarations: imports, types, interfaces, constants and "
+           "function/method signatures whose bodies only fail with 'not implemented'. "
+           "Do not provide implementation bodies or test files. ")
+        + "Another independent "
         "model will design frozen tests from the spec, interfaces and requirements.\n"
         + dumps({"spec": spec, "existing_interfaces": repo,
                  "controller_stage": BOUNDARY_STAGE,
@@ -464,7 +491,15 @@ def test_prompt(
     spec: str, boundary: dict[str, object], repo: str, errors: list[str], *, task_id: str = "",
     sources: dict[str, str] | None = None,
     integration: bool = False,
+    generic: bool = False,
 ) -> str:
+    def shard(task: str, integration: bool = False) -> str:
+        if not generic:
+            return shard_path(task, integration)
+        return ("your test file(s) for this task (new files only, named after "
+                f"{task}{' integration' if integration else ''}, where the project's test "
+                "runner finds them) and the `command` that runs exactly them")
+
     assignment = ""
     if task_id:
         tasks = cast(list[dict[str, Any]], boundary["tasks"])
@@ -481,16 +516,19 @@ def test_prompt(
                     "tasks": [t for t in tasks if t["id"] in related]}
         assignment = (
             f"Assigned task: {task_id}. Test ONLY requirements {dumps(task['reqs'])}. "
-            f"Return exactly one file: {shard_path(task_id, integration)}. "
-            "Other tasks/contracts are dependency context only. Use shared setUp and subTest "
-            "tables. Avoid repetitive setup, comments and "
+            + (f"Return exactly one file: {shard(task_id, integration)}. " if not generic else
+               f"Return {shard(task_id, integration)}. ")
+            + "Other tasks/contracts are dependency context only. "
+            + ("Use shared setUp and subTest tables. " if not generic else
+               "Use shared fixtures and table-driven cases. ")
+            + "Avoid repetitive setup, comments and "
             "redundant assertions; cover the assigned contract with compact representative cases.\n"
         )
         assignment += DECISIVE_ASSERTIONS
         if integration:
             assignment = DECISIVE_ASSERTIONS + (
                 f"Independent INTEGRATION verification for {task_id}; test only its assigned "
-                f"requirements {dumps(task['reqs'])}. Return exactly {shard_path(task_id, True)}. "
+                f"requirements {dumps(task['reqs'])}. Return exactly {shard(task_id, True)}. "
                 "Use actual declared dependencies together through the owning task's public API. "
                 "Derive assertions independently from the original spec; no candidate code or "
                 "other designer's tests are supplied. Distinguish failures at each layer of "
@@ -513,7 +551,36 @@ def test_prompt(
             ]) + "\nEvery edge refers to the frozen tasks and requirement texts below.\n"
     return (
         SPEC_AUTHORITY
-        + "Independently design frozen stdlib unittest tests from the ORIGINAL SPEC, existing "
+        + (_python_test_rules() if not generic else GENERIC_TEST_RULES)
+        + "\n## ORIGINAL SPEC\n" + spec + "\n## EXISTING INTERFACES\n" + repo
+        + "\n## ASSIGNED TEST SHARD\n" + assignment
+        + render_files("PINNED EXISTING SOURCE (before this task)", sources or {})
+        + dumps({"boundary": boundary, "errors": errors})
+    )
+
+
+GENERIC_TEST_RULES = (
+    "Independently design frozen tests from the ORIGINAL SPEC, existing interface map and "
+    "boundary stubs below, in the language and test framework the tested component uses "
+    "(the project's own runner where it has one). The pinned existing source describes "
+    "legacy API behaviour, not a candidate solution. Preserve that behaviour unless the "
+    "ORIGINAL SPEC explicitly changes it; check calling conventions, ordering and error "
+    "handling. Derive expected values from the spec; build fixtures that exercise those "
+    "values. Return only {files:[{path,content}], command}: new test files, and one shell "
+    "command, run from the repository root, that runs exactly these tests and exits non-zero "
+    "when any fails. Never return/edit boundary code, requirements, contracts or task "
+    "ownership. Name each test after its requirement (R<N>) and cover normal, boundary and "
+    "failure cases of every assigned requirement with explicit expected values or errors. "
+    "Each requirement needs tests which fail against the stubs. No network, external "
+    "filesystem or subprocess use beyond the test runner; temporary directories are allowed "
+    "when the spec requires files. Do not weaken the contract to accommodate stubs. "
+    "Verification environment: " + SANDBOX_NOTE + "\n"
+)
+
+
+def _python_test_rules() -> str:
+    return (
+        "Independently design frozen stdlib unittest tests from the ORIGINAL SPEC, existing "
         "interface map and boundary stubs below. The pinned existing source describes legacy "
         "API behaviour, not a candidate solution. Preserve that behaviour unless the ORIGINAL "
         "SPEC explicitly changes it; check calling conventions, ordering and error handling. "
@@ -526,10 +593,6 @@ def test_prompt(
         "requirement needs tests which fail against the stubs. No unlisted packages, network, "
         "external filesystem or subprocess use. TemporaryDirectory in the sandbox is allowed "
         "when required by the spec. Do not weaken the contract to accommodate stubs.\n"
-        + "\n## ORIGINAL SPEC\n" + spec + "\n## EXISTING INTERFACES\n" + repo
-        + "\n## ASSIGNED TEST SHARD\n" + assignment
-        + render_files("PINNED EXISTING SOURCE (before this task)", sources or {})
-        + dumps({"boundary": boundary, "errors": errors})
     )
 
 

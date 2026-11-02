@@ -5,15 +5,16 @@ from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 
 from orchestragent.dsh import DshClient
-from orchestragent.live_workspace import LiveWorkspace
+from orchestragent.live_workspace import LiveWorkspace, safe_relative
 from orchestragent.orch_excerpt import definition_view, excerpt
 from orchestragent.orch_index import Index, RepoIndex, dependency_code
 from orchestragent.serialization import dumps
 
 
-def planning_sources(index: Index, revision: str, paths: Iterable[str]) -> dict[str, str]:
+def planning_sources(index: Index, revision: str, paths: Iterable[str], *,
+                     any_file: bool = False) -> dict[str, str]:
     """Legacy task files plus referenced definitions, never a transitive module import dump."""
-    selected = sorted({path for path in paths if path.endswith(".py")
+    selected = sorted({path for path in paths if path.endswith(".py") or any_file
                        and not LiveWorkspace.is_test_file(path)})
     snapshot = index.at(revision)
     sources = index.read(revision, selected)
@@ -47,16 +48,17 @@ def owned_sources(
 
 def requested_sources(
     index: Index, tree: Path, revision: str, selectors: object, *, catalog_bytes: int = 0,
+    any_file: bool = False,
 ) -> dict[str, str]:
     """Resolve explicit Python file/symbol reads at one candidate revision."""
     if (not isinstance(selectors, list) or not 1 <= len(selectors) <= 16
             or any(not isinstance(item, str) for item in selectors)):
-        raise ValueError("need_files must be a nonempty list of Python paths or path::symbol")
+        raise ValueError("need_files must be a nonempty list of tracked paths or path::symbol")
     names = sorted(str(item) for item in selectors)
     if len(set(names)) != len(names):
         raise ValueError("need_files selectors must be unique")
     paths = list(dict.fromkeys(name.split("::", 1)[0] for name in names))
-    guard = ScopedContext(index, tree, revision, "", 32768)
+    guard = ScopedContext(index, tree, revision, "", 32768, any_file=any_file)
     guard.request(paths, revision)
     repo = index.at(revision)
     sources = index.read(revision, paths)
@@ -89,7 +91,9 @@ def requested_sources(
 
 
 class ScopedContext:
-    def __init__(self, index: Index, tree: Path, base: str, spec: str, limit: int) -> None:
+    def __init__(self, index: Index, tree: Path, base: str, spec: str, limit: int, *,
+                 any_file: bool = False) -> None:
+        self.any_file = any_file
         self.index, self.tree, self.base, self.spec = index, tree, base, spec
         self.limit = min(limit, DshClient.input_limit)
         original = index.tree(base)
@@ -109,7 +113,9 @@ class ScopedContext:
     def _safe(self, path: str, tracked: dict[str, str]) -> bool:
         target = self.tree / path
         return (
-            LiveWorkspace.safe_path(path) and path.endswith(".py") and path in tracked
+            path in tracked
+            and (LiveWorkspace.safe_path(path) and path.endswith(".py")
+                 or self.any_file and safe_relative(path))
             and not target.is_symlink()
             and target.resolve().is_relative_to(self.tree.resolve())
         )

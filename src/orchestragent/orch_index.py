@@ -621,6 +621,9 @@ class RepoIndex:
             return tests
         chosen = []
         for test in tests:
+            if test.startswith("cmd:"):  # a declared check: always selected
+                chosen.append(test)
+                continue
             path = self.modules.get(test.rsplit(".", 2)[0])
             closure = self.reach(path) if path is not None else frozenset()
             if (
@@ -662,6 +665,8 @@ class RepoIndex:
         found = [(path, name) for path in files if path in self.files
                  for name in self.files[path].refs]
         for test in tests:
+            if test.startswith("cmd:") or test.count(".") < 2:
+                continue  # a model-declared check (orch_verify), not a dotted unittest id
             module, owner, method = test.rsplit(".", 2)
             path = self.modules.get(module)
             if path is None:
@@ -895,7 +900,7 @@ class Index:
         return found
 
     def read(self, revision: str, paths: Iterable[str] | None = None,
-             suffix: str = "") -> dict[str, str]:
+             suffix: str | tuple[str, ...] = "") -> dict[str, str]:
         """File contents at `revision` in one batch: named paths, or every path ending
         in `suffix`. Missing paths are left out."""
         tree = self.tree(revision)
