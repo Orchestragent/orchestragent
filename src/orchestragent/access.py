@@ -196,6 +196,24 @@ class Access:
         value = result.stdout.decode("utf-8", "replace").strip()
         return value if 10 <= len(value) <= 16384 else ""
 
+    def save_secret(self, name: str, value: str) -> None:
+        """Store a bring-your-own key for a registered provider (Keychain on macOS, else a
+        0600 file in the data directory). Never logged, never in the state database."""
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
+            raise ValueError("provider names are lower-case letters, digits, - and _")
+        if not 10 <= len(value) <= 16384 or any(not 33 <= ord(c) <= 126 for c in value):
+            raise ValueError("Enter the API key locally (10-16384 visible characters)")
+        if is_macos() and self._persist():
+            self._keychain_store(f"byok-{name}", value)
+        else:
+            self._file_store(f"byok-{name}", value)
+
+    def load_secret(self, name: str) -> str:
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
+            return ""
+        return (self._keychain_load(f"byok-{name}") if is_macos() and self._persist()
+                else self._file_load(f"byok-{name}"))
+
     def restore_keys(self) -> None:
         """Reload persisted keys for providers that already have a budget grant."""
         if not self._persist():

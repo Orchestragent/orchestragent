@@ -27,6 +27,8 @@ live (`orch watch`).
 - Linux with [bubblewrap](https://github.com/containers/bubblewrap) (`apt install bubblewrap`),
   or macOS (uses the built-in `sandbox-exec`)
 - Python 3.12+ and git
+- Models: for the verified (benchmarked) set, the two below; any role can instead use
+  another CLI subscription or API key — see [Models](#models-bring-your-own-cli-or-key-swap-any-role).
 - [Claude Code](https://code.claude.com), authenticated the way Claude Code supports — the
   planner. Either log in with a Claude subscription (`claude auth login`), or use an
   Anthropic API key exactly as Claude Code documents it (`export ANTHROPIC_API_KEY=...`;
@@ -90,28 +92,50 @@ orch status && orch cost              # outcome and spend
 git diff HEAD...orch/<run_id>         # review, then merge it yourself
 ```
 
-## Models: use the verified set, or swap any role
+## Models: bring your own CLI or key, swap any role
 
-orch has four roles. The defaults are exactly what the benchmarks below measured:
+orch is the architecture; the models are yours. Every role can be served by a CLI you
+are logged into with your own subscription (**BYOC**) or by an API key (**BYOK**):
 
-| role | verified default | can be swapped to |
+| provider | how | kind |
 |---|---|---|
-| planner | `claude/claude-opus-5-5:medium` | any Claude model and effort (`opus`, `sonnet`, `haiku` 5.5) |
-| test_designer | `dsh/deepseek-flash:low` | `dsh/deepseek-flash` or `dsh/deepseek-v4-pro`, effort `off`–`max` |
-| builder | `dsh/deepseek-flash:low` | same as the test designer |
-| reviewer | `planner` | `opus-low`, `sonnet`, `sonnet-high`, `dsf`, or `off` |
+| `claude/<model>:<effort>` | Claude Code — `claude auth login`, or `ANTHROPIC_API_KEY` as Claude Code documents | BYOC or BYOK |
+| `codex/<model>:<effort>` | Codex CLI, logged in with your ChatGPT plan or key | BYOC or BYOK |
+| `cursor/<model>` | Cursor CLI, logged in with your Cursor plan | BYOC |
+| `dsh/deepseek-flash:<effort>` | DeepSeek (DSH CLI or direct API) — `orch keys dsh` | BYOK |
+| `<name>/<model>[:effort]` | any OpenAI-compatible API you register (OpenAI, Qwen, Moonshot, Zhipu, OpenRouter, a local Ollama or vLLM, ...) | BYOK |
 
 ```sh
-orch models                                   # current choice per role, verified or not
-orch models set builder dsh/deepseek-v4-pro:low
-orch models reset                             # back to the benchmarked set
+orch providers add openrouter --base-url https://openrouter.ai/api/v1 --key-env OPENROUTER_API_KEY
+orch providers add local --base-url http://localhost:11434/v1     # Ollama, no key needed
+orch keys qwen                                                     # or store a key locally
+orch providers test openrouter some/model                          # one tiny real request
+orch models set builder openrouter/some/model
 ```
 
-Anything other than the verified set works through the same adapters but has not been
-benchmarked: results may differ (for example, letting DeepSeek review DeepSeek-written
-tests missed correlated mistakes in our runs). `orch doctor` says when a custom set is
-active. Other vendors' models are not wired in yet; contributions with benchmark runs are
-welcome.
+The four roles and the **verified set** — the combination the benchmarks below measured.
+Keep it to reproduce our results ("copy the homework"), or swap anything:
+
+| role | verified default | what it does |
+|---|---|---|
+| planner | `claude/claude-opus-5-5:medium` | splits the spec into tasks, boundaries and interfaces |
+| test_designer | `dsh/deepseek-flash:low` | writes each task's frozen tests |
+| builder | `dsh/deepseek-flash:low` | implements tasks against the frozen tests |
+| reviewer | `planner` (or `opus-low`, `sonnet`, `sonnet-high`, `dsf`, `off`) | checks each test shard before freezing |
+
+```sh
+orch models                 # each role's model, and whether it is the verified set
+orch models reset           # back to the benchmarked set
+```
+
+Anything else works through the same adapters but has not been benchmarked: quality, speed
+and cost may differ (for example, letting a model review its own tests missed correlated
+mistakes in our runs). `orch doctor` says when a custom set is active. Roles need models
+that reliably return JSON; strong reasoning matters most for the planner and test designer.
+
+**Use providers within their terms.** Some consumer subscriptions do not allow automated
+or third-party use; don't connect those (orch refuses the ones it knows, e.g. Kimi's).
+See [DISCLAIMER.md](DISCLAIMER.md).
 
 ## Use orch from other agents (MCP)
 
@@ -189,4 +213,5 @@ recorded and shown by `orch cost` / `orch doctor`, and only your provider balanc
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE). Use of model providers through orch is subject to
+their terms; see [DISCLAIMER.md](DISCLAIMER.md).

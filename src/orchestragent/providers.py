@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
-from orchestragent import deepseek_api
+from orchestragent import byok, deepseek_api
 from orchestragent.access import REJECTED_STATUSES, Access
 from orchestragent.catalog import models as catalog_models
 from orchestragent.cursor import CursorClient
@@ -144,7 +144,12 @@ class ProviderClients(NativeClients):
         if provider == "cursor":
             return self.cursor.call(model, prompt, schema, run_id, cancelled)
         if provider != "dsh":
-            return NativeResult("failed", {}, message="Unknown provider")
+            entry = byok.registry(self.provider_root).get(provider)
+            if entry is None:
+                return NativeResult("failed", {}, message="Unknown provider")
+            key = byok.api_key(entry, lambda: self.access.load_secret(provider))
+            return byok.call(entry, key, model, str(prompt), schema, cancelled,
+                             self.call_timeout(effort), effort)
         if model not in {"deepseek-flash", "deepseek-v4-pro"}:
             return NativeResult("failed", {}, message="Unsupported DSH model; no fallback")
         if not self.dsh.account and not self.access.key(provider):

@@ -16,6 +16,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, replace
+from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -296,6 +297,14 @@ def doctor_lines(
                    "models: custom, unverified (" + ", ".join(
                        f"{role}={value}" for role, value in custom.items())
                    + ") -> orch models reset restores the verified set"))
+    from orchestragent import byok
+    data = default_data_dir()
+    for name, entry in byok.registry(data).items():
+        has_key = bool(byok.api_key(entry, partial(Access(data).load_secret, name)))
+        local = str(entry.get("base_url", "")).startswith("http://localhost")
+        checks.append((has_key or local, f"provider {name} ({entry.get('base_url')}): "
+                       + ("key present" if has_key else "local, no key" if local
+                          else f"key missing -> orch keys {name}")))
     claude = cast(dict[str, object], providers.get("claude", {}))
     claude_modes = {
         "claude_subscription": "Claude subscription",
@@ -594,8 +603,9 @@ def parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="check logins, DSF budget, sandbox and repository")
     doctor.add_argument("--allow-unverified-auth", action="store_true",
                         help="allow configured first inference; known auth rejection still fails")
-    keys = commands.add_parser("keys", help="bring your own key: DeepSeek (dsh) or Jev")
-    keys.add_argument("provider", choices=("dsh", "jev"))
+    keys = commands.add_parser(
+        "keys", help="bring your own key: dsh (DeepSeek), jev, or a registered provider")
+    keys.add_argument("provider", help="dsh, jev, or a name from `orch providers list`")
     keys.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)  # no longer asked
     keys.add_argument("--key-stdin", action="store_true",
                       help="read the key from stdin (unattended setup); never pass it as an arg")
@@ -712,6 +722,23 @@ def parser() -> argparse.ArgumentParser:
                        help="authorize retry despite unresolved possibly billable calls")
     retry.add_argument("--discard-candidate", action="store_true",
                        help="discard saved code and authorize fresh generation")
+    providers_cmd = commands.add_parser(
+        "providers", help="bring-your-own-key providers (any OpenAI-compatible API)")
+    providers_commands = providers_cmd.add_subparsers(dest="providers_command")
+    provider_add = providers_commands.add_parser("add", help="register an endpoint")
+    provider_add.add_argument("name")
+    provider_add.add_argument("--base-url", required=True,
+                              help="e.g. https://api.openai.com/v1 or http://localhost:11434/v1")
+    provider_add.add_argument("--key-env", default="",
+                              help="read the key from this environment variable")
+    provider_add.add_argument("--max-tokens", type=int, default=0,
+                              help="output limit to request (0 = provider default)")
+    providers_commands.add_parser("list", help="registered providers (the default)")
+    provider_remove = providers_commands.add_parser("remove", help="unregister")
+    provider_remove.add_argument("name")
+    provider_test = providers_commands.add_parser("test", help="one tiny real request")
+    provider_test.add_argument("name")
+    provider_test.add_argument("model")
     models = commands.add_parser(
         "models", help="which model serves each role; the benchmarked set is the default")
     models_commands = models.add_subparsers(dest="models_command")
@@ -973,6 +1000,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             if result["passed_trials"] == result["expected_trials"]:
                 return 0
             return 4 if result["success_rate"] is None else 3
+        if args.command == "providers":
+            from orchestragent import byok
+            if args.providers_command == "add":
+                print(byok.add(data_dir, args.name, args.base_url, args.key_env,
+                               args.max_tokens))
+            elif args.providers_command == "remove":
+                print(byok.remove(data_dir, args.name))
+            elif args.providers_command == "test":
+                entry = byok.registry(data_dir).get(args.name)
+                if entry is None:
+                    raise ValueError(f"no provider named {args.name}; orch providers add")
+                key = byok.api_key(entry, lambda: Access(data_dir).load_secret(args.name))
+                print(f"{args.name}/{args.model}: {byok.probe(entry, key, args.model)}")
+            else:
+                entries = byok.registry(data_dir)
+                if not entries:
+                    print("no providers registered; orch providers add NAME --base-url URL")
+                for name, entry in entries.items():
+                    source = (f"${entry['key_env']}" if entry.get("key_env")
+                              else "orch keys " + name)
+                    print(f"{name:<14} {entry['base_url']:<40} key: {source}")
+            return 0
+        if args.command == "keys" and args.provider not in {"dsh", "jev"}:
+            from orchestragent import byok
+            if args.provider not in byok.registry(data_dir):
+                raise ValueError(f"unknown provider {args.provider}: register it first with "
+                                 "orch providers add")
+            try:
+                value = (sys.stdin.readline() if args.key_stdin
+                         else getpass.getpass(f"{args.provider} API key: ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\norch keys: cancelled; nothing was stored", file=sys.stderr)
+                return 1
+            Access(data_dir).save_secret(args.provider, value)
+            print(f"{args.provider}: key stored on this machine")
+            return 0
         if args.command == "keys":
             try:
                 lines = keys_lines(Access(data_dir), args.provider, args.key_stdin)

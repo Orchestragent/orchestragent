@@ -6,13 +6,19 @@ VERIFIED set is what the published benchmarks measured; any other choice works t
 the same adapters but is unverified. Precedence: environment variable > the user's
 `orch models set` file (<data dir>/models.json) > the verified default.
 
-A route is written `provider/model:effort`; the reviewer takes a short name.
+A route is written `provider/model:effort`; the reviewer takes a short name. Providers:
+bring your own CLI subscription or key — `claude` (Claude Code), `codex` (Codex CLI),
+`cursor` (Cursor CLI) — or bring your own key — `dsh` (DeepSeek, pinned route) and any
+OpenAI-compatible endpoint registered with `orch providers add`. Kimi's subscription
+forbids non-interactive automation and is refused. Using each provider within its terms is
+the user's responsibility (DISCLAIMER.md).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,13 +32,17 @@ class Choice:
     effort: str
 
     def __str__(self) -> str:
-        return f"{self.provider}/{self.model}:{self.effort}"
+        return f"{self.provider}/{self.model}" + (f":{self.effort}" if self.effort else "")
 
 
-CLAUDE_MODELS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
 CLAUDE_EFFORTS = ("low", "medium", "high", "max")
+CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DSF_MODELS = ("deepseek-flash", "deepseek-v4-pro")
 DSF_EFFORTS = ("off", "low", "high", "max")
+BYOK_EFFORTS = ("", "low", "medium", "high")
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}")
+# Subscriptions whose terms forbid automated, non-interactive use.
+FORBIDDEN = {"kimi": "Kimi's subscription does not allow non-interactive automation"}
 REVIEWERS = ("planner", "opus-low", "sonnet", "sonnet-high", "dsf", "off")
 
 ROLES = ("planner", "test_designer", "builder", "reviewer")
@@ -58,7 +68,7 @@ ENVIRONMENT = {
 }
 
 
-def parse(role: str, value: str) -> Choice | str:
+def parse(role: str, value: str, data_dir: Path | None = None) -> Choice | str:
     """Validate one role's value: a Choice for model roles, a name for the reviewer."""
     if role not in ROLES:
         raise ValueError(f"role must be one of {', '.join(ROLES)}")
@@ -68,14 +78,29 @@ def parse(role: str, value: str) -> Choice | str:
             raise ValueError(f"reviewer must be one of {', '.join(REVIEWERS)}")
         return value
     provider, _, rest = value.partition("/")
-    model, _, effort = rest.partition(":")
-    if role == "planner":
-        if provider != "claude" or model not in CLAUDE_MODELS or effort not in CLAUDE_EFFORTS:
-            raise ValueError("planner must be claude/<" + "|".join(CLAUDE_MODELS) + ">:<"
-                             + "|".join(CLAUDE_EFFORTS) + ">")
-    elif provider != "dsh" or model not in DSF_MODELS or effort not in DSF_EFFORTS:
-        raise ValueError(f"{role} must be dsh/<" + "|".join(DSF_MODELS) + ">:<"
-                         + "|".join(DSF_EFFORTS) + ">")
+    model, _, effort = rest.rpartition(":") if ":" in rest else (rest, "", "")
+    if provider not in {"claude", "codex", "cursor", "dsh"} and effort not in BYOK_EFFORTS:
+        model, effort = rest, ""  # e.g. an Ollama tag such as qwen2.5:7b
+    if provider in FORBIDDEN:
+        raise ValueError(f"{provider} refused: {FORBIDDEN[provider]}")
+    if not MODEL_ID.fullmatch(model or "-"):
+        raise ValueError(f"{role}: model id missing or invalid in {value!r}")
+    allowed = {"claude": CLAUDE_EFFORTS, "codex": CODEX_EFFORTS, "cursor": ("",),
+               "dsh": DSF_EFFORTS}
+    if provider == "dsh" and model not in DSF_MODELS:
+        raise ValueError("dsh serves " + " or ".join(DSF_MODELS)
+                         + "; register other DeepSeek models as a provider")
+    if provider in allowed:
+        if effort not in allowed[provider]:
+            raise ValueError(f"{provider} effort must be one of "
+                             + ", ".join(e or "(none)" for e in allowed[provider]))
+    else:
+        from orchestragent.byok import registry
+        if provider not in registry(data_dir or default_data_dir()):
+            raise ValueError(f"unknown provider {provider!r}: use claude, codex, cursor, dsh "
+                             "or register one with `orch providers add`")
+        if effort not in BYOK_EFFORTS:
+            raise ValueError("a registered provider takes effort low, medium, high or none")
     return Choice(provider, model, effort)
 
 
@@ -116,16 +141,16 @@ def effective(data_dir: Path | None = None) -> dict[str, tuple[str, str]]:
             result[role] = (stored[role], "config")
         else:
             result[role] = (VERIFIED[role], "verified")
-        parse(role, result[role][0])  # fail early and clearly on a bad value
+        parse(role, result[role][0], data_dir)  # fail early and clearly on a bad value
     return result
 
 
 def choose(role: str, data_dir: Path | None = None) -> Choice | str:
-    return parse(role, effective(data_dir)[role][0])
+    return parse(role, effective(data_dir)[role][0], data_dir)
 
 
 def set_role(role: str, value: str, data_dir: Path | None = None) -> str:
-    parse(role, value)
+    parse(role, value, data_dir)
     stored = saved(data_dir)
     stored[role] = value
     path = config_path(data_dir)

@@ -89,7 +89,8 @@ def output_cut(usage: dict[str, object]) -> bool:
 
 def settled_json_failure(outcome: str, message: str, usage: dict[str, object]) -> bool:
     return (outcome == "failed" and not unresolved(outcome, usage)
-            and message.startswith(("Invalid DSH JSON result", "Invalid DeepSeek JSON result")))
+            and message.startswith(("Invalid DSH JSON result", "Invalid DeepSeek JSON result",
+                                    "Invalid JSON result")))
 
 
 def transient(outcome: str, message: str, usage: dict[str, object]) -> bool:
@@ -104,7 +105,8 @@ def transient(outcome: str, message: str, usage: dict[str, object]) -> bool:
     if (outcome != "failed" or output_cut(usage) or "rejected" in usage
             or settled_json_failure(outcome, message, usage)):
         return False
-    return (bool(usage.get("turn_error")) or message.startswith("DSH upstream HTTP 5")
+    return (bool(usage.get("turn_error"))
+            or message.startswith(("DSH upstream HTTP 5", "upstream HTTP 5"))
             or message == "DSH process stopped without a valid result")
 
 

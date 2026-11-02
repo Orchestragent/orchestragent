@@ -2013,3 +2013,18 @@ def test_first_build_effort_switch_applies_only_to_a_tasks_first_dsf_attempt(
     assert run.status == "done"
     assert ("T-001", 1, "off-extended") in builds and ("T-002", 1, "off-extended") in builds
     assert [e for t, a, e in builds if t == "T-001" and a > 1] == ["low-extended"]
+
+
+def test_a_registered_byok_builder_runs_the_whole_ladder_entry(
+    orchestrator: Orchestrator, caller: ScriptedCaller, planned: Run,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = Route("myapi", "some-model", "")
+    monkeypatch.setattr("orchestragent.orch_run.DSF", builder)
+    monkeypatch.setattr("orchestragent.orch_run.DSF_BUILD_FIRST", builder)
+    monkeypatch.setattr("orchestragent.orch_run.DSF_EXTENDED", builder)
+    caller.responses.update({"myapi:T-001": [GOOD_ADD], "myapi:T-002": [GOOD_DOUBLE]})
+    run = orchestrator.execute(planned.id, jobs=1)
+    builds = {(c.provider, c.model, c.effort) for c in orchestrator.state.usage.calls(run.id)
+              if c.purpose == "build"}
+    assert run.status == "done" and builds == {("myapi", "some-model", "")}

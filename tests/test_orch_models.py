@@ -24,7 +24,8 @@ def test_the_default_is_the_verified_benchmark_set(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(("role", "value"), [
     ("planner", "openai/gpt:high"), ("planner", "claude/claude-opus-5-5:extreme"),
-    ("builder", "claude/claude-opus-5-5:low"), ("test_designer", "dsh/deepseek-chat:low"),
+    ("builder", "claude/claude-opus-5-5:extreme"), ("test_designer", "dsh/deepseek-chat:low"),
+    ("builder", "kimi/k3"), ("builder", "unregistered/model"), ("builder", "codex/"),
     ("reviewer", "gpt"), ("pilot", "x"),
 ])
 def test_unsupported_choices_are_refused_with_the_allowed_form(role: str, value: str) -> None:
@@ -70,3 +71,19 @@ def test_the_engine_uses_the_configured_roles(tmp_path: Path) -> None:
     out = subprocess.run([sys.executable, "-c", probe], env=env, capture_output=True,
                          text=True, check=True).stdout.split()
     assert out == ["deepseek-v4-pro", "deepseek-v4-pro", "False", "medium"]
+
+
+def test_byoc_and_registered_byok_providers_serve_any_model_role(tmp_path: Path) -> None:
+    from orchestragent import byok
+    byok.add(tmp_path, "local", "http://localhost:11434/v1")
+    assert parse("builder", "codex/gpt-6-astra:high", tmp_path) == Choice(
+        "codex", "gpt-6-astra", "high")
+    assert parse("planner", "cursor/composer-2.5", tmp_path) == Choice(
+        "cursor", "composer-2.5", "")
+    assert parse("test_designer", "local/qwen2.5:7b", tmp_path) == Choice(
+        "local", "qwen2.5:7b", "")  # an Ollama tag stays part of the model id
+    assert parse("planner", "local/llama:high", tmp_path) == Choice("local", "llama", "high")
+    with pytest.raises(ValueError, match="refused"):
+        parse("planner", "kimi/k3", tmp_path)
+    assert "unverified" in set_role("builder", "local/qwen2.5:7b", tmp_path)
+

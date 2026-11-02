@@ -73,10 +73,12 @@ PATH="$HOME/.local/bin:$PATH"; export PATH
 
 # 3. Models: Claude Code plans, DeepSeek designs tests and builds.
 if have claude; then
-  say "  ok  Claude Code CLI (planner); log in once with: claude auth login"
+  say "  ok  Claude Code CLI (planner): claude auth login, or ANTHROPIC_API_KEY"
 else
-  say "  FIX Claude Code CLI (the planner, on your Claude subscription):"
-  say "      curl -fsSL https://claude.ai/install.sh | bash && claude auth login"
+  say "  ..  Claude Code CLI not found. It is the verified planner (or pick another"
+  say "      model per role: orch models / orch providers). To install it:"
+  say "      curl -fsSL https://claude.ai/install.sh | bash"
+  say "      then: claude auth login (subscription) or export ANTHROPIC_API_KEY=..."
 fi
 if ask "Store your DeepSeek API key for orch now?"; then
   run orch keys dsh

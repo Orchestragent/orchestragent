@@ -206,19 +206,21 @@ EARLY_INTERFACE_START = False
 # The same model and reasoning effort with the wider output budget. Each DSF test-design
 # and build call uses it whenever the call reservation covers that exact request (see
 # _widened); the limit is a ceiling, not a target length. Larger requests keep DSF.
-DSF_EXTENDED = Route("dsh", DSF.model, DSF.effort + EXTENDED)
+# Only the pinned DSH route has the extended output tier; other builders keep their route.
+DSF_EXTENDED = (Route("dsh", DSF.model, DSF.effort + EXTENDED) if DSF.provider == "dsh"
+                else DSF)
 # Test design's reasoning effort. On Boltons at 6d701aa ~85% of each test-design call's
 # output was hidden reasoning (the T-004 integration shard: ~5k answer tokens, 28-40k
 # output, 150-199 s on the critical path). Thinking off made wrong tests (49c8313), so the
 # verified test designer keeps low; it is the `test_designer` role.
 _DESIGNER = cast(ModelChoice, choose_model("test_designer"))
-DSF_TEST = Route("dsh", _DESIGNER.model, _DESIGNER.effort)
+DSF_TEST = Route(_DESIGNER.provider, _DESIGNER.model, _DESIGNER.effort)
 # Effort of a task's FIRST DSF build attempt only; later attempts keep DSF. A build, unlike
 # a frozen test, is checked at once by the tests and a retry sees the exact failure, so a
 # fast optimistic first attempt may win overall (T-004 builds at 6d701aa: ~3-4k answer
 # tokens in 9-28k output, 43-141 s). ORCHESTRA_DSF_BUILD_FIRST_EFFORT=off|low|high, for a
 # measured comparison; low (= DSF) stays the default.
-DSF_BUILD_FIRST = Route("dsh", DSF.model,
+DSF_BUILD_FIRST = Route(DSF.provider, DSF.model,
                         os.environ.get("ORCHESTRA_DSF_BUILD_FIRST_EFFORT", DSF.effort))
 if DSF_BUILD_FIRST.effort not in {"off", "low", "high"}:
     raise ValueError("ORCHESTRA_DSF_BUILD_FIRST_EFFORT must be off, low or high")
@@ -227,8 +229,11 @@ CLAUDE_PLAN = Route("claude", "claude-opus-5-5", "high")
 # Boltons, Linux: Opus high planned in 74-105 s (6d701aa, 5 runs); medium in 37-54 s with
 # 5/5 runs passing acceptance and no replans (284bde9). It is the `planner` role.
 _PLANNER = cast(ModelChoice, choose_model("planner"))
-PLANNER = Route("claude", _PLANNER.model, _PLANNER.effort)
-CLAUDE_PATCH = Route("claude", "claude-opus-5-5", "medium")
+PLANNER = Route(_PLANNER.provider, _PLANNER.model, _PLANNER.effort)
+# Repairs (failure ladder level 3) use Opus at medium with a Claude planner; with any other
+# planner they use the planner's own route, so no provider is used that was not chosen.
+CLAUDE_PATCH = (Route("claude", "claude-opus-5-5", "medium") if PLANNER.provider == "claude"
+                else PLANNER)
 SONNET_PLAN = Route("claude", "claude-sonnet-5-5", "medium")
 # Outcomes that say nothing about the task: stop dispatching, keep the task READY.
 STOP = frozenset(
@@ -1104,16 +1109,17 @@ class Orchestrator:
 
     @staticmethod
     def _extended(route: Route) -> Route:
-        return replace(route, effort=route.effort + EXTENDED)
+        return replace(route, effort=route.effort + EXTENDED) if route.provider == "dsh" \
+            else route
 
     def _widened(self, route: Route, prompt: str, schema: dict[str, object]) -> Route | None:
         """The extended-output route when the per-call reservation bounds this exact
         request's worst case: every request byte billed as an input token plus the full
         extended output."""
-        if route not in {DSF, DSF_TEST, DSF_BUILD_FIRST}:
+        if route not in {DSF, DSF_TEST, DSF_BUILD_FIRST} or route.provider != "dsh":
             return None
         wide = self._extended(route)
-        prices = DSH_PRICE_FEN_PER_MTOK[DSF.model]
+        prices = DSH_PRICE_FEN_PER_MTOK[route.model]
         request = len((self.environment_text + DshClient.task_text(prompt, schema)).encode())
         worst = (request * max(prices["input_tokens"], prices["cache_creation_input_tokens"])
                  + DshClient.output_settings(wide.effort)[0] * prices["output_tokens"])
