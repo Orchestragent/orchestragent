@@ -142,8 +142,9 @@ def test_orch_app_bundle_is_valid_and_its_launcher_serves_the_dashboard(
         install_app(tmp_path / "Other.app")
 
 
-SOURCE_ENTRY: dict[str, object] = {"command": "/py", "args": ["-m", "orchestragent.orch_cli", "mcp"],
-                                   "env": {"PYTHONPATH": "/src"}}
+SOURCE_ENTRY: dict[str, object] = {
+    "command": "/py", "args": ["-m", "orchestragent.orch_cli", "mcp"],
+    "env": {"PYTHONPATH": "/src"}}
 
 
 def test_each_host_gets_its_own_config_shape(tmp_path: Path,
@@ -166,7 +167,8 @@ def test_each_host_gets_its_own_config_shape(tmp_path: Path,
     gemini = json.loads((tmp_path / ".gemini" / "settings.json").read_text())["mcpServers"]["orch"]
     # Gemini CLI refuses PYTHONPATH overrides, so the source path is put on sys.path in -c
     assert "env" not in gemini and gemini["timeout"] == 660000
-    assert gemini["args"][0] == "-c" and "'/src'" in gemini["args"][1] and gemini["args"][2] == "mcp"
+    assert gemini["args"][0] == "-c" and gemini["args"][2] == "mcp"
+    assert "'/src'" in gemini["args"][1]
     assert config_path("vscode", tmp_path) == tmp_path / "cfg" / "Code" / "User" / "mcp.json"
     monkeypatch.setattr(orch_desktop, "is_macos", lambda: True)
     assert config_path("vscode", tmp_path) == (

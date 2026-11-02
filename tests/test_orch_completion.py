@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from orchestragent import orch_desktop
 from orchestragent.orch_cli import main, parser
 from orchestragent.orch_completion import commands, render
 
@@ -39,7 +40,7 @@ def test_bash_completion_offers_subcommands_flags_and_choices(tmp_path: Path) ->
     lines = subprocess.run(["bash", "-c", probe], capture_output=True, text=True,
                            check=True).stdout.splitlines()
     assert lines[0] == "watch"
-    assert lines[1].split() == ["claude-code", "cursor", "claude-desktop"]
+    assert lines[1].split() == list(orch_desktop.CLIENTS)
 
 
 def test_suppressed_flags_are_not_offered() -> None:
