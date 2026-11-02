@@ -260,6 +260,9 @@ def agent_test(output: Path, nodeids: list[str] | None = None) -> None:
     raise SystemExit(0 if passed else 1)
 
 
+SINGLE_AGENT_OUTPUT_LIMIT = 512 * 1024 * 1024
+
+
 def single_agent(orch, clients, case, output, base, trial, result, phases, timeout,
                  effort="high"):
     """One native subscription agent with real file tools and a fixed sandbox test command."""
@@ -301,9 +304,14 @@ def single_agent(orch, clients, case, output, base, trial, result, phases, timeo
                    base_revision=base)
     started = time.monotonic()
     print("[single-agent] Opus reads, edits and tests the same repository", flush=True)
+    # A long native session streams every tool input and result; the 2 MB default would
+    # kill it mid-run and lose its usage, which is unfair to the baseline being measured.
+    clients.output_limit = SINGLE_AGENT_OUTPUT_LIMIT
     with orch.state.usage.capture(receipt):
         outcome, code, stdout, stderr = clients._run(
             argv, orch.repo, prompt, timeout, orch.cancel.is_set)
+        (output / "single-agent-stream.jsonl").write_bytes(stdout)
+        result["single_agent_stream_bytes"] = len(stdout) + len(stderr)
         native = (clients._decode("claude", code, stdout, stderr) if outcome == "ok"
                   else NativeResult(outcome, {}, message="Native single agent did not finish"))
         receipt.outcome, receipt.usage, receipt.session_id = (
