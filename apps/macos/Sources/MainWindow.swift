@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 struct MainWindow: View {
     @Bindable var store: AppStore
     @State private var showNewRun = false
+    @State private var showProjectPicker = false
     @State private var showShortcuts = false
     @State private var cancelID: String?
     @State private var didStart = false
@@ -33,6 +34,12 @@ struct MainWindow: View {
             .toolbar { toolbar }
         }
         .sheet(isPresented: $showNewRun) { NewRunSheet(store: store) }
+        .sheet(isPresented: $showProjectPicker) {
+            ProjectPicker(store: store) {
+                showProjectPicker = false
+                DispatchQueue.main.async { browseProject() }
+            }
+        }
         .sheet(isPresented: $showShortcuts) { shortcuts }
         .alert(L("Something needs attention", "需要处理"), isPresented: Binding(get: { store.error != nil }, set: { if !$0 { store.error = nil } })) {
             Button(L("OK", "好")) { store.error = nil }
@@ -229,13 +236,18 @@ struct MainWindow: View {
     }
     private func chooseProject() {
         if NSEvent.modifierFlags.contains(.option) { Task { await store.connect(repo: nil, demo: true) }; return }
+        showProjectPicker = true
+    }
+    private func browseProject() {
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
         panel.prompt = L("Open Project", "打开项目")
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        guard FileManager.default.fileExists(atPath: url.appending(path: ".git").path) else {
-            store.error = L("Choose a Git repository (a directory containing .git).", "请选择 Git 仓库目录（包含 .git 文件或目录）。"); return
+        panel.begin { response in
+            guard response == .OK else { return }
+            Task { @MainActor in
+                guard let url = panel.url else { return }
+                await store.connect(repo: url.path)
+            }
         }
-        Task { await store.connect(repo: url.path) }
     }
 }
 
@@ -295,7 +307,12 @@ private struct NewRunSheet: View {
     }
     private func importSpec() {
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.plainText, UTType(filenameExtension: "md") ?? .plainText]
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { spec = try String(contentsOf: url, encoding: .utf8) } catch { store.error = error.localizedDescription }
+        panel.begin { response in
+            guard response == .OK else { return }
+            Task { @MainActor in
+                guard let url = panel.url else { return }
+                do { spec = try String(contentsOf: url, encoding: .utf8) } catch { store.error = error.localizedDescription }
+            }
+        }
     }
 }

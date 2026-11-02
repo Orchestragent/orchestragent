@@ -192,7 +192,10 @@ struct StudioSettingsView: View {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.message = L("Choose the orch executable", "选择 orch 可执行文件")
-        if panel.runModal() == .OK, let url = panel.url { orchPath = url.path }
+        panel.begin { response in
+            guard response == .OK else { return }
+            Task { @MainActor in if let url = panel.url { orchPath = url.path } }
+        }
     }
     private func connectRemote() {
         serverError = nil

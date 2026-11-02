@@ -161,6 +161,22 @@
         }
       }
     },
+    "Browse…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Browse…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "浏览…"
+          }
+        }
+      }
+    },
     "Building": {
       "localizations": {
         "en": {
@@ -253,22 +269,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "对话"
-          }
-        }
-      }
-    },
-    "Choose a Git repository (a directory containing .git).": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Choose a Git repository (a directory containing .git)."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "请选择 Git 仓库目录（包含 .git 文件或目录）。"
           }
         }
       }
@@ -893,6 +893,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "完成"
+          }
+        }
+      }
+    },
+    "Enter a Git repository path, or choose a folder.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Enter a Git repository path, or choose a folder."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "输入 Git 仓库路径，或浏览文件夹。"
           }
         }
       }
@@ -1857,6 +1873,22 @@
         }
       }
     },
+    "Open a workspace": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open a workspace"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开工作区"
+          }
+        }
+      }
+    },
     "Open in Editor": {
       "localizations": {
         "en": {
@@ -1885,6 +1917,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "打开以检查此任务"
+          }
+        }
+      }
+    },
+    "Opening…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Opening…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在打开…"
           }
         }
       }
@@ -2285,6 +2333,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "报告问题"
+          }
+        }
+      }
+    },
+    "Repository path": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Repository path"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "仓库路径"
           }
         }
       }

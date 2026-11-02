@@ -7,7 +7,10 @@ The API remains the sole authority for task permissions, frozen checks, and merg
 Open **OrchStudio.xcodeproj**, select **OrchStudio → My Mac**, and Run. The shared scheme
 starts in demonstration mode. Install the `native` backend first (`uv sync --locked --no-editable` at
 repository root), then set **Settings → Server → orch executable** to this checkout's
-`.venv/bin/orch`, or install `orch` on your PATH. The demonstration uses no provider keys
+`.venv/bin/orch`, or install `orch` on your PATH. First launch offers direct repository
+path entry, Browse, or Demo. This keeps startup responsive when macOS
+File Provider stalls while initializing its native folder picker; the automatic
+NSOpenPanel behavior in the original spec is intentionally replaced by this choice. The demonstration uses no provider keys
 and makes no model calls. **File → Open Project** starts a real local service for a Git
 repository; **File → Open Demo** returns to the sandbox. Running an actual spec uses your
 configured providers and their normal billing.
