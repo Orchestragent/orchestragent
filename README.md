@@ -18,8 +18,8 @@ test shards are being written in parallel, and builders wait for their frozen te
 ## Why orch
 
 - **Pay a fraction of a single frontier agent.** The expensive model only plans; tests and
-  code come from a cheap model running in parallel. Measured runs cost about **⅓ to ⅕** of
-  a native Claude Opus agent doing the same job ([numbers below](#benchmarks)).
+  code come from a cheap model running in parallel. Measured runs cost **½ to ⅕** of a
+  native Claude Opus 5.5 agent at high effort doing the same job ([numbers below](#benchmarks)).
 - **Correct by construction, not by hope.** Every task gets independent tests that are
   frozen *before* any implementation exists. A task merges only when its tests pass, inside
   an OS sandbox with no network. Your checked-out branch is never touched: you review one
@@ -189,19 +189,23 @@ interleaved runs each):
 | Claude Opus 5.5 (high), native agent | 4/4 runs pass | 388 s | $1.42–1.84 |
 | **orch** (verified set) | 4/4 runs pass | 444 s | **≈ $0.50–0.86** |
 
-**Larger features** (8 hidden tests each; single runs per configuration):
+**Larger features** (8 hidden tests each; unattended from the spec to the end):
 
-| case | native Opus 5.5 · medium | native Opus 5.5 · high | orch |
-|---|---|---|---|
-| build graph + cache + runner (Boltons, 5 modules) | – | 8/8 · 778 s · $3.32 | **8/8 · 511 s · ≈ $0.61** |
-| rollout controller (NetworkX, 116k lines, 8 modules) | 8/8 · 677 s · $1.94 | 8/8 · 1030 s · $2.72 | 8/8 · 975 s · **≈ $1.52** (other runs 7/8) |
-| time-expanded flows (NetworkX, 9 interlocking modules) | 8/8 · 632 s · $2.33 | 8/8 · 1078 s · $3.82 | 7/8–8/8 · ~1300 s · ≈ $2.5 |
+| case | native Opus 5.5 · medium | native Opus 5.5 · high | native Opus 5.5 · max | orch |
+|---|---|---|---|---|
+| build graph + cache + runner (Boltons, 5 modules) | – | 8/8 · 778 s · $3.32 | – | **8/8 · 511 s · $0.62** |
+| rollout controller (NetworkX, 116k lines, 8 modules) | 8/8 · 677 s · $1.94 | 8/8 · 1030 s · $2.72 | did not finish in 40 min | 8/8 · 975 s · **$1.54** |
+| time-expanded flows (NetworkX, 9 coupled modules) | 8/8 · 632 s · $2.33 | 8/8 · 1078 s · $3.82 | 8/8 · 2219 s · $10.29 | 7/8 · 1022 s · **$1.60** |
 
-Where orch stands today: it matches a frontier agent's result at a fraction of the cost on
-medium and multi-module work, and on the build-graph case it is both faster and about 5×
-cheaper. On the most tightly coupled NetworkX case a native Opus 5.5 at medium effort is
-still faster and more consistent — orch sometimes misses one hidden requirement there. We
-publish that because it is the honest picture, and it is what we are working on next.
+Where orch stands today: it is the cheapest configuration on every case, and on the
+build-graph case it is also the fastest, about 5× cheaper than Opus high. On NetworkX it
+is not yet the most reliable: Opus 5.5 at medium and high passed every run, while orch
+reached 8/8 in 6 of its 18 runs across the configurations we tried and otherwise usually
+missed one hidden requirement. That is what we are working on next. More effort did not
+help the single agent either: at max, Opus took 3.5× as long as at medium, cost 4.4× as
+much on time-expanded flows, and did not finish the rollout controller within 40 minutes.
+Every run, including the failed and invalid ones:
+[docs/measurements/2026-11-02-large-projects.md](docs/measurements/2026-11-02-large-projects.md).
 
 ## Under the hood
 
