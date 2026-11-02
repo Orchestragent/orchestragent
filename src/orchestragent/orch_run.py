@@ -82,6 +82,8 @@ from orchestragent.orch_ladder import (
     triage_options,
     triage_question,
 )
+from orchestragent.orch_models import Choice as ModelChoice
+from orchestragent.orch_models import choose as choose_model
 from orchestragent.orch_modules import (
     MODULES_SCHEMA,
     id_range,
@@ -190,7 +192,10 @@ class Route:
 # and implementation run with thinking at low effort, set explicitly on both transports.
 # Linux run r6f34ed35 (af303bb) at high spent 314,522 DSF output tokens including
 # reasoning, and one 56,400-token test-design call held planning for 428.5 seconds.
-DSF = Route("dsh", "deepseek-flash", "low")
+# Each role's model is the benchmarked (verified) set unless the user chose otherwise with
+# `orch models set` or an environment variable (see orch_models).
+_BUILDER = cast(ModelChoice, choose_model("builder"))
+DSF = Route(_BUILDER.provider, _BUILDER.model, _BUILDER.effort)
 # Dependency files a building-on task reads up front (see _dependency_files).
 DEPENDENCY_READS = 8
 # Whether interface_depends_on lets a task build before those dependencies are merged.
@@ -201,31 +206,28 @@ EARLY_INTERFACE_START = False
 # The same model and reasoning effort with the wider output budget. Each DSF test-design
 # and build call uses it whenever the call reservation covers that exact request (see
 # _widened); the limit is a ceiling, not a target length. Larger requests keep DSF.
-DSF_EXTENDED = Route("dsh", "deepseek-flash", DSF.effort + EXTENDED)
+DSF_EXTENDED = Route("dsh", DSF.model, DSF.effort + EXTENDED)
 # Test design's reasoning effort. On Boltons at 6d701aa ~85% of each test-design call's
 # output was hidden reasoning (the T-004 integration shard: ~5k answer tokens, 28-40k
-# output, 150-199 s on the critical path). ORCHESTRA_DSF_TEST_EFFORT=off|low|high selects it
-# for a measured comparison; low stays the default until "off" is shown to hold quality.
-DSF_TEST = Route("dsh", "deepseek-flash",
-                 os.environ.get("ORCHESTRA_DSF_TEST_EFFORT", DSF.effort))
-if DSF_TEST.effort not in {"off", "low", "high"}:
-    raise ValueError("ORCHESTRA_DSF_TEST_EFFORT must be off, low or high")
+# output, 150-199 s on the critical path). Thinking off made wrong tests (49c8313), so the
+# verified test designer keeps low; it is the `test_designer` role.
+_DESIGNER = cast(ModelChoice, choose_model("test_designer"))
+DSF_TEST = Route("dsh", _DESIGNER.model, _DESIGNER.effort)
 # Effort of a task's FIRST DSF build attempt only; later attempts keep DSF. A build, unlike
 # a frozen test, is checked at once by the tests and a retry sees the exact failure, so a
 # fast optimistic first attempt may win overall (T-004 builds at 6d701aa: ~3-4k answer
 # tokens in 9-28k output, 43-141 s). ORCHESTRA_DSF_BUILD_FIRST_EFFORT=off|low|high, for a
 # measured comparison; low (= DSF) stays the default.
-DSF_BUILD_FIRST = Route("dsh", "deepseek-flash",
+DSF_BUILD_FIRST = Route("dsh", DSF.model,
                         os.environ.get("ORCHESTRA_DSF_BUILD_FIRST_EFFORT", DSF.effort))
 if DSF_BUILD_FIRST.effort not in {"off", "low", "high"}:
     raise ValueError("ORCHESTRA_DSF_BUILD_FIRST_EFFORT must be off, low or high")
 CLAUDE_PLAN = Route("claude", "claude-opus-5-5", "high")
 # The orchestrated planner's effort (the single-agent baseline keeps CLAUDE_PLAN at high).
 # Boltons, Linux: Opus high planned in 74-105 s (6d701aa, 5 runs); medium in 37-54 s with
-# 5/5 runs passing acceptance and no replans (284bde9). ORCHESTRA_PLAN_EFFORT overrides it.
-PLANNER = replace(CLAUDE_PLAN, effort=os.environ.get("ORCHESTRA_PLAN_EFFORT", "medium"))
-if PLANNER.effort not in {"low", "medium", "high", "max"}:
-    raise ValueError("ORCHESTRA_PLAN_EFFORT must be low, medium, high or max")
+# 5/5 runs passing acceptance and no replans (284bde9). It is the `planner` role.
+_PLANNER = cast(ModelChoice, choose_model("planner"))
+PLANNER = Route("claude", _PLANNER.model, _PLANNER.effort)
 CLAUDE_PATCH = Route("claude", "claude-opus-5-5", "medium")
 SONNET_PLAN = Route("claude", "claude-sonnet-5-5", "medium")
 # Outcomes that say nothing about the task: stop dispatching, keep the task READY.
@@ -239,15 +241,14 @@ MAX_TEST_REVIEWS = 3  # a successful test correction may expose another independ
 MAX_REPLAN_REVISIONS = 1  # a rejected replacement subtree gets one corrected proposal
 # A reviewer checks each linted test shard against its requirements' verbatim text and the
 # designer adds tests for stated behaviour nothing asserts (see coverage_prompt).
-# ORCHESTRA_COVERAGE_REVIEW=0 turns it off for comparison.
-COVERAGE_REVIEW = os.environ.get("ORCHESTRA_COVERAGE_REVIEW", "1") != "0"
+# The `reviewer` role; "off" disables the review.
+_REVIEWER = str(choose_model("reviewer"))
+COVERAGE_REVIEW = _REVIEWER != "off"
 MAX_TEST_REVIEWS_PER_SHARD = 2
 # Who reviews frozen test shards: the planner (Opus, default), Sonnet, or DSF itself.
 # Opus reviewed 22 shards for US$3.19 on rollout (f6cdf35); the cheaper reviewers are for
 # measured comparison.
-REVIEW_MODEL = os.environ.get("ORCHESTRA_REVIEW_MODEL", "planner")
-if REVIEW_MODEL not in {"planner", "opus-low", "sonnet", "dsf"}:
-    raise ValueError("ORCHESTRA_REVIEW_MODEL must be planner, opus-low, sonnet or dsf")
+REVIEW_MODEL = _REVIEWER if COVERAGE_REVIEW else "planner"
 DEFAULT_TEST_JOBS = 16  # concurrent DSF test-design shards unless a frozen policy says otherwise
 MAX_FORMAT_REPAIRS = 1  # DSF self-repairs of a settled unparseable/unappliable answer per attempt
 # Repeats of one planning call after a transient transport/provider failure (run r073174b7
@@ -1396,6 +1397,7 @@ class Orchestrator:
         purpose = "integration-coverage-review" if integration else "coverage-review"
         route = {"planner": self._claude_route(run_id, planning=True),
                  "opus-low": replace(CLAUDE_PLAN, effort="low"), "sonnet": SONNET_PLAN,
+                 "sonnet-high": replace(SONNET_PLAN, effort="high"),
                  "dsf": DSF_EXTENDED}[REVIEW_MODEL]
         result = self._call_planning(
             run_id, route, prompt, COVERAGE_SCHEMA,

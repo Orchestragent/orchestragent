@@ -11,7 +11,12 @@ import uuid
 from pathlib import Path, PurePosixPath
 
 from orchestragent.orch_environment import PytestEnvironment
-from orchestragent.platform import sandbox_available, sandbox_command, sandbox_name
+from orchestragent.platform import (
+    sandbox_available,
+    sandbox_command,
+    sandbox_name,
+    sandbox_python,
+)
 from orchestragent.serialization import dumps
 from orchestragent.workspace import Workspace
 
@@ -121,7 +126,9 @@ class LiveWorkspace(Workspace):
         filters = " ".join(f'(require-not (subpath "{p}"))' for p in excluded)
         return (
             "(version 1)(deny default)"
-            f"(allow process-exec (literal {dumps(str(Path(sys.executable).resolve()))}))"
+            # The binary the sandbox really executes (a framework launcher's real Python).
+            "(allow process-exec (literal "
+            f"{dumps(sandbox_python(str(Path(sys.executable).resolve())))}))"
             "(allow process-info*)(allow sysctl-read)"
             f"(allow file-read* (require-all {filters}))"
             f"(allow file-read* file-write* (subpath {dumps(str(directory))}))"

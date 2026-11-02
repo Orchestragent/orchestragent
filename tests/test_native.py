@@ -172,15 +172,19 @@ def test_subscription_call_has_no_tools_and_clean_environment(
 ) -> None:
     for name in (
         "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
         "HTTPS_PROXY",
         "SSH_AUTH_SOCK",
         "CODEX_HOME",
     ):
         monkeypatch.setenv(name, "FAKE_SECRET_NEVER_INHERIT")
+    # Claude Code's own API-key setting reaches the claude process only (its documented
+    # way to run without a subscription); every other vendor's secret stays out.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "FAKE_CLAUDE_KEY_FOR_CLAUDE_ONLY")
     result = native.call(provider, "model-test", "Literal prompt", SCHEMA, "run-1", lambda: False)
     invocation = json.loads((native.root.parent / "invocation.json").read_text())
     args = invocation["args"]
+    assert invocation["env"].get("ANTHROPIC_API_KEY") == (
+        "FAKE_CLAUDE_KEY_FOR_CLAUDE_ONLY" if provider == "claude" else None)
     assert (result.outcome, result.data, result.usage["input_tokens"]) == (
         "ok",
         {"answer": "yes"},
@@ -225,7 +229,6 @@ def test_subscription_call_has_no_tools_and_clean_environment(
     [
         ("codex", "Logged in using an API key: FAKE_SECRET"),
         ("codex", "Not logged in"),
-        ("claude", {"loggedIn": True, "authMethod": "api_key"}),
         ("claude", {"loggedIn": True, "authMethod": "unknown"}),
         ("claude", {"loggedIn": False}),
     ],
@@ -435,3 +438,18 @@ def test_unlimited_call_waits_for_result_and_bounds_only_auth_check(
     assert (result.outcome, result.data, [call.args[3] for call in runner.call_args_list]) == (
         "ok", {"answer": "yes"}, [15, 0],
     )
+
+
+@pytest.mark.parametrize(("auth", "mode"), [
+    ({"loggedIn": True, "authMethod": "api_key", "apiProvider": "firstParty",
+      "apiKeySource": "ANTHROPIC_API_KEY"}, "claude_api_key"),
+    ({"loggedIn": True, "authMethod": "none", "apiProvider": "bedrock"}, "claude_bedrock"),
+])
+def test_claude_api_key_and_cloud_auth_are_accepted(
+    native: NativeClients, configure: Callable[..., None], auth: object, mode: str,
+) -> None:
+    configure(claude_auth=auth)
+    assert native.status()["claude"] == {"ready": True, "auth": mode}
+    result = native.call("claude", "model", "prompt", SCHEMA, "run", lambda: False)
+    assert result.outcome == "ok"
+

@@ -27,7 +27,12 @@ live (`orch watch`).
 - Linux with [bubblewrap](https://github.com/containers/bubblewrap) (`apt install bubblewrap`),
   or macOS (uses the built-in `sandbox-exec`)
 - Python 3.12+ and git
-- [Claude Code](https://code.claude.com) logged in (`claude auth login`) — the planner
+- [Claude Code](https://code.claude.com), authenticated the way Claude Code supports — the
+  planner. Either log in with a Claude subscription (`claude auth login`), or use an
+  Anthropic API key exactly as Claude Code documents it (`export ANTHROPIC_API_KEY=...`;
+  `ANTHROPIC_BASE_URL` for a gateway; Bedrock / Vertex settings also work). orch passes
+  those settings to the `claude` process only and never stores them. `orch doctor` shows
+  which mode is in use. With an API key, planning is billed per token by Anthropic.
 - A DeepSeek API key — test design and builders. The official DSH CLI is used when
   installed, otherwise orch calls the DeepSeek API directly.
 
@@ -84,6 +89,29 @@ orch watch                            # (another terminal) live view of the whol
 orch status && orch cost              # outcome and spend
 git diff HEAD...orch/<run_id>         # review, then merge it yourself
 ```
+
+## Models: use the verified set, or swap any role
+
+orch has four roles. The defaults are exactly what the benchmarks below measured:
+
+| role | verified default | can be swapped to |
+|---|---|---|
+| planner | `claude/claude-opus-5-5:medium` | any Claude model and effort (`opus`, `sonnet`, `haiku` 5.5) |
+| test_designer | `dsh/deepseek-flash:low` | `dsh/deepseek-flash` or `dsh/deepseek-v4-pro`, effort `off`–`max` |
+| builder | `dsh/deepseek-flash:low` | same as the test designer |
+| reviewer | `planner` | `opus-low`, `sonnet`, `sonnet-high`, `dsf`, or `off` |
+
+```sh
+orch models                                   # current choice per role, verified or not
+orch models set builder dsh/deepseek-v4-pro:low
+orch models reset                             # back to the benchmarked set
+```
+
+Anything other than the verified set works through the same adapters but has not been
+benchmarked: results may differ (for example, letting DeepSeek review DeepSeek-written
+tests missed correlated mistakes in our runs). `orch doctor` says when a custom set is
+active. Other vendors' models are not wired in yet; contributions with benchmark runs are
+welcome.
 
 ## Use orch from other agents (MCP)
 

@@ -19,6 +19,15 @@ from orchestragent.native_guard import stop_group
 from orchestragent.platform import claude_binary, codex_binary
 from orchestragent.serialization import dumps
 
+# Claude Code's documented authentication settings (API key, gateway, Bedrock, Vertex).
+CLAUDE_AUTH_ENV = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+    "AWS_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK",
+    "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS",
+)
+
 
 @dataclass(frozen=True)
 class NativeResult:
@@ -80,6 +89,15 @@ class NativeClients:
             processes = tuple(self._processes)
         for process in processes:
             stop_group(process, grace=1)
+
+    @staticmethod
+    def _claude_environment() -> dict[str, str]:
+        """Claude Code's own documented auth settings, passed to the claude process only.
+
+        Users who run Claude through an Anthropic API key, Bedrock or Vertex configure it the
+        Claude Code way; orch never reads, stores or logs these values itself.
+        """
+        return {key: os.environ[key] for key in CLAUDE_AUTH_ENV if key in os.environ}
 
     @staticmethod
     def _environment() -> dict[str, str]:
@@ -211,6 +229,8 @@ class NativeClients:
             "",
             min(self.timeout or 15, 15),
             cancelled,
+            environment=({**self._environment(), **self._claude_environment()}
+                         if provider == "claude" else None),
         )
         result = self._classify(provider, outcome, code, stdout, stderr)
         if result.get("outcome") not in {"cancelled", "timed_out"}:
@@ -247,8 +267,13 @@ class NativeClients:
                     and value.get("subscriptionType") in ("pro", "max", "team", "enterprise")
                 ):
                     result = {"ready": True, "auth": "claude_subscription"}
-                elif value.get("authMethod") in ("api_key", "apiKey"):
-                    result["auth"] = "api_key_rejected"
+                elif code == 0 and value.get("loggedIn") is True and value.get(
+                        "authMethod") in ("api_key", "apiKey"):
+                    # Billed per token by Anthropic (or the configured gateway).
+                    result = {"ready": True, "auth": "claude_api_key"}
+                elif code == 0 and value.get("loggedIn") is True and value.get(
+                        "apiProvider") in ("bedrock", "vertex"):
+                    result = {"ready": True, "auth": f"claude_{value['apiProvider']}"}
         return result
 
     def status(self) -> dict[str, object]:
@@ -387,6 +412,8 @@ class NativeClients:
                 prompt,
                 budget,
                 cancelled,
+                environment=({**self._environment(), **self._claude_environment()}
+                             if provider == "claude" else None),
             )
         if outcome != "ok":
             return NativeResult(

@@ -289,12 +289,25 @@ def doctor_lines(
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         checks.append((False, f"sandbox {sandbox_name()}: {error}"))
     checks.append((True, f"index {backend()}"))  # tree-sitter is optional; ast always works
+    from orchestragent import orch_models
+    custom = {role: value for role, (value, _) in orch_models.effective().items()
+              if value != orch_models.VERIFIED[role]}
+    checks.append((True, "models: the benchmarked (verified) set" if not custom else
+                   "models: custom, unverified (" + ", ".join(
+                       f"{role}={value}" for role, value in custom.items())
+                   + ") -> orch models reset restores the verified set"))
     claude = cast(dict[str, object], providers.get("claude", {}))
+    claude_modes = {
+        "claude_subscription": "Claude subscription",
+        "claude_api_key": "Anthropic API key (billed per token)",
+        "claude_bedrock": "Amazon Bedrock", "claude_vertex": "Google Vertex AI",
+    }
+    auth = str(claude.get("auth", "unknown"))
     checks.append((
         claude.get("ready") is True,
-        f"claude subscription login: {claude.get('auth', 'unknown')}"
-        + ("" if claude.get("ready") is True
-           else " -> claude auth login"),
+        f"claude (planner) via {claude_modes[auth]}" if claude.get("ready") is True
+        else f"claude (planner): {auth} -> claude auth login (subscription), or set "
+             "ANTHROPIC_API_KEY as Claude Code documents",
     ))
     dsh = cast(dict[str, object], providers.get("dsh", {}))
     spent = cast(int, budget.get("spent_cents", 0))
@@ -699,6 +712,15 @@ def parser() -> argparse.ArgumentParser:
                        help="authorize retry despite unresolved possibly billable calls")
     retry.add_argument("--discard-candidate", action="store_true",
                        help="discard saved code and authorize fresh generation")
+    models = commands.add_parser(
+        "models", help="which model serves each role; the benchmarked set is the default")
+    models_commands = models.add_subparsers(dest="models_command")
+    models_set = models_commands.add_parser("set", help="choose a role's model (unverified)")
+    models_set.add_argument("role", choices=("planner", "test_designer", "builder", "reviewer"))
+    models_set.add_argument("value", help="provider/model:effort, or a reviewer name")
+    models_reset = models_commands.add_parser("reset", help="back to the verified set")
+    models_reset.add_argument("role", nargs="?", default="",
+                              choices=("", "planner", "test_designer", "builder", "reviewer"))
     completion = commands.add_parser(
         "completion", help="print shell completion (bash, zsh, fish) for orch")
     completion.add_argument("shell", choices=("bash", "zsh", "fish"))
@@ -788,6 +810,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "watch":
             return watch_command(args, repo)
+        if args.command == "models":
+            from orchestragent import orch_models
+            if args.models_command == "set":
+                print(orch_models.set_role(args.role, args.value, data_dir))
+            elif args.models_command == "reset":
+                print(orch_models.reset(args.role, data_dir))
+            else:
+                print("\n".join(orch_models.table(data_dir)))
+            return 0
         if args.command == "completion":
             from orchestragent.orch_completion import render
             print(render(args.shell, parser()), end="")

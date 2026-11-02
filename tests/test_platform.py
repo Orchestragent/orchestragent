@@ -77,3 +77,23 @@ def test_macos_framework_launcher_is_replaced_by_its_real_interpreter(
     assert command[:4] == ["/usr/bin/sandbox-exec", "-p", "(version 1)", str(real)]
     monkeypatch.setattr(plat, "is_macos", lambda: False)
     assert plat.sandbox_python(str(venv)) == str(venv)  # Linux keeps the given path
+
+
+def test_seatbelt_profile_allows_exec_of_the_real_framework_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    from orchestragent import platform as plat
+    from orchestragent.live_workspace import LiveWorkspace
+    version = tmp_path / "Python.framework" / "Versions" / "3.12"
+    launcher = version / "bin" / "python3.12"
+    real = version / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    for path in (launcher, real):
+        path.parent.mkdir(parents=True)
+        path.write_text("")
+    monkeypatch.setattr(plat, "is_macos", lambda: True)
+    monkeypatch.setattr(sys, "executable", str(launcher))
+    profile = LiveWorkspace.sandbox_profile(tmp_path / "work")
+    assert f'(allow process-exec (literal "{real}"))' in profile
+    assert str(launcher) not in profile  # the launcher's spawn stays forbidden
