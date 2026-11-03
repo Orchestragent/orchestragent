@@ -116,14 +116,11 @@ struct GraphCanvas: View {
 
     private var canvasHeader: some View {
         HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(L("DEPENDENCY MAP", "依赖图")).font(.system(size: 10, weight: .bold, design: .monospaced)).tracking(2).foregroundStyle(.secondary)
-                HStack(spacing: 7) {
-                    Text(L("Every task, in context.", "看见每个任务的来龙去脉。")).font(.system(size: 19, weight: .medium, design: .serif))
-                    if store.boot?.demo == true {
-                        Text("DEMO").font(.system(size: 9, weight: .bold, design: .monospaced))
-                            .padding(.horizontal, 6).padding(.vertical, 3).background(.orange.opacity(0.12), in: Capsule()).foregroundStyle(.orange)
-                    }
+            HStack(spacing: 7) {
+                Text(L("Task graph", "任务图")).font(.system(size: 15, weight: .semibold))
+                if store.boot?.demo == true {
+                    Text("DEMO").font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 6).padding(.vertical, 3).background(.orange.opacity(0.12), in: Capsule()).foregroundStyle(.orange)
                 }
             }
             Spacer()

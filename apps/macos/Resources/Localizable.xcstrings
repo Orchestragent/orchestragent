@@ -785,22 +785,6 @@
         }
       }
     },
-    "DEPENDENCY MAP": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "DEPENDENCY MAP"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "依赖图"
-          }
-        }
-      }
-    },
     "Dark": {
       "localizations": {
         "en": {
@@ -1117,22 +1101,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "出错"
-          }
-        }
-      }
-    },
-    "Every task, in context.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Every task, in context."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "看见每个任务的来龙去脉。"
           }
         }
       }
@@ -3261,6 +3229,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "始终遵循系统“减弱动态效果”设置。"
+          }
+        }
+      }
+    },
+    "Task graph": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Task graph"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "任务图"
           }
         }
       }
