@@ -3233,22 +3233,6 @@
         }
       }
     },
-    "Task graph": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Task graph"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "任务图"
-          }
-        }
-      }
-    },
     "Test designer": {
       "localizations": {
         "en": {

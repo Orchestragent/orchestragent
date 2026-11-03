@@ -117,7 +117,7 @@ struct GraphCanvas: View {
     private var canvasHeader: some View {
         HStack(alignment: .top) {
             HStack(spacing: 7) {
-                Text(L("Task graph", "任务图")).font(.system(size: 15, weight: .semibold))
+                Text(verbatim: "Workflow").font(.system(size: 15, weight: .semibold))
                 if store.boot?.demo == true {
                     Text("DEMO").font(.system(size: 9, weight: .bold, design: .monospaced))
                         .padding(.horizontal, 6).padding(.vertical, 3).background(.orange.opacity(0.12), in: Capsule()).foregroundStyle(.orange)
