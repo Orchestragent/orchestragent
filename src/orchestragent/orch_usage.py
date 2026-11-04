@@ -1,6 +1,6 @@
 """Durable, content-free model-call receipts and protocol-aware token accounting.
 
-Anthropic/DSH Messages input excludes cache reads/writes; Codex and Jev input
+Anthropic/DSH Messages input excludes cache reads/writes; Codex input
 includes them. Reasoning is a breakdown of output, never added a second time.
 Missing counters stay unknown. A pending receipt survives even if planning never
 creates a run or the process dies while a request is in flight.
@@ -12,7 +12,7 @@ import re
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 
 from orchestragent.access import REJECTED_STATUSES
 from orchestragent.serialization import dumps
@@ -139,7 +139,7 @@ def tokens(provider: str, raw: dict[str, object]) -> Tokens:
             lower_bound = (incoming or 0) + (read or 0) + (write or 0)
             if lower_bound > result.input_tokens:
                 result.issues.append("reported total is smaller than known component counters")
-    elif provider in {"codex", "jev"}:
+    elif provider == "codex":
         result.input_tokens = incoming
     else:
         result.issues.append("unknown input accounting convention")
@@ -174,7 +174,6 @@ class Call:
     prompt_hash: str = ""
     prefix_hash: str = ""
     request_bytes: int = 0
-    rules: list[str] = field(default_factory=list)
     base_revision: str = ""
     session_id: str = ""
     finished_at: float | None = None
@@ -239,7 +238,9 @@ class Ledger:
         ).fetchall()
         if limit > 0:
             rows.reverse()
-        return [Call(**json.loads(row["body"])) for row in rows]
+        known = {item.name for item in fields(Call)}
+        return [Call(**{key: value for key, value in json.loads(row["body"]).items()
+                        if key in known}) for row in rows]
 
     def latest_run(self) -> str:
         with self.store.transaction() as db:
@@ -280,7 +281,7 @@ def grouped(calls: list[Call], by: str) -> dict[str, list[Call]]:
     groups: dict[str, list[Call]] = {}
     for call in calls:
         key = {"task": call.task_id or "[shared]", "model": f"{call.provider}/{call.model}",
-               "rule": ",".join(call.rules) or "none", "purpose": call.purpose}[by]
+               "purpose": call.purpose}[by]
         groups.setdefault(key, []).append(call)
     return groups
 

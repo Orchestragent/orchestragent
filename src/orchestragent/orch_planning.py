@@ -1,7 +1,7 @@
 """Durable distributed-planning sessions, bound to exact requests and provider receipts."""
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 from orchestragent.orch_journal import CallJournal
 from orchestragent.serialization import dumps
@@ -13,7 +13,6 @@ class PlanningSession:
     id: str
     spec: str
     base: str
-    strategy: str
     planner: str
     effort: str
     attempts: int = 3
@@ -24,7 +23,6 @@ class PlanningSession:
     designer_effort: str = ""
     reviewed_boundary: bool = False
     integration_checks: bool = False  # legacy sessions never gain new paid shards on resume
-    policy_id: str = ""
     integration_scope: str = "terminal"  # legacy resumes must not acquire additional paid work
 
     def __post_init__(self) -> None:
@@ -51,4 +49,6 @@ class PlanningStore(CallJournal):
                              (run_id,)).fetchone()
         if row is None:
             raise KeyError(f"No resumable planning session {run_id}")
-        return PlanningSession(**json.loads(row["body"]))
+        body = json.loads(row["body"])
+        known = {item.name for item in fields(PlanningSession)}
+        return PlanningSession(**{key: value for key, value in body.items() if key in known})

@@ -1,0 +1,11 @@
+{
+  "command": "cd node && cargo test --release --offline --test acceptance && cd ../router && go test ./hrw/ -run Acceptance -count=1 && cd ../client && npx vitest run test/acceptance.test.ts && npx tsc --noEmit -p . && cd ../planner && python3 -m unittest test_acceptance_planner && cd ../metrics && rm -rf build-acceptance && javac -d build-acceptance -cp lib/junit.jar $(find src test -name '*.java') && java -jar lib/junit.jar execute -cp build-acceptance --select-class meridian.metrics.AcceptanceTest && cd .. && python3 -m unittest acceptance.test_cluster",
+  "files": [
+    "node/tests/acceptance.rs",
+    "router/hrw/acceptance_test.go",
+    "client/test/acceptance.test.ts",
+    "planner/test_acceptance_planner.py",
+    "metrics/test/meridian/metrics/AcceptanceTest.java",
+    "acceptance/test_cluster.py"
+  ]
+}

@@ -1,4 +1,3 @@
-import json
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -235,13 +234,3 @@ def test_account_route_does_not_inherit_api_key_authentication(auth: AuthFixture
     assert cast(dict[str, object], state["authentication"])["transport"] == "cli-account"
     auth.clients.call("dsh", MODEL, "prompt", {}, "account-call", lambda: False)
     assert auth.clients.access.authentication("dsh", MODEL, "cli-account")["verified"] is False
-
-
-def test_jev_credential_storage_semantics_remain_raw(auth: AuthFixture) -> None:
-    operation = auth.clients.access.operation("jev", 10, "budget")
-    auth.clients.access.authorize("jev", 10, "budget", str(operation["operation_digest"]), KEY)
-    assert auth.vault["jev"] == KEY
-    restored = Access(auth.clients.access.root)
-    restored.restore_keys()
-    assert restored.key("jev") == KEY
-    assert json.loads(auth.vault["dsh"])["key"] == KEY

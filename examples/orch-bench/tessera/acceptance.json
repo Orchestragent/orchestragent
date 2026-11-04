@@ -1,0 +1,9 @@
+{
+  "command": "export GOCACHE=\"$TMPDIR/tessera-go-cache\" GOPATH=\"$TMPDIR/tessera-go-path\" GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local && make -C codec && cc -std=c11 -Icodec/include -o codec/build/acceptance codec/tests/acceptance.c codec/build/libtessera.a && codec/build/acceptance && cd cli && go build -o bin/tsr ./cmd/tsr && go test ./tsr/ -run Acceptance -count=1 && cd .. && ruby -Ireport/lib report/test/test_acceptance.rb && ruby acceptance/test_integration.rb",
+  "files": [
+    "codec/tests/acceptance.c",
+    "cli/tsr/acceptance_test.go",
+    "report/test/test_acceptance.rb",
+    "acceptance/test_integration.rb"
+  ]
+}

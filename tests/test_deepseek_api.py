@@ -213,9 +213,9 @@ def test_a_rejected_request_releases_its_reservation(
 
 def test_keys_store_the_key_without_asking_for_a_budget(tmp_path: Path) -> None:
     access = Access(tmp_path / "data")
-    lines = keys_lines(access, "jev", False, secret=lambda prompt: "fake-gateway-key-123")
-    assert lines[0].startswith("jev: key stored on this machine; no local spending cap")
-    assert access.status("jev")["authorized"] is True
+    lines = keys_lines(access, "dsh", False, secret=lambda prompt: "fake-deepseek-key-123")
+    assert lines[0].startswith("dsh: key stored on this machine; no local spending cap")
+    assert access.status("dsh")["authorized"] is True
 
 
 def test_keys_cancelled_at_the_prompt_store_nothing(
@@ -223,6 +223,6 @@ def test_keys_cancelled_at_the_prompt_store_nothing(
 ) -> None:
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
     data = tmp_path / "data"
-    assert main(["--data-dir", str(data), "keys", "jev"]) == 1
+    assert main(["--data-dir", str(data), "keys", "dsh"]) == 1
     assert "cancelled; nothing was stored" in capsys.readouterr().err
-    assert Access(data).status("jev")["authorized"] is False
+    assert Access(data).status("dsh")["authorized"] is False

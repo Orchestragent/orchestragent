@@ -38,10 +38,10 @@ DATA_KEYS = frozenset({
     "status", "level", "next", "category", "signature", "outcome", "route", "sample",
     "passed", "tests", "skipped", "candidates", "passing", "requests", "selectors", "commit",
     "head", "candidate", "call_id", "purpose", "depends_on", "interface_dependencies", "review",
-    "rule", "kind", "task", "source", "base", "jobs", "verify_jobs", "rpm", "cache_mode",
-    "peak_generating", "peak_verifying", "blocked_rate", "failures", "planned", "bytes",
-    "context_requests", "dependencies", "refreshes", "note", "map_bytes", "score", "limit",
-    "cache_affinity", "revision", "max_cents", "candidate_reuses", "reason", "plan",
+    "kind", "task", "source", "base", "jobs", "verify_jobs", "rpm",
+    "peak_generating", "peak_verifying", "bytes",
+    "context_requests", "dependencies", "refreshes", "note", "map_bytes", "limit",
+    "revision", "max_cents", "candidate_reuses", "reason", "plan",
 })
 SECRET = re.compile(
     r"(?i)\b(?:sk|pk|rk|ghp|gho|xox[abp])[-_][A-Za-z0-9_-]{8,}"
@@ -155,7 +155,6 @@ def read(db: sqlite3.Connection, run_id: str, observed_at: float) -> Snapshot:
                 run = {"id": run_id, "status": clean(body.get("status", ""), 24),
                        "message": clean(body.get("message", "")),
                        "branch": clean(body.get("branch", ""), 80),
-                       "strategy": clean(body.get("strategy", ""), 40),
                        "base": clean(body.get("base", ""), 12),
                        "created_at": body.get("created_at")}
         if "orch_tasks" in present:
@@ -255,7 +254,7 @@ def natural(text: str) -> list[object]:
 
 
 def owner(call: Call) -> str:
-    if call.purpose in DESIGN and call.task_id:
+    if call.purpose.split("-rejoin")[0] in DESIGN and call.task_id:
         integration = call.purpose.startswith("integration-")
         return f"design:{call.task_id}" + (":int" if integration else "")
     if call.scope in {"planning", "evolve"} or not call.task_id:
@@ -428,7 +427,7 @@ def derive(snap: Snapshot) -> Json:
         for hop in call["via"]:
             if hop not in nodes:
                 provider = str(hop).removeprefix("api:")
-                nodes[hop] = Node(hop, {"jev": "Jev (AI Gateway)"}.get(provider, provider.title()),
+                nodes[hop] = Node(hop, provider.title(),
                                   str(call["model"]), "provider", len(nodes))
 
     # Histories: model-call nodes from receipts, tasks from their state events.
@@ -604,9 +603,6 @@ def _log(event: OrchEvent) -> Json:
     bits = [f"{key}={value}" for key, value in data.items()
             if key in {"status", "category", "signature", "outcome", "passed", "tests",
                        "level", "next", "requests", "route", "sample"}]
-    if event.kind == "plan.outcome":
-        # Not the run's result: whether the plan needed no repairs, splits or vacuous tests.
-        bits = [f"plan clean={data.get('passed')}"]
     return {"seq": event.seq, "at": event.at, "kind": event.kind, "task": event.task_id,
             "node": node, "summary": clean(" ".join(bits), 140), "data": data,
             "attempt": attempt_of(event.span)}

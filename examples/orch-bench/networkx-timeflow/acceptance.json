@@ -1,0 +1,1 @@
+{"command": "python3 -m unittest -q test_acceptance", "files": ["test_acceptance.py"]}

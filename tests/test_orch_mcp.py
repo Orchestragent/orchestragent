@@ -115,7 +115,7 @@ def test_start_plans_then_runs_exactly_the_planned_run_and_wait_reports_it(
     assert state["state"] == "finished" and state["exit_code"] == 0
     assert state["run"] == "r1a2b3c4d"
     calls = fake_orch.read_text().splitlines()
-    assert calls[0].startswith(f"--repo {repo} plan --distributed --base HEAD ")
+    assert calls[0].startswith(f"--repo {repo} plan --base HEAD ")
     assert calls[0].endswith("spec.md")
     assert calls[1] == f"--repo {repo} run --jobs 2 r1a2b3c4d"
     saved = next((repo / ".git" / "orch" / "mcp" / "jobs").iterdir()) / "spec.md"
@@ -154,3 +154,25 @@ def test_job_ids_are_validated_before_touching_the_filesystem(repo: Path) -> Non
     for bad in ("../../etc", "zzz", "0123456789ab/../x"):
         result = call("orch_wait", {"repo": str(repo), "job": bad})
         assert result["isError"] is True
+
+
+def test_start_with_a_run_resumes_it_without_planning(repo: Path, fake_orch: Path) -> None:
+    started = call("orch_start", {"repo": str(repo), "run": "r1a2b3c4d", "jobs": 3})
+    assert started["isError"] is False and "resuming run r1a2b3c4d" in text(started)
+    job = text(started).split()[2]
+    state = json.loads(text(call("orch_wait", {"repo": str(repo), "job": job,
+                                               "timeout_s": 30})))
+    assert state["state"] == "finished" and state["run"] == "r1a2b3c4d"
+    assert fake_orch.read_text().splitlines() == [f"--repo {repo} run --jobs 3 r1a2b3c4d"]
+    bad = call("orch_start", {"repo": str(repo), "run": "r1; rm -rf /"})
+    assert bad["isError"] is True and "run" in text(bad)
+
+
+def test_intervention_tools_validate_and_call_the_cli(repo: Path, fake_orch: Path) -> None:
+    hinted = call("orch_hint", {"repo": str(repo), "task": "T-002", "text": "use integer cents"})
+    assert hinted["isError"] is False
+    assert fake_orch.read_text().splitlines()[-1] == (
+        f"--repo {repo} hint T-002 use integer cents")
+    call("orch_take", {"repo": str(repo), "task": "T-002", "run": "r1a2b3c4d"})
+    assert fake_orch.read_text().splitlines()[-1] == f"--repo {repo} take T-002 --run r1a2b3c4d"
+    assert call("orch_submit", {"repo": str(repo), "task": "T-2"})["isError"] is True

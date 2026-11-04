@@ -1,3 +1,5 @@
+import random
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -10,14 +12,136 @@ import pytest
 from orchestragent.envelope import digest
 from orchestragent.native import NativeResult
 from orchestragent.orch_audit import audit
-from orchestragent.orch_build import shared_context
-from orchestragent.orch_cli import main, status_lines
+from orchestragent.orch_cli import SUMMARY_AT, main, status_lines
 from orchestragent.orch_pace import TokenBucket
-from orchestragent.orch_run import DSF, Deferred, Orchestrator
-from orchestragent.orch_state import OrchTask, Run
-from orchestragent.orch_synthetic import Shape, SyntheticBuilder, synthetic_plan
+from orchestragent.orch_run import Deferred, Orchestrator
+from orchestragent.orch_state import OrchTask
 from orchestragent.workspace import Workspace
-from tests.conftest import GOOD_ADD, edit_result, local_runner
+from tests.conftest import local_runner
+
+
+@pytest.fixture(autouse=True)
+def local_red(unsandboxed: None) -> None:
+    """Every synthetic run plans: the red gate runs without the OS sandbox."""
+
+
+@dataclass(frozen=True)
+class Shape:
+    tasks: int = 60
+    packages: int = 6
+    fan_in: int = 2
+    seed: int = 7
+
+
+STUB = '{name}() {{ echo "not implemented" >&2; return 1; }}'
+
+
+def synthetic_plan(shape: Shape) -> tuple[dict[str, object], dict[str, tuple[str, str, str]]]:
+    """A boundary of `tasks` one-function shell modules over `packages` directories, and
+    task id -> (path, stub line, correct line). Task N computes fN(x) = x + N + the sum of
+    its dependencies, so a wrong dependency shows up in its own check. Shell keeps the
+    synthetic checks fast; orch itself never looks at the language."""
+    rng = random.Random(shape.seed)
+    deps: dict[int, list[int]] = {}
+    package = {n: (n - 1) % shape.packages for n in range(1, shape.tasks + 1)}
+    for n in range(1, shape.tasks + 1):
+        earlier = list(range(max(1, n - 3 * shape.packages), n))
+        deps[n] = sorted(rng.sample(earlier, min(len(earlier), rng.randint(0, shape.fan_in))))
+    files: list[dict[str, str]] = []
+    bodies: dict[str, tuple[str, str, str]] = {}
+    tasks: list[dict[str, object]] = []
+    for n in range(1, shape.tasks + 1):
+        path = f"pkg{package[n]}/f{n}.sh"
+        sources = "".join(f". pkg{package[d]}/f{d}.sh\n" for d in deps[n])
+        calls = "".join(f" + $(f{d} $1)" for d in deps[n])
+        stub = STUB.format(name=f"f{n}")
+        files.append({"path": path, "content": f"# synthetic task {n}\n{sources}{stub}\n"})
+        bodies[f"T-{n:03d}"] = (path, stub, f"f{n}() {{ echo $(( $1 + {n}{calls} )); }}")
+        tasks.append({
+            "id": f"T-{n:03d}", "goal": f"implement f{n}", "reqs": [f"R{n}"],
+            "files": [path], "depends_on": [f"T-{d:03d}" for d in deps[n]],
+            "interface_depends_on": [], "tests": [],
+            "contract": f"f{n} x prints x + {n}" + "".join(f" + f{d} x" for d in deps[n]),
+        })
+    plan: dict[str, object] = {
+        "summary": f"synthetic {shape.tasks} tasks over {shape.packages} packages",
+        "requirements": [{"id": f"R{n}", "text": f"f{n} value"}
+                         for n in range(1, shape.tasks + 1)],
+        "files": files,
+        "tasks": tasks,
+    }
+    return plan, bodies
+
+
+def _value(n: int, deps: dict[str, list[str]], x: int) -> int:
+    return x + n + sum(_value(int(d[2:]), deps, x) for d in deps[f"T-{n:03d}"])
+
+
+@dataclass
+class SyntheticBuilder:
+    """Answers every model route of a synthetic run: the boundary, the root component's
+    test design, no integration checks, and builder calls with the right body, except for
+    a deterministic share of first build attempts that are wrong or rate limited (the cheap
+    retry fixes them)."""
+
+    plan: dict[str, object]
+    bodies: dict[str, tuple[str, str, str]]
+    wrong: float = 0.0  # share of tasks whose first DSF build is wrong
+    limited: float = 0.0  # share of tasks whose first build call is rate limited
+    calls: dict[str, int] = field(default_factory=dict)
+    answers: dict[str, int] = field(default_factory=dict)  # DSF answers that were not 429
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def _share(self, task: str, salt: str, share: float) -> bool:
+        return int(digest(f"{salt}/{task}")[:8], 16) / 0xFFFFFFFF < share
+
+    def _design(self) -> NativeResult:
+        """The one root component's design: a shell check per task, red on the stubs."""
+        tasks = cast(list[dict[str, Any]], self.plan["tasks"])
+        deps = {str(t["id"]): list(t["depends_on"]) for t in tasks}
+        shards = []
+        for task in deps:
+            n = int(task[2:])
+            path = self.bodies[task][0]
+            lines = "".join(f'[ "$(f{n} {x})" = "{_value(n, deps, x)}" ] || '
+                            f'{{ echo "R{n} f{n} {x}"; exit 1; }}\n' for x in (2, -3))
+            test = f"checks/f{n}_test.sh"
+            shards.append({"task": task, "command": f"sh {test}",
+                           "files": [{"path": test, "content": f". {path}\n{lines}"}]})
+        return NativeResult("ok", {"shards": shards})
+
+    def __call__(
+        self, provider: str, model: str, prompt: str, schema: dict[str, object], run_id: str,
+        cancelled: Callable[[], bool], *, effort: str = "",
+    ) -> NativeResult:
+        if "-test-design-component-" in run_id:
+            return self._design()
+        if "-integration-design-planner-" in run_id:
+            return NativeResult("ok", {"checks": []})  # the synthetic checks already compose
+        found = re.search(r"T-[0-9]{3}", run_id)
+        if found is None:
+            return NativeResult("ok", self.plan)
+        task = found.group(0)
+        with self.lock:
+            seen = self.calls.get(task, 0)
+            self.calls[task] = seen + 1
+        usage: dict[str, object] = {
+            "input_tokens": len(prompt) // 4, "output_tokens": 60,
+            "cache_read_input_tokens": len(prompt) // 5, "settled_cents": 1,
+        }
+        path, stub, body = self.bodies[task]
+        if provider == "dsh" and seen == 0 and self._share(task, "limited", self.limited):
+            return NativeResult("rate_limited", {}, message="429 (synthetic)", usage={})
+        if provider == "dsh":
+            with self.lock:
+                first = self.answers.get(task, 0) == 0
+                self.answers[task] = self.answers.get(task, 0) + 1
+            if first and self._share(task, "wrong", self.wrong):
+                body = body.replace("echo $(( $1 + ", "echo $(( $1 - ", 1)
+        return NativeResult("ok", {
+            "status": "DONE", "summary": "", "reason": "", "lesson": "",
+            "edits": [{"path": path, "search": stub, "replace": body}],
+        }, usage=usage)
 
 
 @dataclass
@@ -89,17 +213,17 @@ def synthetic(
 
 
 def test_a_wide_run_merges_everything_and_passes_the_audit(orch_repo: Path) -> None:
-    shape = Shape(tasks=40, packages=5, fan_in=2)
+    # Every merge gate runs every merged check (declared checks have no impact analysis),
+    # so gate work grows with the square of the task count: 24 tasks keep this fast.
+    shape = Shape(tasks=24, packages=4, fan_in=2)
     orchestrator, builder = synthetic(orch_repo, shape, wrong=0.2, limited=0.05)
     run = orchestrator.execute(orchestrator.plan("synthetic").id, jobs=6)
     events = orchestrator.state.events(run.id)
     metrics = next(e.data for e in events if e.kind == "run.metrics")
-    gates = [e.data for e in events if e.kind == "task.gate"]
-    wrong = sum(builder._share(f"T-{n:03d}", "wrong", 0.2) for n in range(1, 41))
+    wrong = sum(builder._share(f"T-{n:03d}", "wrong", 0.2) for n in range(1, 25))
     assert run.status == "done" and audit(orchestrator, run.id) == []
-    assert sum(e.kind == "task.done" for e in events) == 40
+    assert sum(e.kind == "task.done" for e in events) == 24
     assert sum(e.kind == "task.failed" for e in events) == wrong > 0
-    assert sum(int(str(g["skipped"])) for g in gates) > sum(int(str(g["tests"])) for g in gates)
     assert int(str(metrics["worktrees_reused"])) > int(str(metrics["worktrees_created"]))
     assert 1 < int(str(metrics["peak_generating"])) <= 6
 
@@ -134,85 +258,6 @@ def test_unknown_cache_history_does_not_serialize_the_first_calls(orch_repo: Pat
     assert orchestrator._room(0) == 4
     assert orchestrator.execute(run.id, jobs=4).status == "done"
     assert overlap.seen[0] == 1 and max(overlap.seen) > 1
-
-
-@pytest.mark.parametrize("critical", [False, True])
-def test_shared_project_cache_keeps_critical_path_order(
-    orch_repo: Path, critical: bool,
-) -> None:
-    orchestrator, builder = synthetic(orch_repo, Shape(tasks=4, packages=2, fan_in=0))
-    if critical:
-        cast(list[dict[str, object]], builder.plan["tasks"])[2]["depends_on"] = ["T-002"]
-    run = orchestrator.plan("synthetic")
-    orchestrator._promote(run.id)
-    prefix = digest(shared_context(run.repo_map, "", run.spec))[:12]
-    orchestrator.cache_policy.observe((DSF.provider, DSF.model, prefix), 980, 990, {
-        "input_tokens": 20, "output_tokens": 10, "total_tokens": 110,
-        "cache_read_input_tokens": 80, "cache_creation_input_tokens": 0,
-    })
-    assert orchestrator._ready(run.id, set())[0].id == ("T-002" if critical else "T-001")
-    assert {key[2] for key in orchestrator.ready_cache_keys.values()} == {prefix}
-    orchestrator.cache_mode = "off"
-    assert orchestrator._ready(run.id, set())[0].id == ("T-002" if critical else "T-001")
-
-
-def test_cache_wait_deadline_is_reconsidered_while_warming_call_stalls(
-    orchestrator: Orchestrator, independent_run: Run, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    second_started = threading.Event()
-    original_ready = orchestrator._ready
-
-    def ready(run_id: str, busy: set[str]) -> list[OrchTask]:
-        tasks = original_ready(run_id, busy)
-        orchestrator.ready_cache_keys = {t.id: ("dsh", "deepseek-flash", t.id) for t in tasks}
-        return tasks
-
-    def call(*args: Any, **kwargs: Any) -> NativeResult:
-        if "T-001" in args[4]:
-            assert second_started.wait(2), "cache wait exceeded its deadline"
-            return GOOD_ADD
-        second_started.set()
-        return edit_result("doubler.py", "return a * 2")
-
-    monkeypatch.setattr(orchestrator, "_ready", ready)
-    monkeypatch.setattr("orchestragent.orch_cache.CachePolicy.delay",
-                        lambda self, key: 0.2 if key[2] == "T-002" else 0)
-    orchestrator.call = call
-    # The fixture clock is fixed; use a monotonic clock for this scheduling boundary.
-    orchestrator.clock = time.monotonic
-    result = orchestrator.execute(independent_run.id, jobs=2)
-    assert result.status == "done" and second_started.is_set()
-    assert any(e.kind == "task.cache_wait" for e in orchestrator.state.events(result.id))
-
-
-def test_probe_trusts_no_report_whose_tail_was_cut(orch_repo: Path) -> None:
-    def tail_only(execution: Path, scratch: Path, revision: str, names: list[str] | None,
-                  *, timeout: float = 25.0) -> tuple[bool, str]:
-        passed, report = local_runner(execution, scratch, revision, names)
-        return passed, report[-1500:]  # the sandbox keeps only the end of long output
-
-    orchestrator, _ = synthetic(orch_repo, Shape(tasks=40, packages=4, fan_in=0))
-    orchestrator.runner = tail_only
-    run = orchestrator.plan("synthetic")
-    assert not [e for e in orchestrator.state.events(run.id) if e.kind == "plan.vacuous_tests"]
-
-
-def test_probe_runs_each_task_once_however_long_its_failing_report(orch_repo: Path) -> None:
-    probes: list[list[str]] = []
-
-    def counting(execution: Path, scratch: Path, revision: str, names: list[str] | None,
-                 *, timeout: float = 25.0) -> tuple[bool, str]:
-        passed, report = local_runner(execution, scratch, revision, names)
-        if "/probe-" in str(execution):
-            probes.append(list(names or []))
-        return passed, report[-200:]  # nothing in the report could name every failure
-
-    orchestrator, _ = synthetic(orch_repo, Shape(tasks=12, packages=3, fan_in=0))
-    orchestrator.runner = counting
-    run = orchestrator.plan("synthetic")
-    tasks = orchestrator.state.tasks(run.id)
-    assert sorted(map(sorted, probes)) == sorted(sorted(t.tests) for t in tasks)
-    assert not [e for e in orchestrator.state.events(run.id) if e.kind == "plan.vacuous_tests"]
 
 
 def test_generation_resumes_while_earlier_tasks_still_verify(orch_repo: Path) -> None:
@@ -272,12 +317,14 @@ def test_request_rate_paces_builder_calls(orch_repo: Path) -> None:
 def test_wide_runs_show_aggregates_and_the_audit_catches_tampering(
     orch_repo: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    orchestrator, _ = synthetic(orch_repo, Shape(tasks=32, packages=4, fan_in=1), wrong=0.1)
+    wide = SUMMARY_AT + 1
+    orchestrator, _ = synthetic(orch_repo, Shape(tasks=wide, packages=4, fan_in=1), wrong=0.1)
     run = orchestrator.execute(orchestrator.plan("synthetic").id, jobs=8)
     summary = status_lines(orchestrator.state, run, full=False)
-    assert summary[1:3] == [f"  all 32 task(s) merged on orch/{run.id}", "  32 task(s): DONE 32"]
+    assert summary[1:3] == [f"  all {wide} task(s) merged on orch/{run.id}",
+                            f"  {wide} task(s): DONE {wide}"]
     assert summary[-1] == f"  (`orch status --all {run.id}` lists every task)"
-    assert len(status_lines(orchestrator.state, run)) == 2 + 32  # header, message, tasks
+    assert len(status_lines(orchestrator.state, run)) == 2 + wide  # header, message, tasks
     Workspace.git(orch_repo, "tag", "-f", f"orch/{run.id}/done", f"orch/{run.id}/plan")
     assert main(["--repo", str(orch_repo), "audit", run.id, "--no-tests"]) == 1
     assert "done tag" in capsys.readouterr().out

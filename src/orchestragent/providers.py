@@ -10,7 +10,6 @@ from orchestragent.access import REJECTED_STATUSES, Access
 from orchestragent.catalog import models as catalog_models
 from orchestragent.cursor import CursorClient
 from orchestragent.dsh import DshClient
-from orchestragent.jev import JevClient
 from orchestragent.native import NativeClients, NativeResult
 from orchestragent.platform import dsh_binary
 
@@ -91,8 +90,6 @@ class ProviderClients(NativeClients):
             self, root / "dsh", account=os.environ.get("ORCHESTRA_DSH_ACCOUNT", "0") == "1"
         )
         self.cursor = CursorClient(self, root)
-        # Decision model for orch triage; never part of the coding dispatch routes.
-        self.jev = JevClient(self.access)
 
     def status(self) -> dict[str, object]:
         result = super().status()
@@ -116,7 +113,6 @@ class ProviderClients(NativeClients):
             "authentication": authentication, "auth": "api_explicit_budget", "message": message,
         }
         result["cursor"] = self.cursor.status()
-        result["jev"] = self.jev.status()
         result["kimi"] = {
             "ready": False,
             "auth": "interactive_only",

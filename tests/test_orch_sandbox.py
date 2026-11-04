@@ -47,6 +47,26 @@ def test_user_homes_are_not_readable(tmp_path: Path) -> None:
         probe.unlink()
 
 
+def test_tmpdir_is_short_enough_for_a_unix_socket(tmp_path: Path) -> None:
+    """tsx binds its IPC pipe under $TMPDIR; a socket path is limited to 104-108 bytes.
+    The worktree may sit deep in a .git/orch tree, so the program must see a short one."""
+    deep = tmp_path / ("d" * 60) / ("e" * 60) / "work"
+    deep.mkdir(parents=True)
+    probe = ("import os, socket\n"
+             "path = os.path.join(os.environ['TMPDIR'], 'probe.sock')\n"
+             "print('TMPDIR', os.environ['TMPDIR'])\n"
+             "socket.socket(socket.AF_UNIX).bind(path); print('BOUND')\n"
+             "open(os.path.join(os.environ['TMPDIR'], 'made.txt'), 'w').write('made')\n")
+    (deep / "probe.py").write_text(probe)
+    python = Path(sys.executable).resolve()
+    out = run(deep, [str(python), "-I", "probe.py"],
+              Toolchain("python", read_only=(python.parents[1],)), timeout=30).output
+    assert "BOUND" in out, out
+    tmpdir = next(line.split(" ", 1)[1] for line in out.splitlines() if line.startswith("TMPDIR"))
+    assert len(tmpdir) < 80
+    assert (deep / ".orch-tmp" / "made.txt").read_text() == "made"  # the same directory
+
+
 def test_timeout_stops_the_whole_process_group(tmp_path: Path) -> None:
     result = run(tmp_path, ["/bin/sh", "-c", "(sleep 30; echo late > late.txt) & sleep 30"],
                  SHELL, timeout=2)

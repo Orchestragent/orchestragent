@@ -22,15 +22,15 @@ from orchestragent.orch_usage import (
     usage_fields,
 )
 from tests.conftest import (
+    ADD_SHARD,
     BAD_ADD,
+    DOUBLE_SHARD,
     GOOD_ADD,
     GOOD_DOUBLE,
     Clock,
     ScriptedCaller,
-    ScriptedJev,
-    cheat,
+    component_design,
     local_runner,
-    rung,
 )
 
 USAGE: dict[str, object] = {"input_tokens": 100, "output_tokens": 20,
@@ -61,7 +61,6 @@ def test_reconciliation_distinguishes_unknown_exposure_from_proven_rejection(
          (200, 20, 220, 60, 40)),
         ("codex", {"input_tokens": 200, "output_tokens": 20, "cached_input_tokens": 60},
          (200, 20, 220, 60, None)),
-        ("jev", {"input_tokens": 200, "output_tokens": 0}, (200, 0, 200, None, None)),
         ("claude", {"input_tokens": 100, "output_tokens": 20},
          (None, 20, None, None, None)),
         ("dsh", {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
@@ -107,9 +106,9 @@ def test_receipt_survives_provider_exceptions_before_a_plan_exists(
     monkeypatch.setattr(orchestrator, "call", broken)
     with pytest.raises(failure):
         orchestrator.plan("SECRET user specification")
-    [call] = orchestrator.state.usage.calls()
+    [call] = orchestrator.state.usage.calls()  # the planner's look-around is the first call
     assert call.outcome == f"exception:{failure.__name__}"
-    assert (call.purpose, call.scope, call.task_id, call.attempt) == ("plan", "planning", "", 1)
+    assert (call.purpose, call.scope, call.task_id, call.attempt) == ("look", "planning", "", 1)
     assert call.finished_at is not None and call.prompt_hash
     assert "SECRET" not in json.dumps(asdict(call))
     assert not orchestrator.state.runs()
@@ -126,7 +125,7 @@ def test_rejected_plans_remain_queryable_from_cli(
     assert main(["--repo", str(orch_repo), "cost", "--json"]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["groups"]["[shared]"]["known_tokens"]["total_tokens"] == 220
-    assert result["calls"][0]["outcome"] == "failed"
+    assert [c["outcome"] for c in result["calls"] if c["purpose"] == "plan"] == ["failed"]
 
 
 def test_parallel_receipts_survive_reopening_without_losing_calls(
@@ -162,38 +161,33 @@ def test_inflight_receipt_is_visible_before_result_and_remains_unknown(
         )
 
 
-def test_retry_and_jev_receipts_link_to_events_without_double_counting(
+def test_retry_receipts_link_to_events_without_double_counting(
     orch_repo: Path, caller: ScriptedCaller, clock: Clock, math_plan: dict[str, object],
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], unsandboxed: None,
 ) -> None:
     caller.responses = {
         "plan": [NativeResult("ok", math_plan, usage=USAGE)],
-        "dsh:T-001": [replace(BAD_ADD, usage=USAGE)],
-        "claude:T-001": [replace(GOOD_ADD, usage=USAGE)],
+        "dsh:design:root": [replace(component_design(ADD_SHARD, DOUBLE_SHARD), usage=USAGE)],
+        "dsh:T-001": [replace(BAD_ADD, usage=USAGE), replace(GOOD_ADD, usage=USAGE)],
         "dsh:T-002": [replace(GOOD_DOUBLE, usage=USAGE)],
     }
-    jev_usage: dict[str, object] = {"input_tokens": 50, "output_tokens": 0, "cost_usd": 0.00001}
-    jev = ScriptedJev(
-        triage=[replace(rung("claude_patch", 0.9), usage=jev_usage)],
-        screen=[replace(cheat(0), usage=jev_usage)],
-    )
-    orch = Orchestrator(orch_repo, caller, local_runner, clock=clock, decide=jev,
-                        jev_mode="on", notify=lambda _: None)
+    orch = Orchestrator(orch_repo, caller, local_runner, clock=clock, notify=lambda _: None)
     run = orch.execute(orch.plan("spec").id)
     calls = orch.state.usage_calls(run.id)
-    events = [e for e in orch.state.events(run.id) if e.kind in {"attempt.result", "jev.call"}]
-    assert run.status == "done" and len(calls) == 6
-    assert {e.data["call_id"] for e in events} == {c.id for c in calls if c.task_id}
-    assert cast(dict[str, int], summary(calls)["known_tokens"])["total_tokens"] == 980
+    events = [e for e in orch.state.events(run.id) if e.kind == "attempt.result"]
+    assert run.status == "done" and len(calls) == 6  # look, planner, designer, 3 builds
+    assert {e.data["call_id"] for e in events} == {
+        c.id for c in calls if c.task_id and c.scope == "execution"}
+    assert cast(dict[str, int], summary(calls)["known_tokens"])["total_tokens"] == 1100
     assert all(not c.legacy for c in calls)
     task_calls = [c for c in calls if c.task_id == "T-001"]
-    assert {c.purpose for c in task_calls} == {"build", "triage", "patch"}
-    assert {c.attempt for c in task_calls} == {1, 2}
+    assert {c.purpose for c in task_calls} == {"build"}  # its test design is the component's
+    assert [c.attempt for c in task_calls] == [1, 2]
     capsys.readouterr()
     assert main(["--repo", str(orch_repo), "cost", "--task", "T-001", "--json"]) == 0
     filtered = json.loads(capsys.readouterr().out)
-    assert filtered["totals"]["known_tokens"]["total_tokens"] == 490
-    assert len(filtered["calls"]) == 3
+    assert filtered["totals"]["known_tokens"]["total_tokens"] == 440
+    assert len(filtered["calls"]) == 2
     assert main(["--repo", str(orch_repo), "cost", "--call", task_calls[0].id, "--json"]) == 0
     exact = json.loads(capsys.readouterr().out)
     assert [c["id"] for c in exact["calls"]] == [task_calls[0].id]

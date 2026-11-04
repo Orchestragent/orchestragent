@@ -8,12 +8,11 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
+from typing import Any
 
 from orchestragent.envelope import digest
-from orchestragent.orch_graph import replacement_frontier
-from orchestragent.orch_rules import KINDS, Rule
 from orchestragent.orch_usage import Call, Ledger, unresolved, usage_fields
 from orchestragent.serialization import dumps
 from orchestragent.store import Conflict, Store
@@ -47,10 +46,7 @@ class OrchTask:
     status: str = "PLANNED"
     attempts: int = 0
     level: int = 0  # failure-ladder rung of the next attempt (see orch_ladder)
-    used_levels: list[int] = field(default_factory=list)
-    claude_attempts: int = 0
     rebases: int = 0
-    disputes: int = 0
     generation: int = 0  # 0 for planned tasks, +1 for each replan that produced it
     last_signature: str = ""
     last_diff_hash: str = ""
@@ -58,15 +54,20 @@ class OrchTask:
     last_diff: str = ""
     commit: str = ""
     reason: str = ""
-    mutation: float = -1.0  # mutation score of its tests at `mutated_at`; -1 unmeasured
-    mutated_at: str = ""
     context_requests: int = 0
     context_selectors: list[str] = field(default_factory=list)
     pending_candidate: str = ""  # immutable commit; resumes verification without a model call
     failed_candidate: str = ""  # structurally valid code; reconsider only after tests change
     interface_depends_on: list[str] = field(default_factory=list)  # subset of integration edges
     input_revisions: list[str] = field(default_factory=list)  # bounded automatic contract refreshes
-    pending_review: str = ""  # immutable input snapshot; resume it before another implementation
+    human_hint: str = ""  # guidance a person gave this task (`orch hint`); every later attempt
+    route: str = ""  # `provider/model:effort` a person chose for this task's builds; "" = role
+    # Who reopened this DONE task: "person" (guidance with rework) or the upstream task id
+    # whose change broke its checks. Its next merge ripples to its own dependents.
+    reopened_by: str = ""
+    supervisions: int = 0  # supervisor decisions taken for this task (bounded)
+    guidance: str = ""  # the supervisor's guidance for later attempts
+    component: str = ""  # the plan component this task belongs to ("" = the root component)
 
     def entry(self) -> dict[str, object]:
         """This task as a plan entry (the shape the planner and lint use)."""
@@ -81,6 +82,8 @@ class OrchTask:
         }
         if self.interface_depends_on:
             entry["interface_depends_on"] = list(self.interface_depends_on)
+        if self.component:
+            entry["component"] = self.component
         return entry
 
 
@@ -106,10 +109,8 @@ class Run:
     regressions: int = 0
     # Integration HEAD whose every commit passed its gate; resume rolls back to it.
     verified_head: str = ""
-    policy_id: str = ""  # immutable decision snapshot, empty for legacy online trials
     environment_root: str = ""
     environment_fingerprint: str = ""
-    strategy: str = "opus-dsf"
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,12 @@ class OrchEvent:
     kind: str
     at: float
     data: dict[str, object] = field(default_factory=dict)
+
+
+def _decode[T: (Run, OrchTask)](kind: type[T], body: dict[str, Any]) -> T:
+    """A stored row, ignoring fields older releases wrote that this one no longer has."""
+    known = {item.name for item in fields(kind)}
+    return kind(**{key: value for key, value in body.items() if key in known})
 
 
 def span_of(run_id: str, task_id: str = "", attempt: int = 0) -> tuple[str, str]:
@@ -152,7 +159,6 @@ class OrchState:
                     parent TEXT NOT NULL CHECK (parent <> '' OR span = run_id),
                     kind TEXT NOT NULL, at REAL NOT NULL, data TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS orch_events_run ON orch_events(run_id, seq);
-                CREATE TABLE IF NOT EXISTS orch_rules (id TEXT PRIMARY KEY, body TEXT NOT NULL);
             """)
 
     # --- writes ---------------------------------------------------------
@@ -240,25 +246,23 @@ class OrchState:
 
     def revise_tests(
         self, run_id: str, task_id: str, plan: dict[str, object], head: str, *,
-        expected_plan: str, attempt: int, candidate: str, level: int, expected_review: str = "",
-        expected_entry: dict[str, object] | None = None,
+        expected_plan: str, attempt: int, candidate: str, level: int,
+        tests: list[str] | None = None,
     ) -> None:
-        """Publish a test revision and invalidate its old verification atomically."""
+        """Publish a test revision (files and/or check commands) and invalidate its old
+        verification atomically."""
         with self.store.transaction() as db:
             run, task = self._run(db, run_id), self._task(db, run_id, task_id)
             if (run.plan_hash != expected_plan or task.attempts != attempt
-                    or task.pending_review != expected_review
-                    or expected_entry is not None and task.entry() != expected_entry
                     or task.status not in IN_FLIGHT or level not in {0, 3}
                     or (not candidate and level != 0)):
                 raise Conflict("Test revision no longer matches its active attempt")
             self._save_run(db, replace(run, plan=plan, plan_hash=plan_hash(plan),
                                        verified_head=head))
             self._save_task(db, run_id, replace(
-                task, status="READY", level=level, used_levels=[], disputes=task.disputes + 1,
-                claude_attempts=task.claude_attempts + 1, last_signature="", last_diff_hash="",
+                task, status="READY", level=level, last_signature="", last_diff_hash="",
                 last_error="", last_diff="", pending_candidate=candidate, failed_candidate="",
-                pending_review="",
+                tests=list(tests) if tests is not None else task.tests,
             ))
             self._event(db, run_id, "plan.tests_revised", {
                 "task": task_id, "commit": head, "previous_plan": expected_plan,
@@ -282,7 +286,7 @@ class OrchState:
             updated = replace(
                 task, status="READY", pending_candidate="", failed_candidate="",
                 input_revisions=[*task.input_revisions, revision],
-                level=3 if task.level == 3 else 0, used_levels=[],
+                level=3 if task.level == 3 else 0,
                 last_signature="", last_diff_hash="", last_diff=diff[-4000:],
                 last_error=f"Dependency contracts changed: {', '.join(changed)}. "
                            "Repair this task against the current dependency contracts; "
@@ -297,16 +301,12 @@ class OrchState:
     def request_context(
         self, run_id: str, task_id: str, selectors: list[str], revision: str, error: str = "",
         *, call_id: str = "", observed_requests: int | None = None,
-        partial_files: tuple[str, ...] = (),
     ) -> OrchTask:
         """Bound context turns across retries, parallel samples and process restarts."""
         with self.store.transaction() as db:
             task = self._task(db, run_id, task_id)
             wanted = list(dict.fromkeys([*task.context_selectors, *selectors]))
-            progress = any(item not in task.context_selectors
-                           and (item.split("::", 1)[0] not in task.context_selectors
-                                or item.split("::", 1)[0] in partial_files)
-                           for item in selectors)
+            progress = any(item not in task.context_selectors for item in selectors)
             if selectors and not progress:
                 if observed_requests is not None and observed_requests < task.context_requests:
                     self._event(db, run_id, "context.shared", {
@@ -325,7 +325,6 @@ class OrchState:
             self._event(db, run_id, "context.request", {
                 "selectors": selectors, "revision": revision, "error": error,
                 "requests": task.context_requests, "call_id": call_id,
-                "partial_files": list(partial_files),
             }, task_id, task.attempts)
             return task
 
@@ -383,13 +382,6 @@ class OrchState:
             given = {test for task in replacements for test in task.tests}
             if wanted != given:
                 raise Conflict("replacement tests differ from the replaced tasks")
-            frontier = replacement_frontier(
-                {path for task in tasks if task.id in chosen for path in task.files},
-                {task.id: task.depends_on for task in replacements},
-                {task.id: task.files for task in replacements},
-            )
-            if frontier:
-                raise Conflict("; ".join(frontier[:3]))
             kept = [
                 task.entry()
                 for task in tasks
@@ -468,10 +460,7 @@ class OrchState:
                 unknown = [call.id for call in receipts if call.task_id == task.id
                            and call.attempt == task.attempts
                            and unresolved(call.outcome, call.usage)]
-                blocked = bool(unknown) and (not task.pending_candidate or any(
-                    call.id in unknown and call.sample == task.pending_review
-                    for call in receipts
-                ))
+                blocked = bool(unknown) and not task.pending_candidate
                 status = "PARKED" if blocked else "READY"
                 reason = "unresolved provider calls; inspect `orch reconcile`" if blocked else ""
                 self._save_task(db, run_id, replace(task, status=status, reason=reason))
@@ -483,7 +472,6 @@ class OrchState:
                 )
             return [task.id for task in interrupted]
 
-    # --- builder rules (shared by every run in this repository) ----------
     def retry(self, run_id: str, task_id: str, *, ack_unknown: bool = False,
               discard_candidate: bool = False) -> OrchTask:
         """Explicit retry is a single state decision, not a read-then-write race."""
@@ -500,8 +488,7 @@ class OrchState:
             pending = "" if discard_candidate else task.pending_candidate
             task = replace(task, status="READY", reason="", pending_candidate=pending,
                            failed_candidate="" if discard_candidate else task.failed_candidate,
-                           level=task.level if pending else 0,
-                           used_levels=task.used_levels if pending else [], rebases=0)
+                           level=task.level if pending else 0, rebases=0)
             self._save_task(db, run_id, task)
             self._event(db, run_id, "task.retry", {
                 "status": "READY", "acknowledged_calls": unknown,
@@ -509,107 +496,62 @@ class OrchState:
             }, task_id)
             return task
 
-    def add_rule(self, text: str, source: str, kind: str = "builder") -> Rule | None:
-        """A new candidate, or None when the same lesson is already known for that kind."""
+    def message(self, run_id: str, task_id: str, text: str, *, rework: bool = False
+                ) -> OrchTask:
+        """A person's guidance for one task (the studio's node conversation).
+
+        Every later attempt of this task sees it. A PARKED task goes back to READY with a
+        fresh ladder; a DONE task does too when `rework` asks for a rebuild (its merge then
+        ripples to its dependents, see Orchestrator._merge). The text is kept verbatim in the
+        event log for the conversation and folded into human_hint for the builder."""
+        text = text.strip()
+        if not text:
+            raise Conflict("a message needs text")
         with self.store.transaction() as db:
-            rows = db.execute("SELECT body FROM orch_rules").fetchall()
-            known = [Rule(**json.loads(row["body"])) for row in rows]
-            same = [rule for rule in known if rule.kind == kind]
-            if any(rule.text.casefold() == text.casefold() for rule in same):
-                return None
-            rule = Rule(f"{KINDS[kind]}{len(same) + 1}", text, source, self.clock(), kind=kind)
-            db.execute("INSERT INTO orch_rules VALUES(?,?)", (rule.id, dumps(asdict(rule))))
-            return rule
+            task = self._task(db, run_id, task_id)
+            if task.status == "REPLANNED":
+                raise Conflict(f"{task_id} was replaced by a replan; message its replacements")
+            folded = " ".join(text.split())
+            hints = f"{task.human_hint}\n- {folded}" if task.human_hint else f"- {folded}"
+            task = replace(task, human_hint=hints)
+            if task.status == "PARKED" or (task.status == "DONE" and rework):
+                task = replace(task, status="READY", reason="", level=0,
+                               rebases=0, pending_candidate="", failed_candidate="",
+                               reopened_by="person" if task.status == "DONE"
+                               else task.reopened_by)
+            self._save_task(db, run_id, task)
+            self._event(db, run_id, "task.message", {"text": text, "rework": rework,
+                                                     "status": task.status}, task_id)
+            return task
 
-    def rules(self, kind: str = "") -> list[Rule]:
-        """Every rule, or one kind's; builder rules first, then by number."""
+    def set_route(self, run_id: str, task_id: str, route: str) -> OrchTask:
+        """The model a person chose for this task's builds ("" = the role's model)."""
         with self.store.transaction() as db:
-            rows = db.execute("SELECT body FROM orch_rules").fetchall()
-        found = [Rule(**json.loads(row["body"])) for row in rows]
-        return sorted(
-            (rule for rule in found if not kind or rule.kind == kind),
-            key=lambda rule: (rule.kind != "builder", int(rule.id[1:])),
-        )
+            task = self._task(db, run_id, task_id)
+            if task.status == "REPLANNED":
+                raise Conflict(f"{task_id} was replaced by a replan")
+            task = replace(task, route=route)
+            self._save_task(db, run_id, task)
+            self._event(db, run_id, "task.route", {"route": route}, task_id)
+            return task
 
-    def save_rule(self, rule: Rule) -> None:
+    def hint(self, run_id: str, task_id: str, text: str) -> OrchTask:
+        """Add a person's guidance to a task; a parked task goes back to READY, fresh ladder."""
+        text = " ".join(text.split())
+        if not text:
+            raise Conflict("a hint needs text")
         with self.store.transaction() as db:
-            db.execute("UPDATE orch_rules SET body=? WHERE id=?", (dumps(asdict(rule)), rule.id))
-
-    @staticmethod
-    def _count(
-        db: sqlite3.Connection, rule_id: str, shown: bool, passed: bool, step: int,
-        proxy: bool = False,
-    ) -> bool:
-        row = db.execute("SELECT body FROM orch_rules WHERE id=?", (rule_id,)).fetchone()
-        if row is None:
-            return False
-        rule = Rule(**json.loads(row["body"]))
-        prefix = ("proxy_" if proxy else "") + ("with" if shown else "without")
-        for suffix, amount in (("total", step), ("passed", step * int(passed))):
-            name = f"{prefix}_{suffix}"
-            setattr(rule, name, getattr(rule, name) + amount)
-        db.execute("UPDATE orch_rules SET body=? WHERE id=?", (dumps(asdict(rule)), rule_id))
-        return True
-
-    def plan_outcome(
-        self, run_id: str, rule_id: str, shown: bool, passed: bool, kind: str,
-        data: dict[str, object],
-    ) -> None:
-        """Count a planner A/B observation and log it on the run: `kind` is proxy (a new
-        plan), replay (an offline re-plan of a past spec) or outcome (the real result)."""
-        with self.store.transaction() as db:
-            if rule_id:
-                self._count(db, rule_id, shown, passed, 1, proxy=kind != "outcome")
-            self._event(db, run_id, f"plan.{kind}",
-                        {**data, "rule": rule_id, "shown": shown, "passed": passed})
-
-    def planning_history(self) -> list[tuple[str, float, float]]:
-        """(run, proxy score, real blocked rate) for runs that have both."""
-        with self.store.transaction() as db:
-            rows = db.execute(
-                "SELECT run_id, kind, data FROM orch_events "
-                "WHERE kind IN ('plan.proxy', 'plan.outcome') ORDER BY seq"
-            ).fetchall()
-        proxy: dict[str, float] = {}
-        real: dict[str, float] = {}
-        for row in rows:
-            data = json.loads(row["data"])
-            if row["kind"] == "plan.proxy":
-                proxy.setdefault(row["run_id"], float(data["score"]))
-            else:
-                real.setdefault(row["run_id"], float(data["blocked_rate"]))
-        return [(run, proxy[run], real[run]) for run in proxy if run in real]
-
-    def rule_outcome(
-        self, rule_id: str, shown: bool, passed: bool, run_id: str, task_id: str, attempt: int
-    ) -> None:
-        """Count one A/B observation and log it on the attempt, atomically."""
-        with self.store.transaction() as db:
-            if self._count(db, rule_id, shown, passed, 1):
-                self._event(db, run_id, "rule.trial",
-                            {"rule": rule_id, "shown": shown, "passed": passed}, task_id, attempt)
-
-    def discount(self, run_id: str, task_id: str, why: str) -> list[str]:
-        """Withdraw a task's A/B observations (its tests proved too weak to be evidence).
-
-        Each observation is withdrawn at most once; returns the rules touched.
-        """
-        with self.store.transaction() as db:
-            rows = db.execute(
-                "SELECT seq, kind, data FROM orch_events WHERE run_id=? AND task_id=? "
-                "AND kind IN ('rule.trial', 'rule.discounted') ORDER BY seq",
-                (run_id, task_id),
-            ).fetchall()
-            done = {seq for row in rows if row["kind"] == "rule.discounted"
-                    for seq in json.loads(row["data"])["trials"]}
-            fresh = [(row["seq"], json.loads(row["data"])) for row in rows
-                     if row["kind"] == "rule.trial" and row["seq"] not in done]
-            for _, data in fresh:
-                self._count(db, data["rule"], data["shown"], data["passed"], -1)
-            if fresh:
-                self._event(db, run_id, "rule.discounted",
-                            {"trials": [seq for seq, _ in fresh], "why": why}, task_id)
-            return sorted({data["rule"] for _, data in fresh})
+            task = self._task(db, run_id, task_id)
+            if task.status in {"DONE", "REPLANNED"}:
+                raise Conflict(f"{task_id} is {task.status}; a hint can no longer change it")
+            hints = f"{task.human_hint}\n- {text}" if task.human_hint else f"- {text}"
+            task = replace(task, human_hint=hints)
+            if task.status == "PARKED":
+                task = replace(task, status="READY", reason="", level=0, rebases=0)
+            self._save_task(db, run_id, task)
+            self._event(db, run_id, "task.hint", {"hint": text, "status": task.status},
+                        task_id)
+            return task
 
     # --- reads ----------------------------------------------------------
     @staticmethod
@@ -617,7 +559,7 @@ class OrchState:
         row = db.execute("SELECT body FROM orch_runs WHERE id=?", (run_id,)).fetchone()
         if row is None:
             raise KeyError(f"Unknown run {run_id}")
-        return Run(**json.loads(row["body"]))
+        return _decode(Run, json.loads(row["body"]))
 
     @staticmethod
     def _task(db: sqlite3.Connection, run_id: str, task_id: str) -> OrchTask:
@@ -626,12 +568,12 @@ class OrchState:
         ).fetchone()
         if row is None:
             raise KeyError(f"Unknown task {task_id}")
-        return OrchTask(**json.loads(row["body"]))
+        return _decode(OrchTask, json.loads(row["body"]))
 
     @staticmethod
     def _tasks(db: sqlite3.Connection, run_id: str) -> list[OrchTask]:
         return [
-            OrchTask(**json.loads(row["body"]))
+            _decode(OrchTask, json.loads(row["body"]))
             for row in db.execute(
                 "SELECT body FROM orch_tasks WHERE run_id=? ORDER BY id", (run_id,)
             )
@@ -642,7 +584,7 @@ class OrchState:
             return self._run(db, run_id)
 
     def spent(self, run_id: str) -> int:
-        """Cents the run's model calls (builder, Claude, Jev) have settled so far."""
+        """Cents the run's model calls (builder, Claude) have settled so far."""
         return sum(cents for call in self.usage_calls(run_id)
                    if type(cents := call.usage.get("settled_cents", 0)) is int)
 
@@ -655,18 +597,15 @@ class OrchState:
             key = (event.span, event.data.get("sample"))
             if event.kind == "attempt.called":
                 started[key] = event
-            if event.kind not in {"attempt.result", "jev.call"}:
+            if event.kind != "attempt.result":
                 continue
             if event.data.get("call_id") in ids:
                 continue
             raw = event.data.get("usage")
             route = str(event.data.get("route", "unknown/unknown"))
             provider, _, model = route.partition("/")
-            if route == "vercel/typesafe-ai/jev":
-                provider, model = "jev", "typesafe-ai/jev"
             before = started.get(key)
             meta = before.data if before else {}
-            rules = meta.get("rules", [])
             suffix = event.span.rsplit("/a", 1)[-1]
             calls.append(Call(
                 id=f"legacy-{event.seq}", run_id=run_id, provider=provider, model=model,
@@ -676,7 +615,6 @@ class OrchState:
                 attempt=int(suffix) if suffix.isdigit() else 0,
                 outcome=str(event.data.get("outcome", "unknown")),
                 prefix_hash=str(meta.get("prefix", "")),
-                rules=[str(r) for r in rules] if isinstance(rules, list) else [],
                 usage=usage_fields(raw) if isinstance(raw, dict) else {}, legacy=True,
             ))
         return sorted(calls, key=lambda call: call.started_at)
@@ -685,7 +623,7 @@ class OrchState:
         """Every run, newest first."""
         with self.store.transaction() as db:
             rows = db.execute("SELECT body FROM orch_runs ORDER BY created_at DESC, id DESC")
-            return [Run(**json.loads(row["body"])) for row in rows.fetchall()]
+            return [_decode(Run, json.loads(row["body"])) for row in rows.fetchall()]
 
     def latest(self) -> Run:
         with self.store.transaction() as db:
