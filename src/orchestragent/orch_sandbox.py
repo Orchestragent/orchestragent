@@ -11,13 +11,18 @@ lets processes run:
   workdir and reading user homes; processes start only from the OS and toolchain roots.
 
 Dependencies are never fetched here: toolchain caches are mounted read-only.
+
+$TMPDIR inside the sandbox is short. Programs bind Unix sockets under it (tsx's IPC pipe,
+test servers) and a socket path is limited to 104-108 bytes, so the workdir's scratch
+directory is bound to /tmp (Linux) or reached through a short symlink (macOS) and the
+program never sees the deep path the worktree lives at.
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
-import resource
 import shutil
 import signal
 import subprocess
@@ -29,6 +34,7 @@ from pathlib import Path
 from orchestragent.platform import is_macos, seccomp_filter
 
 OUTPUT_LIMIT = 4 * 1024 * 1024  # bytes of combined output kept on disk before stopping
+SANDBOX_TMP = "/tmp"  # where the workdir's scratch appears inside a Linux sandbox
 OS_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/alternatives", "/etc/ssl",
             "/etc/ca-certificates", "/etc/hosts", "/etc/nsswitch.conf", "/etc/host.conf",
             "/etc/passwd", "/etc/group", "/etc/localtime")
@@ -69,8 +75,23 @@ def _environment(workdir: Path, toolchain: Toolchain) -> dict[str, str]:
     return env
 
 
+def short_tmp(host_tmp: Path) -> Path:
+    """A short path to `host_tmp` for sandboxes that cannot remap it (macOS): a symlink in
+    the system temporary directory, named after the directory it points at."""
+    digest = hashlib.sha256(str(host_tmp).encode()).hexdigest()[:12]
+    link = Path(tempfile.gettempdir()) / f"orch-{digest}"
+    if link.is_symlink() and os.readlink(link) == str(host_tmp):
+        return link
+    try:
+        link.unlink(missing_ok=True)
+        link.symlink_to(host_tmp, target_is_directory=True)
+    except FileExistsError:  # another thread made the same link
+        pass
+    return link
+
+
 def linux_command(workdir: Path, argv: list[str], toolchain: Toolchain, env: dict[str, str],
-                  seccomp_fd: int) -> list[str]:
+                  seccomp_fd: int, host_tmp: Path) -> list[str]:
     if not shutil.which("bwrap"):
         raise RuntimeError("No sandbox backend: install bubblewrap on Linux")
     command = ["bwrap", "--die-with-parent", "--unshare-all", "--new-session",
@@ -78,13 +99,13 @@ def linux_command(workdir: Path, argv: list[str], toolchain: Toolchain, env: dic
     for root in OS_ROOTS:
         if Path(root).exists():
             command += ["--ro-bind", root, root]
-    command += ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+    command += ["--dev", "/dev", "--proc", "/proc", "--bind", str(host_tmp), SANDBOX_TMP]
     for extra in toolchain.read_only:
         resolved = extra.resolve()
         if resolved.exists():
             command += ["--ro-bind", str(resolved), str(resolved)]
     command += ["--bind", str(workdir), str(workdir), "--chdir", str(workdir), "--clearenv"]
-    for key, value in env.items():
+    for key, value in {**env, "TMPDIR": SANDBOX_TMP}.items():
         command += ["--setenv", key, value]
     return command + argv
 
@@ -121,32 +142,33 @@ def run(workdir: Path, argv: list[str], toolchain: Toolchain, *, timeout: float,
         raise ValueError("timeout must be finite and positive")
     workdir = workdir.resolve()
     env = _environment(workdir, toolchain)
-    Path(env["TMPDIR"]).mkdir(exist_ok=True)
-    cpu, files = toolchain.cpu_seconds, toolchain.open_files
-
-    def limits() -> None:  # inherited by bwrap/sandbox-exec and every process below them
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (output_limit * 64, output_limit * 64))
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        wanted = files if hard == resource.RLIM_INFINITY else min(files, hard)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+    host_tmp = Path(env["TMPDIR"])
+    host_tmp.mkdir(exist_ok=True)
+    if is_macos():
+        env["TMPDIR"] = str(short_tmp(host_tmp))
+    # Limits are set by the shell's own ulimit, then exec: orch runs sandboxes from many
+    # threads, and subprocess's preexec_fn (Python code between fork and exec) is unsafe
+    # there. They are inherited by bwrap/sandbox-exec and every process below them.
+    blocks = output_limit * 64 // 512  # ulimit -f counts 512-byte blocks
+    limits = (f"ulimit -t {toolchain.cpu_seconds}; ulimit -f {blocks}; "
+              f"ulimit -n {toolchain.open_files} 2>/dev/null; exec \"$@\"")
 
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as program:
         pass_fds: tuple[int, ...] = ()
         if is_macos():
             command = ["/usr/bin/sandbox-exec", "-p", mac_profile(workdir, toolchain), *argv]
         else:
-            program.write(seccomp_filter(processes=True))
+            program.write(seccomp_filter())
             program.flush()
             program.seek(0)
             fd = program.fileno()
             os.set_inheritable(fd, True)
             pass_fds = (fd,)
-            command = linux_command(workdir, argv, toolchain, env, fd)
+            command = linux_command(workdir, argv, toolchain, env, fd, host_tmp)
+        command = ["/bin/sh", "-c", limits, "orch-limits", *command]
         process = subprocess.Popen(
             command, cwd=workdir, env=env, stdin=subprocess.DEVNULL, stdout=output,
-            stderr=subprocess.STDOUT, pass_fds=pass_fds, start_new_session=True,
-            preexec_fn=limits)
+            stderr=subprocess.STDOUT, pass_fds=pass_fds, start_new_session=True)
         try:
             code, timed_out = process.wait(timeout=timeout), False
         except subprocess.TimeoutExpired:

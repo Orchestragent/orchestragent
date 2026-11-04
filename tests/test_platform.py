@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from orchestragent import platform as host
-from orchestragent.platform import sandbox_command, seccomp_filter
+from orchestragent.platform import seccomp_filter
 
 
 def test_seccomp_filter_fails_closed_on_an_unknown_architecture() -> None:
@@ -17,83 +17,19 @@ def test_seccomp_filter_is_whole_instructions_ending_in_allow(machine: str) -> N
     assert len(program) % 8 == 0 and program[-8:-4] == b"\x06\x00\x00\x00"
 
 
-def test_linux_sandbox_keeps_host_paths_and_binds_runtime_and_bundle_read_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(host, "is_macos", lambda: False)
-    monkeypatch.setattr("orchestragent.platform.shutil.which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(host, "seccomp_filter", lambda: b"")
-    work, bundle = tmp_path / "work", tmp_path / "bundle"
-    python = tmp_path / "uv-python" / "bin" / "python3"
-    command = sandbox_command(work, str(python), "pass", read_only=(bundle,))
-    pairs = {(command[i], command[i + 1], command[i + 2]) for i in range(len(command) - 2)}
-    resolved = [str(p.resolve()) for p in (work, bundle, tmp_path / "uv-python")]
-    assert {("--bind", resolved[0], resolved[0]), ("--ro-bind", resolved[1], resolved[1]),
-            ("--ro-bind", resolved[2], resolved[2])} <= pairs
-    assert command[command.index("--chdir") + 1] == resolved[0]
-    assert command[-1].endswith("pass") and "/work" not in command
-
-
 def test_data_dir_prefers_env_then_checkout_then_per_user_location(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from orchestragent import platform as plat
     monkeypatch.setenv("ORCHESTRA_DATA_DIR", str(tmp_path / "explicit"))
-    assert plat.default_data_dir() == tmp_path / "explicit"
+    assert host.default_data_dir() == tmp_path / "explicit"
     monkeypatch.delenv("ORCHESTRA_DATA_DIR")
-    checkout = plat.source_root()
-    assert checkout is not None and plat.default_data_dir() == checkout / ".data"
-    monkeypatch.setattr(plat, "source_root", lambda: None)  # installed as a package
-    monkeypatch.setattr(plat, "is_macos", lambda: False)
+    checkout = host.source_root()
+    assert checkout is not None and host.default_data_dir() == checkout / ".data"
+    monkeypatch.setattr(host, "source_root", lambda: None)  # installed as a package
+    monkeypatch.setattr(host, "is_macos", lambda: False)
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    assert plat.default_data_dir() == tmp_path / "xdg" / "orch"
-    monkeypatch.setattr(plat, "is_macos", lambda: True)
+    assert host.default_data_dir() == tmp_path / "xdg" / "orch"
+    monkeypatch.setattr(host, "is_macos", lambda: True)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    assert plat.default_data_dir() == (
+    assert host.default_data_dir() == (
         tmp_path / "home" / "Library" / "Application Support" / "orch")
-
-
-def test_macos_framework_launcher_is_replaced_by_its_real_interpreter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from orchestragent import platform as plat
-    version = tmp_path / "Python.framework" / "Versions" / "3.12"
-    launcher = version / "bin" / "python3.12"
-    real = version / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
-    for path in (launcher, real):
-        path.parent.mkdir(parents=True)
-        path.write_text("")
-    venv = tmp_path / "venv" / "bin" / "python"
-    venv.parent.mkdir(parents=True)
-    venv.symlink_to(launcher)
-    monkeypatch.setattr(plat, "is_macos", lambda: True)
-    assert plat.sandbox_python(str(venv)) == str(real)  # venv symlink -> framework launcher
-    assert plat.sandbox_python(str(launcher)) == str(real)
-    plain = tmp_path / "usr" / "bin" / "python3"
-    plain.parent.mkdir(parents=True)
-    plain.write_text("")
-    assert plat.sandbox_python(str(plain)) == str(plain)  # not a framework build
-    command = plat.sandbox_command(tmp_path, str(venv), "pass", profile="(version 1)")
-    assert command[:4] == ["/usr/bin/sandbox-exec", "-p", "(version 1)", str(real)]
-    monkeypatch.setattr(plat, "is_macos", lambda: False)
-    assert plat.sandbox_python(str(venv)) == str(venv)  # Linux keeps the given path
-
-
-def test_seatbelt_profile_allows_exec_of_the_real_framework_interpreter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import sys
-
-    from orchestragent import platform as plat
-    from orchestragent.live_workspace import LiveWorkspace
-    version = tmp_path / "Python.framework" / "Versions" / "3.12"
-    launcher = version / "bin" / "python3.12"
-    real = version / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
-    for path in (launcher, real):
-        path.parent.mkdir(parents=True)
-        path.write_text("")
-    monkeypatch.setattr(plat, "is_macos", lambda: True)
-    monkeypatch.setattr(sys, "executable", str(launcher))
-    profile = LiveWorkspace.sandbox_profile(tmp_path / "work")
-    assert f'(allow process-exec (literal "{real}"))' in profile
-    assert str(launcher) not in profile  # the launcher's spawn stays forbidden

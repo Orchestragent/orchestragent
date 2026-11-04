@@ -26,7 +26,6 @@ class TaskProgress:
     attempts: int
     call_ids: list[str]
     reason: str
-    review: str = ""
 
 
 @dataclass(frozen=True)
@@ -92,10 +91,6 @@ def snapshot(state: OrchState, run_id: str = "") -> Progress:
         blocked = waiting - early if not task.pending_candidate else waiting
         stage = {"RUNNING": "generating", "VERIFYING": "verifying", "MERGING": "merging",
                  "DONE": "merged", "PARKED": "parked", "REPLANNED": "replaced"}.get(task.status)
-        if task.pending_review and task.status in {"RUNNING", "VERIFYING"}:
-            stage = "reviewing"
-        elif task.pending_review and task.status == "READY":
-            stage = "review_ready"
         if stage is None:
             stage = ("candidate_wait" if task.pending_candidate and waiting
                      else "candidate_ready" if task.pending_candidate
@@ -104,7 +99,6 @@ def snapshot(state: OrchState, run_id: str = "") -> Progress:
             task.id, task.status, stage, sorted(blocked), sorted(waiting), sorted(early),
             depth.get(task.id, 0), task.pending_candidate, task.commit, task.attempts,
             [call.id for call in calls if call.task_id == task.id], task.reason,
-            task.pending_review,
         ))
     timestamps = [event.at for event in events]
     timestamps += [call.finished_at or call.started_at for call in calls]
@@ -147,8 +141,6 @@ def lines(progress: Progress) -> list[str]:
                       f"generate_wait={','.join(task.generation_waits) or '-'} "
                       f"merge_wait={','.join(task.integration_waits) or '-'} "
                       f"candidate={task.candidate[:12] or '-'}")
-        if task.review:
-            output.append(f"    review={task.review}")
         if task.reason:
             output.append(f"    {task.reason}")
     output.append("recovery: " + ", ".join(

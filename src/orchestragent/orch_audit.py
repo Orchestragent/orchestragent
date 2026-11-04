@@ -5,11 +5,9 @@ line naming what is wrong; an empty list means the run's history, git state and 
 default) its merged tests all agree.
 """
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from orchestragent.orch_build import REQUIRED_TRAILERS, parse_trailers
-from orchestragent.orch_environment import PytestEnvironment
 from orchestragent.orch_state import FINISHED, TRANSITIONS
 
 if TYPE_CHECKING:
@@ -77,17 +75,7 @@ def audit(orchestrator: "Orchestrator", run_id: str, run_tests: bool = True) -> 
     stale = [line for line in listed.splitlines()
              if line.startswith("worktree ") and f"/{run_id}/work/" in line]
     findings += [f"leftover worktree {line.split(' ', 1)[1]}" for line in stale]
-    if not orchestrator.index.snapshots() or run.checkpoint not in {
-        revision for revision, _, _ in orchestrator.index.snapshots()
-    }:
-        findings.append("no index snapshot for the plan checkpoint")
     merged = [test for task in tasks.values() if task.status == "DONE" for test in task.tests]
-    if run_tests:
-        try:
-            orchestrator.bind_environment(run.environment_root, run.environment_fingerprint)
-        except (ValueError, OSError) as error:
-            findings.append(f"pinned project environment unavailable: {type(error).__name__}")
-            run_tests = False
     if run_tests and (merged or run.baseline):
         with orchestrator.worktree(run_id, "audit", head) as tree:
             passed, report = orchestrator.verify(
@@ -96,25 +84,4 @@ def audit(orchestrator: "Orchestrator", run_id: str, run_tests: bool = True) -> 
         orchestrator.release_worktrees(run_id)
         if not passed:
             findings.append(f"merged tests fail at HEAD: {report.strip()[-300:]}")
-    if run.environment_root or run.environment_fingerprint:
-        expected = (("plan.project_baseline", run.base), ("run.project_final", head))
-        for kind, revision in expected:
-            if run.status == "done" and not any(
-                event.kind == kind and event.data.get("passed") is True
-                and event.data.get("revision") == revision
-                and event.data.get("environment_fingerprint") == run.environment_fingerprint
-                for event in events
-            ):
-                findings.append(f"no successful {kind} evidence for pinned revision/environment")
-        if run_tests:
-            try:
-                environment = PytestEnvironment(Path(run.environment_root),
-                                                run.environment_fingerprint)
-                passed, detail = orchestrator._project_tests(run_id, head, environment)
-                if not passed:
-                    findings.append(f"project pytest fails at HEAD: {detail.strip()[-300:]}")
-            except (ValueError, OSError, RuntimeError) as error:
-                findings.append(f"project pytest verification unavailable: {type(error).__name__}")
-            finally:
-                orchestrator.release_worktrees(run_id)
     return findings

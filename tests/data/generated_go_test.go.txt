@@ -1,0 +1,269 @@
+package ledger
+
+import (
+    "reflect"
+    "strings"
+    "testing"
+)
+
+func TestT001_R1_ParseCSVHeaderOnly(t *testing.T) {
+    got, err := ParseCSV(strings.NewReader(`date,account,amount_cents,memo
+`))
+    if err != nil {
+        t.Fatalf("ParseCSV returned error for header-only input: %v", err)
+    }
+    if len(got) != 0 {
+        t.Fatalf("ParseCSV returned %d entries, want 0", len(got))
+    }
+}
+
+func TestT001_R1_ParseCSVValid(t *testing.T) {
+    tests := []struct {
+        name  string
+        input string
+        want  []Entry
+    }{
+        {
+            name: "quoted fields, order, empty memo, int64 bounds",
+            input: `date,account,amount_cents,memo
+2023-12-31,Checking,9223372036854775807,"pay ""bonus"""
+2024-02-29,Savings,0,
+2023-12-31,Checking,-9223372036854775808,café
+`,
+            want: []Entry{
+                {Date: "2023-12-31", Account: "Checking", AmountCents: 9223372036854775807, Memo: `pay "bonus"`},
+                {Date: "2024-02-29", Account: "Savings", AmountCents: 0, Memo: ""},
+                {Date: "2023-12-31", Account: "Checking", AmountCents: -9223372036854775808, Memo: "café"},
+            },
+        },
+        {
+            name: "quoted commas in account and memo",
+            input: `date,account,amount_cents,memo
+2024-03-01,"Acme, Inc",-5,"hello, world"
+`,
+            want: []Entry{
+                {Date: "2024-03-01", Account: "Acme, Inc", AmountCents: -5, Memo: "hello, world"},
+            },
+        },
+        {
+            name: "quoted newline in memo",
+            input: `date,account,amount_cents,memo
+2024-03-01,Checking,100,"line1
+line2"
+`,
+            want: []Entry{
+                {Date: "2024-03-01", Account: "Checking", AmountCents: 100, Memo: `line1
+line2`},
+            },
+        },
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            got, err := ParseCSV(strings.NewReader(tt.input))
+            if err != nil {
+                t.Fatalf("ParseCSV returned unexpected error: %v", err)
+            }
+            if !reflect.DeepEqual(got, tt.want) {
+                t.Fatalf("ParseCSV = %#v, want %#v", got, tt.want)
+            }
+        })
+    }
+}
+
+func TestT001_R1_ParseCSVInvalid(t *testing.T) {
+    tests := []struct {
+        name       string
+        input      string
+        wantPrefix string
+    }{
+        {name: "empty input", input: "", wantPrefix: "line 1: "},
+        {
+            name: "wrong header",
+            input: `Date,account,amount_cents,memo
+2024-01-01,Checking,1,x
+`,
+            wantPrefix: "line 1: ",
+        },
+        {
+            name: "header with extra field",
+            input: `date,account,amount_cents,memo,extra
+`,
+            wantPrefix: "line 1: ",
+        },
+        {
+            name: "first record is not header",
+            input: `2024-01-01,Checking,1,x
+`,
+            wantPrefix: "line 1: ",
+        },
+        {
+            name: "row with three fields",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,1
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "row with five fields",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,1,x,extra
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "date not YYYY-MM-DD",
+            input: `date,account,amount_cents,memo
+2024-1-01,Checking,1,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "date not a real calendar date",
+            input: `date,account,amount_cents,memo
+2023-02-29,Checking,1,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "date month out of range",
+            input: `date,account,amount_cents,memo
+2024-13-01,Checking,1,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "date day out of range",
+            input: `date,account,amount_cents,memo
+2024-04-31,Checking,1,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "empty account",
+            input: `date,account,amount_cents,memo
+2024-01-01,,1,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "account leading space",
+            input: `date,account,amount_cents,memo
+2024-01-01, Checking,1,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "account trailing space",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking ,1,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "account leading tab",
+            input: `date,account,amount_cents,memo
+2024-01-01,	Checking,1,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "amount with plus sign",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,+1,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "amount with leading zero",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,01,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "negative amount with leading zero",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,-01,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "amount empty",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "amount with leading space",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking, 1,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "amount with trailing space",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,1 ,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "amount not an integer",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,1.0,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "amount exponent notation",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,1e3,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "amount overflows int64",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,9223372036854775808,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "amount underflows int64",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,-9223372036854775809,x
+`,
+            wantPrefix: "line 2: ",
+        },
+        {
+            name: "first violating row after a valid row",
+            input: `date,account,amount_cents,memo
+2024-01-01,Checking,1,ok
+2024-01-02,Checking ,2,bad account
+`,
+            wantPrefix: "line 3: ",
+        },
+        {
+            name: "csv syntax error",
+            input: `date,account,amount_cents,memo
+2024-01-01,Che"cking,1,x
+`,
+            wantPrefix: "line 2: ",
+        },
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            got, err := ParseCSV(strings.NewReader(tt.input))
+            if err == nil {
+                t.Fatalf("ParseCSV returned entries %#v and nil error, want error", got)
+            }
+            if got != nil {
+                t.Fatalf("ParseCSV returned non-nil slice %#v with error %v", got, err)
+            }
+            if !strings.HasPrefix(err.Error(), tt.wantPrefix) {
+                t.Fatalf("error = %q, want prefix %q", err.Error(), tt.wantPrefix)
+            }
+        })
+    }
+}

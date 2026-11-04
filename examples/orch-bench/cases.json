@@ -1,0 +1,9 @@
+{
+  "boltons-checkpoint": {"source": ".data/bench/boltons-upstream", "revision": "d31d821d"},
+  "boltons-buildgraph": {"source": ".data/bench/boltons-upstream", "revision": "d31d821d"},
+  "networkx-rollout": {"source": ".data/bench/networkx-upstream", "revision": "4fa222d2"},
+  "networkx-timeflow": {"source": ".data/bench/networkx-upstream", "revision": "4fa222d2"},
+  "polyglot-ledger": {"source": "/home/ubuntu/workspaces/bench-sources/polyglot-ledger", "revision": "HEAD"},
+  "meridian": {"source": "/home/ubuntu/workspaces/bench-sources/meridian", "revision": "HEAD"},
+  "tessera": {"source": "/home/ubuntu/workspaces/bench-sources/tessera", "revision": "HEAD"}
+}

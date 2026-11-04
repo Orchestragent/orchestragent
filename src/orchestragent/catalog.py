@@ -21,7 +21,7 @@ MODELS: dict[str, list[tuple[str, str]]] = {
 
 EFFORTS: dict[str, set[str]] = {
     "codex": {"low", "medium", "high", "xhigh", "max"},
-    "claude": {"low", "medium", "high", "max"},
+    "claude": {"low", "medium", "high", "xhigh", "max"},
     "dsh": {"off", "low", "high", "max"},
     "cursor": set(),
     "kimi": set(),

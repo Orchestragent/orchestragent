@@ -25,7 +25,7 @@ from typing import Any
 from orchestragent.native import NativeResult
 
 # Provider names orch already uses for built-in adapters.
-BUILT_IN = frozenset({"claude", "codex", "cursor", "dsh", "kimi", "jev"})
+BUILT_IN = frozenset({"claude", "codex", "cursor", "dsh", "kimi"})
 NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 JSON_ONLY = (
     "You are a component of an automated build system. Answer with exactly one JSON object "

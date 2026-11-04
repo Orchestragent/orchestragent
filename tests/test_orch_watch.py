@@ -269,7 +269,7 @@ def test_state_database_is_opened_read_only(state_db: Path, tmp_path: Path) -> N
     before = digest(state_db)
     db = connect(state_db)
     with pytest.raises(sqlite3.OperationalError):
-        db.execute("INSERT INTO orch_rules VALUES ('x', '{}')")
+        db.execute("INSERT INTO orch_runs VALUES ('x', 0, '{}')")
     db.close()
     source = Source(state_db)
     assert source.poll() is not None and source.poll() is None  # unchanged: no new model

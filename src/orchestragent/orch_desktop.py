@@ -224,7 +224,8 @@ if [ -f "$STATE/server.pid" ]; then  # one dashboard at a time: stop the previou
   kill "$(cat "$STATE/server.pid")" 2>/dev/null || true
 fi
 : > "$STATE/server.log"
-(trap '' HUP; run_orch --repo "$REPO" watch --web --port 0) > "$STATE/server.log" 2>&1 &
+# exec: the recorded pid is the server itself, so stopping it leaves nothing behind
+(trap '' HUP; exec {orch} --repo "$REPO" watch --web --port 0) > "$STATE/server.log" 2>&1 &
 echo $! > "$STATE/server.pid"
 URL=""
 for _ in $(seq 1 50); do

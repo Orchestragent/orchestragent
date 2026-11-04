@@ -392,7 +392,7 @@ class NativeClients:
                     "--disable-slash-commands",
                     "--no-chrome",
                 ]
-                if effort in {"low", "medium", "high", "max"}:
+                if effort in {"low", "medium", "high", "xhigh", "max"}:
                     args.extend(["--effort", effort])
                 if isinstance(prompt, ContextPrompt) and prompt.shared and prompt.dynamic.strip():
                     context_path = cwd / "context.txt"

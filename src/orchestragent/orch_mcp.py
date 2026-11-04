@@ -62,8 +62,11 @@ TOOLS: list[Json] = [
                 "base": {"type": "string", "description": "git revision to build on (HEAD)"},
                 "jobs": {"type": "integer", "minimum": 1, "maximum": 16,
                          "description": "parallel builders (default 4)"},
+                "run": {"type": "string", "description": (
+                    "resume this existing run instead of planning (after orch_hint or "
+                    "orch_submit); spec is then not needed")},
             },
-            "required": ["repo", "spec"],
+            "required": ["repo"],
             "additionalProperties": False,
         },
     },
@@ -123,6 +126,47 @@ TOOLS: list[Json] = [
             "type": "object",
             "properties": {"repo": _REPO, "job": _JOB},
             "required": ["repo", "job"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "orch_hint",
+        "description": (
+            "Give a stuck (PARKED) task guidance in plain words; its next attempts follow it "
+            "and the task retries. Resume the build afterwards with orch_start(run=...)."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"repo": _REPO, "task": {"type": "string", "pattern": "^T-[0-9]{3}$"},
+                           "text": {"type": "string", "minLength": 1, "maxLength": 2000},
+                           "run": {"type": "string"}},
+            "required": ["repo", "task", "text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "orch_take",
+        "description": (
+            "Take over a stuck task yourself: returns a directory with its best code, the "
+            "files you may edit and the frozen check commands. Edit only those files, then "
+            "call orch_submit."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"repo": _REPO, "task": {"type": "string", "pattern": "^T-[0-9]{3}$"},
+                           "run": {"type": "string"}},
+            "required": ["repo", "task"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "orch_submit",
+        "description": (
+            "Verify your edits to a taken-over task with its frozen checks and merge them; "
+            "dependent tasks then continue when the build resumes (orch_start(run=...))."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"repo": _REPO, "task": {"type": "string", "pattern": "^T-[0-9]{3}$"},
+                           "run": {"type": "string"}},
+            "required": ["repo", "task"],
             "additionalProperties": False,
         },
     },
@@ -241,27 +285,45 @@ def alive(pid: int) -> bool:
 def start(arguments: Json) -> str:
     repo = repository(arguments.get("repo"))
     spec = arguments.get("spec")
-    if not isinstance(spec, str) or len(spec.strip()) < 20:
-        raise ToolError("spec must be the complete requirements text")
+    resume = arguments.get("run") or ""
+    if resume and not re.fullmatch(r"r[0-9a-f]{8}", str(resume)):
+        raise ToolError("run must look like r1a2b3c4d")
+    if not resume and (not isinstance(spec, str) or len(spec.strip()) < 20):
+        raise ToolError("spec must be the complete requirements text (or give run to resume)")
     base = arguments.get("base") or "HEAD"
     if not isinstance(base, str) or not re.fullmatch(r"[\w./^~@{}-]{1,200}", base):
         raise ToolError("base must be a git revision")
     jobs = arguments.get("jobs", 4)
     if type(jobs) is not int or not 1 <= jobs <= 16:
         raise ToolError("jobs must be an integer from 1 to 16")
+    path = launch(repo, spec if isinstance(spec, str) else "", str(resume), base, jobs)
+    job = path.name
+    what = f"resuming run {resume}" if resume else "planning, then running"
+    return (f"orch job {job} started in {repo} ({what} with {jobs} builders).\n"
+            f"Follow it with orch_wait(repo, job={job!r}); the result branch is orch/<run_id>.")
+
+
+def launch(repo: Path, spec: str, resume: str, base: str = "HEAD", jobs: int = 4) -> Path:
+    """Start `orch plan` + `orch run` (or `orch run RUN` to resume) detached from this
+    process; returns the job directory (job.json, log, exit). Shared by MCP and the studio."""
     job = uuid.uuid4().hex[:12]
     path = mcp_home(repo) / "jobs" / job
     path.mkdir(parents=True)
-    (path / "spec.md").write_text(spec if spec.endswith("\n") else spec + "\n")
     cli = " ".join(_quote(part) for part in [*orch_command(), "--repo", str(repo)])
-    # Plan, then run exactly the run that plan created: its id is the first one plan logs.
     log_file = _quote(str(path / "log"))
-    script = (
-        f"{cli} plan --distributed --base {_quote(base)} {_quote(str(path / 'spec.md'))}"
-        f" && run_id=$(grep -oE 'run r[a-f0-9]{{8}}' {log_file} | head -n 1 | cut -c5-)"
-        f" && [ -n \"$run_id\" ] && {cli} run --jobs {jobs} \"$run_id\";"
-        f" echo $? > {_quote(str(path / 'exit'))}"
-    )
+    if resume:  # continue an existing run, e.g. after orch_hint or orch_submit
+        script = (f"echo 'run {resume}'; {cli} run --jobs {jobs} {_quote(str(resume))};"
+                  f" echo $? > {_quote(str(path / 'exit'))}")
+    else:
+        assert isinstance(spec, str)
+        (path / "spec.md").write_text(spec if spec.endswith("\n") else spec + "\n")
+        # Plan, then run exactly the run that plan created: its id is the first plan logs.
+        script = (
+            f"{cli} plan --base {_quote(base)} {_quote(str(path / 'spec.md'))}"
+            f" && run_id=$(grep -oE 'run r[a-f0-9]{{8}}' {log_file} | head -n 1 | cut -c5-)"
+            f" && [ -n \"$run_id\" ] && {cli} run --jobs {jobs} \"$run_id\";"
+            f" echo $? > {_quote(str(path / 'exit'))}"
+        )
     with (path / "log").open("wb") as log:
         process = subprocess.Popen(
             ["/bin/sh", "-c", script], stdin=subprocess.DEVNULL, stdout=log,
@@ -269,8 +331,7 @@ def start(arguments: Json) -> str:
         )
     (path / "job.json").write_text(dumps({"pid": process.pid, "started_at": time.time(),
                                           "base": base, "jobs": jobs}))
-    return (f"orch job {job} started in {repo} (planning, then running with {jobs} builders).\n"
-            f"Follow it with orch_wait(repo, job={job!r}); the result branch is orch/<run_id>.")
+    return path
 
 
 def _quote(text: str) -> str:
@@ -363,9 +424,29 @@ def doctor(arguments: Json) -> str:
     return clip(run_cli(repo, "doctor", "--allow-unverified-auth")[1])
 
 
+def intervene(command: str) -> Callable[[Json], str]:
+    """orch hint / take / submit on one task, reported as the CLI reports it."""
+    def handler(arguments: Json) -> str:
+        repo = repository(arguments.get("repo"))
+        task = arguments.get("task")
+        if not isinstance(task, str) or not re.fullmatch(r"T-[0-9]{3}", task):
+            raise ToolError("task must look like T-001")
+        run = arguments.get("run") or ""
+        if run and not re.fullmatch(r"r[0-9a-f]{8}", str(run)):
+            raise ToolError("run must look like r1a2b3c4d")
+        args = [command, task, *([str(arguments.get("text", ""))] if command == "hint" else [])]
+        code, text = run_cli(repo, *args, *(["--run", str(run)] if run else []), timeout=1800)
+        if code and command != "submit":
+            raise ToolError(text.strip()[-2000:])
+        return clip(text)
+    return handler
+
+
 HANDLERS: dict[str, Callable[[Json], str]] = {
     "orch_start": start, "orch_wait": wait, "orch_status": status, "orch_report": report,
     "orch_cost": cost, "orch_cancel": cancel, "orch_doctor": doctor,
+    "orch_hint": intervene("hint"), "orch_take": intervene("take"),
+    "orch_submit": intervene("submit"),
 }
 
 

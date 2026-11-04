@@ -2,27 +2,22 @@ import copy
 import json
 import re
 import sqlite3
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
-from threading import Barrier
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-from orchestragent.live_workspace import LiveWorkspace
+from orchestragent import orch_verify
 from orchestragent.native import ContextPrompt, NativeResult
-from orchestragent.orch_build import SPEC_AUTHORITY, EditError
+from orchestragent.orch_build import SPEC_AUTHORITY
 from orchestragent.orch_cli import main
-from orchestragent.orch_plan import lint, unittest_ids
-from orchestragent.orch_policy import Tuning
+from orchestragent.orch_generic import assemble, boundary_errors
 from orchestragent.orch_run import (
     CLAUDE_PLAN,
     DSF,
     DSF_EXTENDED,
-    SONNET_PLAN,
     Orchestrator,
     PlanError,
     Route,
@@ -31,44 +26,62 @@ from orchestragent.orch_state import Run
 from orchestragent.orch_thin import (
     BOUNDARY_RULES,
     BOUNDARY_STAGE,
-    assemble,
-    boundary_errors,
     boundary_fingerprint,
     boundary_prompt,
     boundary_review_prompt,
     canonical_boundary,
+    component_test_prompt,
     fill_requirements,
-    integration_targets,
     review_verdict,
-    revise_draft,
-    shard_path,
     spec_requirements,
 )
-from orchestragent.orch_thin import test_prompt as design_prompt
 from orchestragent.orch_usage import Call, output_cut, unresolved
+from orchestragent.orch_verify import Check
 from orchestragent.store import Conflict
 from orchestragent.workspace import Workspace
-from tests.conftest import BAD_ADD, GOOD_ADD, GOOD_DOUBLE, ScriptedCaller, edit_result, local_runner
+from tests.conftest import (
+    ADD_CHECK,
+    ADD_SHARD,
+    ADD_TEST,
+    ADD_TESTS,
+    DOUBLE_CHECK,
+    DOUBLE_SHARD,
+    GOOD_ADD,
+    GOOD_DOUBLE,
+    ScriptedCaller,
+    component_design,
+    edit_result,
+    integration,
+    local_runner,
+)
+
+ROOT = "dsh:design:root"  # the math plan's one implicit component designer
+ROOT_COMPONENT = {"id": "", "dir": ".", "test_command": ""}
 
 
-@pytest.mark.parametrize(("graph", "expected"), [
-    ({"a": [], "b": ["a"], "c": ["b"]}, ["c"]),
-    ({"a": [], "b": [], "join": ["a", "b"], "last": ["join"]}, ["join", "last"]),
-    ({"a": [], "b": ["a"], "join": ["a", "b"], "last": ["join"]}, ["last"]),
-    ({"a": [], "b": [], "join": ["a", "b"], "other": []}, ["join"]),
-    ({}, []),
-])
-def test_integration_targets_cover_true_joins_without_redundant_ancestral_inputs(
-    graph: dict[str, list[str]], expected: list[str],
-) -> None:
-    assert integration_targets(graph) == expected
+def shard_file(tid: str, integration: bool = False) -> str:
+    """Where the scripted test designers put a task's frozen test file."""
+    return f"test_orch_{tid.lower().replace('-', '_')}{'_integration' if integration else ''}.py"
 
 
-def test_legacy_integration_scope_only_selects_terminal_outputs() -> None:
-    graph = {"a": [], "b": [], "join": ["a", "b"], "last": ["join"]}
-    assert integration_targets(graph, "terminal") == ["last"]
-    with pytest.raises(ValueError, match="integration scope"):
-        integration_targets(graph, "unknown")
+def shard(tid: str, source: str, integration: bool = False) -> tuple[str, str, str, str]:
+    """One task's shard of a component design: one unittest file and the command that runs
+    exactly it."""
+    path = shard_file(tid, integration)
+    return tid, path, source, f"python3 -m unittest -q {path.removesuffix('.py')}"
+
+
+def root_design(*shards: tuple[str, str, str, str],
+                usage: dict[str, object] | None = None) -> NativeResult:
+    """The root component designer's answer for `shards`."""
+    answer = component_design(*shards)
+    return replace(answer, usage=usage) if usage else answer
+
+
+def contract_test(module: str, expression: str, expected: object, rid: str) -> str:
+    return (f"import unittest\nfrom {module} import {expression.split('(')[0]}\n"
+            f"class TestContract(unittest.TestCase):\n    def test_{rid}_value(self):\n"
+            f"        self.assertEqual({expression}, {expected!r})\n")
 
 
 def test_boundary_lint_feedback_does_not_change_cached_context() -> None:
@@ -79,51 +92,14 @@ def test_boundary_lint_feedback_does_not_change_cached_context() -> None:
     assert "invalid ownership" in retry.dynamic and "invalid ownership" not in retry.shared
 
 
-@pytest.mark.parametrize("integration", [False, True])
-def test_design_scope_preserves_upstream_requirements_without_unrelated_contracts(
-    boundary: dict[str, object], integration: bool,
-) -> None:
-    requirements = cast(list[dict[str, str]], boundary["requirements"])
-    requirements[0]["text"] = "PRODUCER_DOMAIN: positive, zero and negative inputs are valid"
-    requirements.append({"id": "R9", "text": "UNRELATED_REQUIREMENT_SENTINEL"})
-    tasks = cast(list[dict[str, Any]], boundary["tasks"])
-    tasks.append({"id": "T-009", "goal": "unrelated", "contract": "UNRELATED_CONTRACT_SENTINEL",
-                  "reqs": ["R9"], "files": ["unrelated.py"], "depends_on": [], "tests": []})
-    original = copy.deepcopy(boundary)
-    prompt = design_prompt("original spec", boundary, "repo map", [], task_id="T-002",
-                           integration=integration)
-    assert "PRODUCER_DOMAIN" in prompt and "positive, zero and negative" in prompt
-    assert "UNRELATED_REQUIREMENT_SENTINEL" not in prompt
-    assert "UNRELATED_CONTRACT_SENTINEL" not in prompt and boundary == original
-    assert ('["T-001","T-002"]' in prompt) is integration
+@pytest.fixture
+def boundary(math_plan: dict[str, object]) -> dict[str, object]:
+    return copy.deepcopy(math_plan)
 
 
 def revised(result: NativeResult, number: int) -> NativeResult:
     """An author revision; an unchanged resubmission is a named stop, not a new draft."""
     return NativeResult("ok", {**copy.deepcopy(result.data), "summary": f"revision {number}"})
-
-
-@pytest.fixture
-def boundary(math_plan: dict[str, object]) -> dict[str, object]:
-    plan = copy.deepcopy(math_plan)
-    plan["files"] = [
-        file
-        for file in cast(list[dict[str, str]], plan["files"])
-        if not LiveWorkspace.is_test_file(file["path"])
-    ]
-    plan["tasks"] = [{**task, "tests": []} for task in cast(list[dict[str, object]], plan["tasks"])]
-    return plan
-
-
-@pytest.fixture
-def design(math_plan: dict[str, object]) -> dict[str, object]:
-    return {
-        "files": [
-            file
-            for file in cast(list[dict[str, str]], math_plan["files"])
-            if LiveWorkspace.is_test_file(file["path"])
-        ]
-    }
 
 
 @pytest.fixture
@@ -168,143 +144,66 @@ def test_ambiguous_boundary_labels_are_never_guessed(
     elif defect == "missing":
         tasks[1]["depends_on"] = ["unknown"]
     elif defect == "frozen":
-        tasks[0]["tests"] = ["test_code.Case.test_r1_behavior"]
+        tasks[0]["tests"] = [ADD_TEST]
     else:
         tasks[0]["id"] = []
     assert canonical_boundary(alias_boundary) == alias_boundary
     assert boundary_errors(alias_boundary, frozenset())
 
 
-@pytest.fixture
-def thin_caller(boundary: dict[str, object], design: dict[str, object]) -> ScriptedCaller:
-    return ScriptedCaller(
-        {
-            "plan": [NativeResult("ok", boundary), NativeResult("ok", design)],
-            "dsh:T-001": [GOOD_ADD],
-            "dsh:T-002": [GOOD_DOUBLE],
-        }
-    )
-
-
-@pytest.fixture
-def thin(orch_repo: Path, thin_caller: ScriptedCaller) -> Orchestrator:
-    return Orchestrator(
-        orch_repo, thin_caller, local_runner, notify=lambda _: None, strategy="sonnet-dsf"
-    )
-
-
-def test_thin_assembly_preserves_explicit_interface_dependencies(
-    boundary: dict[str, object], design: dict[str, object],
+def test_assembly_preserves_explicit_interface_dependencies(
+    boundary: dict[str, object],
 ) -> None:
     cast(list[dict[str, object]], boundary["tasks"])[1]["interface_depends_on"] = ["T-001"]
-    assert boundary_errors(boundary) == []
-    plan = assemble(boundary, design)
-    assert cast(list[dict[str, object]], plan["tasks"])[1]["interface_depends_on"] == ["T-001"]
+    assert boundary_errors(boundary, frozenset()) == []
+    plan = assemble(boundary, [
+        ("T-001", [{"path": "test_add.py", "content": ADD_TESTS}], ADD_CHECK.id),
+        ("T-002", [{"path": "test_double.py", "content": "x"}], DOUBLE_CHECK.id),
+    ], frozenset())
+    tasks = cast(list[dict[str, object]], plan["tasks"])
+    assert tasks[1]["interface_depends_on"] == ["T-001"]
+    assert [task["tests"] for task in tasks] == [[ADD_CHECK.id], [DOUBLE_CHECK.id]]
 
 
 @pytest.fixture
 def distributed_case(
-    orch_repo: Path, boundary: dict[str, object],
+    orch_repo: Path, boundary: dict[str, object], unsandboxed: None,
 ) -> tuple[Orchestrator, ScriptedCaller]:
+    """An existing adder.py; the root component designer answers both tasks' tests in one
+    call, then each task's builder answers once."""
     files = cast(list[dict[str, str]], boundary["files"])
     existing = files.pop(0)
     (orch_repo / existing["path"]).write_text(existing["content"])
     Workspace.git(orch_repo, "add", existing["path"])
     Workspace.git(orch_repo, "commit", "-m", "existing implementation target")
-    responses = {"plan": [NativeResult("ok", boundary)]}
-    for tid, rid, module, expression, expected, build in [
-        ("T-001", "r1", "adder", "add(2, 3)", 5, GOOD_ADD),
-        ("T-002", "r2", "doubler", "double(4)", 8, GOOD_DOUBLE),
-    ]:
-        source = (f"import unittest\nfrom {module} import {expression.split('(')[0]}\n"
-                  f"class TestContract(unittest.TestCase):\n    def test_{rid}_value(self):\n"
-                  f"        self.assertEqual({expression}, {expected})\n")
-        responses[f"dsh:{tid}"] = [NativeResult("ok", {"files": [{
-            "path": f"test_orch_{tid.lower().replace('-', '_')}.py", "content": source,
-        }]}), build]
-    caller = ScriptedCaller(responses)
-    barrier = Barrier(2)
-
-    def call(provider: str, model: str, prompt: str, schema: dict[str, object], run_id: str,
-             cancelled: Callable[[], bool], *, effort: str = "") -> NativeResult:
-        if "-test-design-" in run_id and "-1-" in run_id:
-            barrier.wait(timeout=5)
-        return caller(provider, model, prompt, schema, run_id, cancelled, effort=effort)
-
-    return Orchestrator(orch_repo, call, local_runner, notify=lambda _: None), caller
+    caller = ScriptedCaller({
+        "plan": [NativeResult("ok", boundary)],
+        ROOT: [root_design(shard("T-001", contract_test("adder", "add(2, 3)", 5, "r1")),
+                           shard("T-002", contract_test("doubler", "double(4)", 8, "r2")))],
+        "dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE],
+    })
+    return Orchestrator(orch_repo, caller, local_runner, notify=lambda _: None), caller
 
 
 @pytest.fixture
 def resumable_case(
     distributed_case: tuple[Orchestrator, ScriptedCaller],
 ) -> tuple[Orchestrator, ScriptedCaller]:
-    orch, caller = distributed_case
-    orch.call = caller  # resume cases run shards sequentially to control the crash boundary
-    return orch, caller
+    return distributed_case
 
 
-def test_fixture_capture_is_repaired_before_any_builder_call(
-    resumable_case: tuple[Orchestrator, ScriptedCaller],
-) -> None:
-    orch, caller = resumable_case
-    source = ("import unittest\nfrom adder import add\n"
-              "class Contract(unittest.TestCase):\n    def test_r1_callbacks(self):\n"
-              "        callbacks = {n: lambda: add(n, 0) for n in (1, 2)}\n"
-              "        for n, callback in callbacks.items():\n"
-              "            self.assertEqual(callback(), n)\n")
-    caller.responses["dsh:T-001"].insert(0, NativeResult("ok", {"files": [{
-        "path": "test_orch_t_001.py", "content": source}]}))
-    run = orch.plan("add and double", distributed=True, test_jobs=1)
-    calls = orch.state.usage.calls(run.id)
-    assert sum(call.purpose == "test-design" and call.task_id == "T-001" for call in calls) == 2
-    assert not any(call.scope == "execution" for call in calls)
-    prompts = [prompt for _, key, prompt in caller.calls if key == "dsh:T-001"]
-    assert "loop variables" in prompts[-1] and caller.keys().count("plan") == 1
-
-
-@pytest.mark.parametrize("legacy", [False, True])
-def test_distributed_policy_and_execution_settings_stay_pinned_through_planning_resume(
-    resumable_case: tuple[Orchestrator, ScriptedCaller], legacy: bool,
-) -> None:
-    orch, caller = resumable_case
-    rule = orch.state.add_rule("Keep public inputs and exceptions explicit.", "prior", "planner")
-    assert rule is not None
-    orch.state.save_rule(replace(rule, status="active"))
-    original = None if legacy else orch.policies.enable(
-        tuning=Tuning(jobs=1, test_jobs=1, verify_jobs=1, cache_mode="off"))
-    caller.responses["dsh:T-002"].insert(0, NativeResult("auth_required", {}))
-    with pytest.raises(PlanError, match="auth_required"):
-        orch.plan("add and double", distributed=True, test_jobs=1 if legacy else None)
-    run_id = orch.state.usage.calls()[0].run_id
-    if legacy:
-        orch.policies.enable(tuning=Tuning(jobs=8))
-        with orch.state.store.transaction() as db:
-            row = db.execute("SELECT body FROM orch_planning_sessions WHERE id=?",
-                             (run_id,)).fetchone()
-            body = json.loads(row[0])
-            body.pop("policy_id")
-            db.execute("UPDATE orch_planning_sessions SET body=? WHERE id=?",
-                       (json.dumps(body), run_id))
-    else:
-        candidate = orch.policies.snapshot(tuning=Tuning(jobs=8))
-        # A concurrent activation must not replace the interrupted run's inputs.
-        with orch.state.store.transaction() as db:
-            db.execute("UPDATE orch_policy_head SET id=?", (candidate.id,))
-    orch = Orchestrator(orch.repo, caller, local_runner, notify=lambda _: None)
-    run = orch.resume_plan(run_id)
-    assert run.policy_id == (original.id if original else "")
-    assert caller.keys().count("plan") == caller.keys().count("dsh:T-001") == 1
-    planner_prompt = next(prompt for provider, _, prompt in caller.calls if provider == "claude")
-    assert (rule.text in planner_prompt) is (not legacy)
-    assert orch.execute(run.id).status == "done"
-    started = next(e.data for e in orch.state.events(run.id) if e.kind == "run.started")
-    assert (started["jobs"], started["cache_mode"]) == ((1, "off") if original else (4, "auto"))
+QUAD_INTEGRATION = ("import unittest\nfrom quad import quad\n"
+                    "class Composition(unittest.TestCase):\n    def test_r3_composed(self):\n"
+                    "        self.assertEqual(quad(2), 8)\n")
+QUAD_CHECK = ("python3 -m unittest -q " + shard_file("T-003", True).removesuffix(".py"))
 
 
 @pytest.fixture
 def integration_case(
     resumable_case: tuple[Orchestrator, ScriptedCaller],
 ) -> tuple[Orchestrator, ScriptedCaller]:
+    """T-003 joins T-001 and T-002: the planner is asked for integration checks. Its check
+    (quad(2) == 8) catches a quad that returns 0, which the task's own shard accepts."""
     orch, caller = resumable_case
     boundary = caller.responses["plan"][0].data
     cast(list[dict[str, object]], boundary["requirements"]).append({
@@ -314,96 +213,36 @@ def integration_case(
         "def quad(n: int) -> int:\n    raise NotImplementedError\n"})
     cast(list[dict[str, object]], boundary["tasks"]).append({
         "id": "T-003", "goal": "compose add and double", "reqs": ["R3"], "files": ["quad.py"],
-        "depends_on": ["T-001", "T-002"], "tests": [], "contract": "quad(n) returns 4*n"})
-    designs = []
-    for integration, value in ((True, 2), (False, 0)):  # integration shards dispatch first
-        source = ("import unittest\nfrom quad import quad\n"
-                  "class Composition(unittest.TestCase):\n    def test_r3_composed(self):\n"
-                  f"        self.assertEqual(quad({value}), {4 * value})\n")
-        designs.append(NativeResult("ok", {"files": [{
-            "path": shard_path("T-003", integration), "content": source}]}))
-    caller.responses["dsh:T-003"] = [*designs, edit_result("quad.py", "return 0"),
+        "depends_on": ["T-001", "T-002"], "interface_depends_on": [], "tests": [],
+        "contract": "quad(n) returns 4*n"})
+    own = ("import unittest\nfrom quad import quad\n"
+           "class Composition(unittest.TestCase):\n    def test_r3_composed(self):\n"
+           "        self.assertEqual(quad(0), 0)\n")
+    design = cast(list[dict[str, object]], caller.responses[ROOT][0].data["shards"])
+    design.append({"task": "T-003", "files": [{"path": shard_file("T-003"), "content": own}],
+                   "command": f"python3 -m unittest -q {shard_file('T-003').removesuffix('.py')}"})
+    caller.responses["claude:integration"] = [integration((
+        ["T-001", "T-002", "T-003"], shard_file("T-003", True), QUAD_INTEGRATION, QUAD_CHECK))]
+    caller.responses["dsh:T-003"] = [edit_result("quad.py", "return 0"),
                                     edit_result("quad.py", "return add(double(n), double(n))")]
     return orch, caller
 
 
-@pytest.fixture
-def middle_join_case(
-    integration_case: tuple[Orchestrator, ScriptedCaller],
-) -> tuple[Orchestrator, ScriptedCaller]:
-    orch, caller = integration_case
-    boundary = caller.responses["plan"][0].data
-    files = cast(list[dict[str, str]], boundary["files"])
-    next(file for file in files if file["path"] == "doubler.py")["content"] = (
-        "def double(a: int) -> int:\n    raise NotImplementedError\n")
-    tasks = cast(list[dict[str, Any]], boundary["tasks"])
-    tasks[1].update(depends_on=[], contract="double(a) == 2*a")
-    caller.responses["dsh:T-002"][-1] = edit_result("doubler.py", "return 2*a")
-    cast(list[dict[str, str]], boundary["requirements"]).append({
-        "id": "R4", "text": "render(n) is the string form of quad(n)"})
-    files.append({"path": "rendered.py", "content": "from quad import quad\n"
-                  "def render(n: int) -> str:\n    raise NotImplementedError\n"})
-    tasks.append({"id": "T-004", "goal": "render quad", "reqs": ["R4"],
-                  "files": ["rendered.py"], "depends_on": ["T-003"], "tests": [],
-                  "contract": "render(n) returns str(quad(n))"})
-    source = ("import unittest\nfrom rendered import render\n"
-              "class Render(unittest.TestCase):\n    def test_r4_render(self):\n"
-              "        self.assertEqual(render(0), '0')\n")
-    caller.responses["dsh:T-004"] = [
-        *[NativeResult("ok", {"files": [{"path": shard_path("T-004", integration),
-                                         "content": source}]}) for integration in (True, False)],
-        edit_result("rendered.py", "return str(quad(n))"),
-    ]
-    return orch, caller
-
-
-@pytest.mark.parametrize("legacy", [False, True])
-def test_mid_graph_integration_is_pinned_and_legacy_resume_does_not_buy_new_shards(
-    middle_join_case: tuple[Orchestrator, ScriptedCaller], legacy: bool,
-) -> None:
-    orch, caller = middle_join_case
-    # the first shard dispatched (deepest integration), so nothing else is bought before it
-    caller.responses["dsh:T-004"].insert(0, NativeResult("auth_required", {}))
-    with pytest.raises(PlanError, match="auth_required"):
-        orch.plan("Compose independent producers then render the result", distributed=True,
-                  test_jobs=1)
-    run_id = orch.state.usage.calls()[0].run_id
-    if legacy:
-        with orch.state.store.transaction() as db:
-            row = db.execute("SELECT body FROM orch_planning_sessions WHERE id=?",
-                             (run_id,)).fetchone()
-            body = json.loads(row[0])
-            body.pop("integration_scope")
-            db.execute("UPDATE orch_planning_sessions SET body=? WHERE id=?",
-                       (json.dumps(body), run_id))
-        caller.responses["dsh:T-003"].pop(0)  # legacy terminal-only work was already frozen
-    resumed = Orchestrator(orch.repo, caller, local_runner, notify=lambda _: None)
-    resumed.resume_plan(run_id)
-    assert resumed.planning.session(run_id).integration_scope == ("terminal" if legacy else "joins")
-    assert len(resumed.state.task(run_id, "T-003").tests) == (1 if legacy else 2)
-    assert resumed.execute(run_id, jobs=1).status == "done"
-    failures = [e for e in resumed.state.events(run_id, "T-003") if e.kind == "task.failed"]
-    assert len(failures) == int(not legacy)
-    assert caller.keys().count("plan") == 1
-    designs = [c for c in resumed.state.usage.calls(run_id)
-               if c.purpose == "integration-test-design" and c.outcome == "ok"]
-    assert len(designs) == (1 if legacy else 2)
-
-
 @pytest.mark.parametrize("mode", ["enabled", "disabled", "resume", "legacy_resume"])
-def test_independent_integration_shard_gates_composed_code_and_resumes_without_rebilling(
+def test_the_planners_integration_check_gates_composed_code_and_resumes_without_rebilling(
     integration_case: tuple[Orchestrator, ScriptedCaller], mode: str,
 ) -> None:
     orch, caller = integration_case
     enabled = mode in {"enabled", "resume"}
-    responses = caller.responses["dsh:T-003"]
     if not enabled:
-        responses.pop(0)  # the integration design, which dispatches first when enabled
+        caller.responses.pop("claude:integration")
     if "resume" in mode:
-        responses.insert(0, NativeResult("auth_required", {}))
+        # interrupt the last planning call: the integration design, or the component
+        # design when integration checks are off
+        caller.responses["claude:integration" if enabled else ROOT].insert(
+            0, NativeResult("auth_required", {}))
         with pytest.raises(PlanError, match="auth_required"):
-            orch.plan("Compose add, double and quad", distributed=True, test_jobs=1,
-                      integration_checks=enabled)
+            orch.plan("Compose add, double and quad", test_jobs=1, integration_checks=enabled)
         run_id = orch.state.usage.calls()[0].run_id
         if mode == "legacy_resume":
             with orch.state.store.transaction() as db:
@@ -416,15 +255,17 @@ def test_independent_integration_shard_gates_composed_code_and_resumes_without_r
         orch = Orchestrator(orch.repo, caller, local_runner, notify=lambda _: None)
         run = orch.resume_plan(run_id)
     else:
-        run = orch.plan("Compose add, double and quad", distributed=True, test_jobs=1,
-                        integration_checks=enabled)
+        run = orch.plan("Compose add, double and quad", test_jobs=1, integration_checks=enabled)
     session = orch.planning.session(run.id)
     task = orch.state.task(run.id, "T-003")
     assert session.integration_checks is enabled and len(task.tests) == (2 if enabled else 1)
-    assert caller.keys().count("plan") == caller.keys().count("dsh:T-001") == 1
+    assert all(orch_verify.is_check(test) for test in task.tests)
+    assert caller.keys().count("plan") == 1
+    assert caller.keys().count(ROOT) == (2 if mode == "legacy_resume" else 1)
     calls = orch.state.usage.calls(run.id)
-    assert sum(c.purpose == "integration-test-design" for c in calls) == (
+    assert sum(c.purpose == "integration-design" for c in calls) == (
         2 if mode == "resume" else int(enabled))
+    assert all(c.provider == "claude" for c in calls if c.purpose == "integration-design")
     completed = orch.execute(run.id, jobs=1)
     assert completed.status == "done"
     failures = [e for e in orch.state.events(run.id, "T-003") if e.kind == "task.failed"]
@@ -438,9 +279,9 @@ def test_planning_resume_reuses_boundary_and_finished_shards_without_rebilling(
     resumable_case: tuple[Orchestrator, ScriptedCaller], outcome: str,
 ) -> None:
     orch, caller = resumable_case
-    caller.responses["dsh:T-002"].insert(0, NativeResult(outcome, {}))
+    caller.responses[ROOT].insert(0, NativeResult(outcome, {}))
     with pytest.raises(PlanError, match=outcome):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1)
     calls = orch.state.usage.calls()
     run_id, old_base = calls[0].run_id, calls[0].base_revision
     (orch.repo / "unrelated.txt").write_text("a later user commit\n")
@@ -455,9 +296,8 @@ def test_planning_resume_reuses_boundary_and_finished_shards_without_rebilling(
         run_id, ack_unknown_calls=[calls[-1].id] if outcome == "timeout" else [],
     )
     assert completed.base == old_base and completed.status == "planned"
-    assert caller.keys().count("plan") == caller.keys().count("dsh:T-001") == 1
-    assert caller.keys().count("dsh:T-002") == 2
-    assert len(resumed.state.usage.calls(run_id)) == 4
+    assert caller.keys().count("plan") == 1 and caller.keys().count(ROOT) == 2
+    assert len(resumed.state.usage.calls(run_id)) == 4  # look, boundary, two designs
     original = next(c for c in resumed.state.usage.calls(run_id) if c.id == calls[-1].id)
     assert unresolved(original.outcome, original.usage) == (outcome == "timeout")
     assert resumed.resume_plan(run_id).checkpoint == completed.checkpoint
@@ -472,15 +312,15 @@ def test_planning_response_and_receipt_roll_back_together_on_storage_failure(
 
     def crash(db: sqlite3.Connection, call: Call, result: NativeResult | None) -> None:
         finish(db, call, result)
-        if call.task_id == "T-002":  # the first shard dispatched: it has the larger closure
+        if call.purpose == "test-design":
             raise RuntimeError("injected after response write before receipt transaction commit")
 
     monkeypatch.setattr(orch.planning, "finish", crash)
     with pytest.raises(RuntimeError, match="injected"):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1)
     calls = orch.state.usage.calls()
-    assert len(calls) == 2  # the queued second shard never dispatches after the storage fault
-    pending = next(c for c in calls if c.task_id == "T-002")
+    assert len(calls) == 3  # the look-around, the boundary and the one component design
+    pending = next(c for c in calls if c.purpose == "test-design")
     assert pending.outcome == "pending" and pending.finished_at is None
     with orch.state.store.transaction() as db:
         row = db.execute("SELECT response FROM orch_planning_calls WHERE call_id=?",
@@ -498,9 +338,9 @@ def test_planning_resume_rejects_changed_request_without_dispatch(
     change: str,
 ) -> None:
     orch, caller = resumable_case
-    caller.responses["dsh:T-002"].insert(0, NativeResult("auth_required", {}))
+    caller.responses[ROOT].insert(0, NativeResult("auth_required", {}))
     with pytest.raises(PlanError):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1)
     calls = orch.state.usage.calls()
     if change == "route":
         monkeypatch.setattr("orchestragent.orch_run.PLANNER",
@@ -519,23 +359,22 @@ def test_cli_resumes_pinned_planning_and_requires_unknown_call_authorization(
     capsys: pytest.CaptureFixture[str], reviewed: bool,
 ) -> None:
     orch, caller = resumable_case
-    caller.responses["dsh:T-002"].insert(0, NativeResult("timeout", {}))
+    caller.responses[ROOT].insert(0, NativeResult("timeout", {}))
     if reviewed:
         caller.responses["plan"].append(NativeResult("ok", {"approved": True, "issues": []}))
     with pytest.raises(PlanError):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1,
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1,
                   reviewed_boundary=reviewed)
     calls = orch.state.usage.calls()
-    clients = SimpleNamespace(call=caller, jev=SimpleNamespace(
-        status=lambda: {"ready": False}, decide=None), close=lambda: None)
+    clients = SimpleNamespace(call=caller, close=lambda: None)
     monkeypatch.setattr("orchestragent.orch_cli.providers", lambda _: clients)
-    monkeypatch.setattr(LiveWorkspace, "run_unittests", staticmethod(local_runner))
+    monkeypatch.setattr(orch_verify, "run", local_runner)
     args = ["--repo", str(orch.repo), "plan", "--resume", calls[0].run_id]
     assert main(args) == 1
     assert "Unresolved planning call" in capsys.readouterr().err
     assert main([*args, "--ack-unknown-call", calls[-1].id]) == 0
     assert "planned" in capsys.readouterr().out
-    assert len(caller.calls) == (5 if reviewed else 4)
+    assert len(caller.calls) == (5 if reviewed else 4)  # the look-around replays on resume
 
 
 @pytest.mark.parametrize("repair", ["none", "lint", "review", "settled-json", "mixed"])
@@ -557,7 +396,7 @@ def test_reviewed_boundary_keeps_structural_repairs_on_dsf_and_semantics_on_plan
     if repair in {"settled-json", "mixed"}:
         responses.insert(0, NativeResult("failed", {}, message="Invalid DeepSeek JSON result"))
     caller.responses["plan"] = responses
-    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1,
+    run = orch.plan("Implement adder.add and doubler.double", test_jobs=1,
                     reviewed_boundary=True, attempts=2)
     calls = orch.state.usage.calls(run.id)
     draft = [c for c in calls if c.purpose == "boundary-draft"]
@@ -572,10 +411,10 @@ def test_reviewed_boundary_keeps_structural_repairs_on_dsf_and_semantics_on_plan
                    for provider, _, text in caller.calls if provider == "dsh")
 
 
-@pytest.mark.parametrize(("failure", "calls", "code"), [
-    ("json", 2, "structural_budget"),
-    ("review", 4, "review_budget"),
-    ("unchanged", 3, "repeated_boundary"),
+@pytest.mark.parametrize(("failure", "calls", "code"), [  # each count includes the look-around
+    ("json", 3, "structural_budget"),
+    ("review", 5, "review_budget"),
+    ("unchanged", 4, "repeated_boundary"),
 ])
 def test_reviewed_planning_limits_each_failure_class_and_resume_does_not_refill_it(
     resumable_case: tuple[Orchestrator, ScriptedCaller], failure: str, calls: int, code: str,
@@ -589,8 +428,7 @@ def test_reviewed_planning_limits_each_failure_class_and_resume_does_not_refill_
         "unchanged": [draft, rejected, draft],
     }[failure]
     with pytest.raises(PlanError, match=rf"\({code}\)"):
-        orch.plan("Implement adder.add and doubler.double", distributed=True,
-                  reviewed_boundary=True, attempts=2)
+        orch.plan("Implement adder.add and doubler.double", reviewed_boundary=True, attempts=2)
     count = len(caller.calls)
     run_id = orch.state.usage.calls()[0].run_id
     with pytest.raises(PlanError, match=rf"\({code}\)"):
@@ -613,13 +451,13 @@ def ownership_drafts(
             "cycle": NativeResult("ok", cycle)}
 
 
-def test_default_distributed_plan_is_opus_boundary_then_dsf_tests_after_named_repair(
+def test_default_plan_is_opus_boundary_then_dsf_tests_after_named_repair(
     resumable_case: tuple[Orchestrator, ScriptedCaller], ownership_drafts: dict[str, NativeResult],
 ) -> None:
     orch, caller = resumable_case
     caller.responses["plan"] = [ownership_drafts["duplicate"], ownership_drafts["valid"]]
-    run = orch.execute(orch.plan("Implement adder.add and doubler.double", distributed=True,
-                                 test_jobs=1, attempts=2).id)
+    run = orch.execute(orch.plan("Implement adder.add and doubler.double", test_jobs=1,
+                                 attempts=2).id)
     session = orch.planning.session(run.id)
     calls = orch.state.usage.calls(run.id)
     authors = [text for provider, key, text in caller.calls if key == "plan"]
@@ -628,10 +466,11 @@ def test_default_distributed_plan_is_opus_boundary_then_dsf_tests_after_named_re
         CLAUDE_PLAN.label, "medium", "dsh/deepseek-flash")
     assert sorted({(c.provider, c.model, c.effort, c.purpose) for c in calls
                    if c.scope == "planning"}) == [
+        ("claude", "claude-opus-5-5", "medium", "look"),
         ("claude", "claude-opus-5-5", "medium", "plan"),
         ("dsh", "deepseek-flash", DSF_EXTENDED.effort, "test-design")]
     assert all(c.provider == "dsh" for c in calls if c.scope == "execution")
-    assert "duplicate-acceptance R1: T-001,T-002" in authors[1]
+    assert "R1: accepted by both T-001 and T-002" in authors[1]
     assert all(BOUNDARY_RULES in text for text in authors)
 
 
@@ -648,13 +487,13 @@ def test_opus_boundary_stops_are_named_and_resume_replays_them_without_dispatch(
     ownership_drafts["duplicate-renamed"] = revised(ownership_drafts["duplicate"], 1)
     caller.responses["plan"] = [ownership_drafts[name] for name in drafts]
     with pytest.raises(PlanError, match=rf"plan failed lint \({code}\)"):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, attempts=attempts)
+        orch.plan("Implement adder.add and doubler.double", attempts=attempts)
     run_id = orch.state.usage.calls()[0].run_id
     resumed = Orchestrator(orch.repo, caller, local_runner, notify=lambda _: None)
     with pytest.raises(PlanError, match=rf"\({code}\)"):
         resumed.resume_plan(run_id)
     stop = json.loads((orch.run_dir(run_id) / "planning" / "stop.json").read_text())
-    assert caller.keys() == ["plan", "plan"] and stop["code"] == code
+    assert caller.keys() == ["claude:look", "plan", "plan"] and stop["code"] == code
     assert {c.provider for c in orch.state.usage.calls(run_id)} == {"claude"}
 
 
@@ -667,20 +506,20 @@ def test_revision_keeps_structural_errors_and_review_findings_for_the_author(
         NativeResult("ok", {"approved": False, "issues": ["R2 contract omits ordering"]}),
         revised(ownership_drafts["valid"], 1), NativeResult("ok", {"approved": True, "issues": []}),
     ]
-    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1,
+    run = orch.plan("Implement adder.add and doubler.double", test_jobs=1,
                     reviewed_boundary=True, attempts=2)
     last, review = (next(text for provider, key, text in reversed(caller.calls)
                          if provider == route and key == "plan") for route in ("dsh", "claude"))
     assert run.status == "planned"
-    assert "duplicate-acceptance R1" in last and "R2 contract omits ordering" in last
+    assert "R1: accepted by both T-001 and T-002" in last and "R2 contract omits ordering" in last
     assert BOUNDARY_RULES in review
 
 
 @pytest.mark.parametrize(("mutation", "message"), [
-    ("duplicate", "duplicate-acceptance R1: T-001,T-002; R2: T-001,T-002"),
-    ("cycle", "dependency cycle through T-001"),
-    ("writer", "doubler.py already owned by T-001"),
-    ("unclaimed", "R2: no task implements it"),
+    ("duplicate", "R1: accepted by both T-001 and T-002"),
+    ("cycle", "depends_on must be acyclic"),
+    ("writer", "doubler.py: written by both T-001 and T-002"),
+    ("unclaimed", "requirements without an accepting task: R2"),
 ])
 def test_boundary_errors_name_requirements_tasks_and_files(
     boundary: dict[str, object], mutation: str, message: str,
@@ -695,7 +534,7 @@ def test_boundary_errors_name_requirements_tasks_and_files(
     else:
         tasks[1]["reqs"] = ["R1"]
         tasks[0]["reqs"] = []
-    assert any(message in error for error in boundary_errors(boundary))
+    assert any(message in error for error in boundary_errors(boundary, frozenset()))
 
 
 @pytest.fixture
@@ -748,10 +587,7 @@ def test_planner_may_leave_spec_requirement_text_to_the_controller(
     assert isinstance(prompt, ContextPrompt) and '"spec_requirement_ids":["R1"]' in prompt.shared
     assert [r["text"] for r in cast(list[dict[str, str]], filled["requirements"])] == [
         "Add two ints.\nKeep it exact.\n\nAlso keep inputs unchanged.", "double an integer"]
-    assert reqs[0]["text"] == "" and boundary_errors(filled) == []
-    reqs[1]["text"] = ""
-    assert "requirement 'R2'" in boundary_errors(
-        fill_requirements(boundary, spec_requirements(spec)))[0]
+    assert reqs[0]["text"] == "" and boundary_errors(filled, frozenset()) == []
 
 
 def test_saved_timeflow_drafts_replay_to_named_ownership_and_a_repeated_fingerprint() -> None:
@@ -766,8 +602,8 @@ def test_saved_timeflow_drafts_replay_to_named_ownership_and_a_repeated_fingerpr
                              if path not in declared)
         results.append(boundary_errors(draft, existing, existing_edits=True))
     assert [len(errors) for errors in results] == [1, 0, 1]
-    assert "duplicate-acceptance R8: T-007,T-009" in results[0][0]
-    assert "duplicate-acceptance R8: T-008,T-009" in results[2][0]
+    assert "R8: accepted by both T-007 and T-009" in results[0][0]
+    assert "R8: accepted by both T-008 and T-009" in results[2][0]
     assert boundary_fingerprint(results[0]) == boundary_fingerprint(results[2])
 
 
@@ -783,70 +619,52 @@ SHARD_USAGE: dict[str, object] = {"input_tokens": 10, "output_tokens": 5, "settl
 DANGLING = NativeResult(  # a closed content string followed by a stray member
     "failed", {}, usage=SHARD_USAGE, message="Invalid DSH JSON result: Expecting ':' delimiter",
     text='{"files":[{"path":"test_orch_t_001.py","content":"import unittest\\n","\\n"}]}')
-UNCLOSED = NativeResult("ok", {"files": [{"path": "test_orch_t_001.py", "content": (
-    "import unittest\nclass Offsets(unittest.TestCase):\n    def test_r1_offset(self):\n"
-    "        data = b'{\"a\": 1}'\n        mid = data.index(b'{\"a\") - 1\n")}]},
-    usage=SHARD_USAGE)
-
-
-LOCAL_FIX = edit_result("test_orch_t_001.py", "data.index(b'{\"a\"') - 1",
-                        search="data.index(b'{\"a\") - 1")
-NON_ASCII = NativeResult("ok", {"files": [{"path": "test_orch_t_001.py", "content": (
-    "import unittest\nclass Bytes(unittest.TestCase):\n    def test_r1_bytes(self):\n"
-    "        payload = b'{\"a\":\"caf\u00e9\"}'\n        self.assertEqual(len(payload), 13)\n")}]},
-    usage=SHARD_USAGE)
-NON_ASCII_FIX = edit_result("test_orch_t_001.py", "'{\"a\":\"caf\u00e9\"}'.encode()",
-                            search="b'{\"a\":\"caf\u00e9\"}'")
-MISSED_FIX = edit_result("test_orch_t_001.py", "x", search="text that is not in the draft")
-DELETING_FIX = edit_result(  # compiles, but drops the only R1 test
-    "test_orch_t_001.py", "    def helper_only(self):\n        pass\n",
-    search="    def test_r1_offset(self):\n        data = b'{\"a\": 1}'\n"
-           "        mid = data.index(b'{\"a\") - 1\n")
+DOUBLE_VALUE = shard("T-002", contract_test("doubler", "double(4)", 8, "r2"))
+# T-001's tests pass on the stubs, so they prove nothing (red gate).
+VACUOUS = root_design(shard("T-001", "import unittest\nclass Vacuous(unittest.TestCase):\n"
+                            "    def test_r1_nothing(self):\n        pass\n"),
+                      DOUBLE_VALUE, usage=SHARD_USAGE)
+# A runner the sandbox does not have: exit 127 (red gate).
+NOT_RUNNABLE = root_design(
+    ("T-001", shard_file("T-001"), contract_test("adder", "add(2, 3)", 5, "r1"),
+     "no-such-test-runner test_orch_t_001.py"), DOUBLE_VALUE, usage=SHARD_USAGE)
+# After the first round T-002's shard is accepted: a repair returns only T-001's.
+VACUOUS_AGAIN = root_design(shard("T-001", "import unittest\nclass Vacuous(unittest.TestCase):\n"
+                                  "    def test_r1_nothing(self):\n        pass\n"),
+                            usage=SHARD_USAGE)
+NOT_RUNNABLE_AGAIN = root_design(
+    ("T-001", shard_file("T-001"), contract_test("adder", "add(2, 3)", 5, "r1"),
+     "no-such-test-runner test_orch_t_001.py"), usage=SHARD_USAGE)
 
 
 @pytest.mark.parametrize(("failures", "attempts", "calls", "stop", "reason"), [
-    ([DANGLING, UNCLOSED, LOCAL_FIX], 2, 3, "", ""),
-    ([UNCLOSED, DANGLING, LOCAL_FIX], 2, 3, "", ""),
-    ([NON_ASCII, NON_ASCII_FIX], 2, 2, "", ""),
+    ([DANGLING], 2, 2, "", ""),
     ([DANGLING, DANGLING], 2, 3, "", ""),
     ([DANGLING, DANGLING, DANGLING], 2, 3, "lint_budget", "invalid/truncated JSON"),
-    ([UNCLOSED, MISSED_FIX, UNCLOSED], 3, 3, "repeated_lint_error", "unterminated"),
-    ([UNCLOSED, DELETING_FIX], 2, 2, "lint_budget", "does not cover all assigned"),
-], ids=["format-then-local-source-fix", "malformed-patch-keeps-the-draft",
-        "non-ascii-bytes-local-fix", "format-twice",
-        "persistent-format", "missed-patch-falls-back-then-repeats",
-        "patch-cannot-weaken-coverage"])
+    ([DANGLING, VACUOUS, VACUOUS_AGAIN], 3, 3, "repeated_lint_error", "prove nothing"),
+    ([VACUOUS, NOT_RUNNABLE_AGAIN], 2, 2, "lint_budget", "could not run (exit 127)"),
+], ids=["format-once", "format-twice", "persistent-format", "format-then-repeated-red",
+        "red-failures-share-the-revision-budget"])
 def test_shard_format_repairs_and_lint_revisions_have_separate_named_bounds(
     resumable_case: tuple[Orchestrator, ScriptedCaller], failures: list[NativeResult],
     attempts: int, calls: int, stop: str, reason: str,
 ) -> None:
     orch, caller = resumable_case
-    caller.responses["dsh:T-001"][:0] = failures
+    caller.responses[ROOT][:0] = failures
     if stop:
-        with pytest.raises(PlanError, match=rf"test-designer T-001 failed lint \({stop}\)") as err:
-            orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1,
-                      attempts=attempts)
+        with pytest.raises(PlanError,
+                           match=rf"test designer component-root failed lint \({stop}\)") as err:
+            orch.plan("Implement adder.add and doubler.double", test_jobs=1, attempts=attempts)
         assert reason in err.value.errors[0]
     else:
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1,
-                  attempts=attempts)
-    designed = [c for c in orch.state.usage.calls() if c.task_id == "T-001"]
-    prompts = [text for _, key, text in caller.calls if key == "dsh:T-001"]
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1, attempts=attempts)
+    designed = [c for c in orch.state.usage.calls() if c.task_id == "component-root"]
+    prompts = [text for _, key, text in caller.calls if key == ROOT]
     assert [c.attempt for c in designed] == list(range(1, calls + 1))
     assert all(c.effort == DSF_EXTENDED.effort for c in designed)
-    purposes = [c.purpose for c in designed]
-    if "test-repair" in purposes:
-        repair = purposes.index("test-repair")
-        assert "LOCAL REPAIR OF YOUR DRAFT" in prompts[repair]
-        assert ("    5|         mid = data.index(b'{\\\"a\\\") - 1" in prompts[repair]
-                or "bytes can only contain ASCII" in prompts[repair])
-    if failures[:2] == [DANGLING, UNCLOSED]:
-        assert "error_char=" in prompts[1] and purposes == [
-            "test-design", "test-design", "test-repair"]
-    if failures[:2] == [UNCLOSED, DANGLING]:  # no full regeneration after a malformed patch
-        assert purposes == ["test-design", "test-repair", "test-repair"]
-        assert "unterminated" in prompts[2] and "invalid/truncated JSON" in prompts[2]
-        assert "replaces only the full-file output instruction" in prompts[2]
+    assert {c.purpose for c in designed} == {"test-design"}
+    if failures[0] is DANGLING:
+        assert "error_char=" in prompts[1] and "invalid/truncated JSON" in prompts[1]
 
 
 CUT_SHARD = replace(DANGLING, usage={**SHARD_USAGE, "stop_reason": "max_tokens",
@@ -869,13 +687,13 @@ def test_shard_starts_at_the_widest_covered_budget_and_a_confirmed_cut_stops(
 ) -> None:
     orch, caller = resumable_case
     monkeypatch.setattr("orchestragent.orch_run.DSF_RESERVATION", reservation)
-    caller.responses["dsh:T-001"][:0] = failures
+    caller.responses[ROOT][:0] = failures
     if stop:
-        with pytest.raises(PlanError, match=rf"test-designer T-001 {re.escape(stop)}"):
-            orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+        with pytest.raises(PlanError, match=rf"test designer component-root {re.escape(stop)}"):
+            orch.plan("Implement adder.add and doubler.double", test_jobs=1)
     else:
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
-    designed = [c for c in orch.state.usage.calls() if c.task_id == "T-001"]
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1)
+    designed = [c for c in orch.state.usage.calls() if c.task_id == "component-root"]
     assert [c.effort for c in designed] == efforts
     assert [c.attempt for c in designed] == list(range(1, len(efforts) + 1))
     assert all(output_cut(failure.usage) for failure in failures)
@@ -885,58 +703,43 @@ def test_shard_output_limit_stop_replays_on_resume_without_new_calls(
     resumable_case: tuple[Orchestrator, ScriptedCaller],
 ) -> None:
     orch, caller = resumable_case
-    caller.responses["dsh:T-001"][:0] = [CUT_SHARD]
+    caller.responses[ROOT][:0] = [CUT_SHARD]
     with pytest.raises(PlanError, match=r"failed lint \(output_limit\)"):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1)
     count = len(caller.calls)
     run_id = orch.state.usage.calls()[0].run_id
     resumed = Orchestrator(orch.repo, caller, local_runner, notify=lambda _: None)
     with pytest.raises(PlanError, match=r"failed lint \(output_limit\)"):
         resumed.resume_plan(run_id)
-    assert len(caller.calls) == count and caller.keys().count("dsh:T-001") == 1
+    assert len(caller.calls) == count and caller.keys().count(ROOT) == 1
 
 
-def test_unrunnable_test_shape_is_returned_to_the_designer_before_freezing(
-    resumable_case: tuple[Orchestrator, ScriptedCaller],
+@pytest.mark.parametrize(("rejected", "problem"), [
+    (VACUOUS, "prove nothing"), (NOT_RUNNABLE, "could not run (exit 127)")])
+def test_red_gate_returns_a_vacuous_or_unrunnable_check_to_the_designer_before_freezing(
+    resumable_case: tuple[Orchestrator, ScriptedCaller], rejected: NativeResult, problem: str,
 ) -> None:
     orch, caller = resumable_case
-    orphan = ("import unittest\nfrom adder import add\nclass Shared:\n"
-              "    def test_r1_value(self):\n        self.assertEqual(add(2, 3), 5)\n")
-    caller.responses["dsh:T-001"].insert(0, NativeResult("ok", {"files": [
-        {"path": "test_orch_t_001.py", "content": orphan}]}, usage=SHARD_USAGE))
-    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
-    prompts = [text for _, key, text in caller.calls if key == "dsh:T-001"]
+    caller.responses[ROOT].insert(0, rejected)
+    run = orch.plan("Implement adder.add and doubler.double", test_jobs=1)
+    prompts = [text for _, key, text in caller.calls if key == ROOT]
     assert run.status == "planned" and len(prompts) == 2
-    assert "class Shared defines tests but is not a unittest.TestCase" in prompts[1]
-    tasks = cast(list[dict[str, Any]], run.plan["tasks"])
-    assert all("Shared" not in test for task in tasks for test in task["tests"])
-
-
-def test_shards_start_deepest_and_integration_first_but_assemble_in_plan_order(
-    integration_case: tuple[Orchestrator, ScriptedCaller],
-) -> None:
-    orch, caller = integration_case
-    run = orch.plan("Compose add, double and quad", distributed=True, test_jobs=1)
-    dispatched = [(c.task_id, c.purpose) for c in orch.state.usage.calls(run.id)
-                  if c.provider == "dsh"]
-    assert dispatched == [("T-003", "integration-test-design"), ("T-003", "test-design"),
-                          ("T-002", "test-design"), ("T-001", "test-design")]
-    tests = [cast(dict[str, str], file)["path"]
-             for file in cast(list[object], run.plan["files"]) if "test_orch" in str(file)]
-    assert tests == [shard_path("T-001"), shard_path("T-002"), shard_path("T-003"),
-                     shard_path("T-003", True)]
+    assert problem in prompts[1]
+    [frozen] = orch.state.task(run.id, "T-001").tests
+    assert cast(Check, orch_verify.parse(frozen)).command == (
+        "python3 -m unittest -q test_orch_t_001")
 
 
 @pytest.mark.parametrize(("interruption", "resumes"), [
     (NativeResult("auth_required", {}), True), (NativeResult("timeout", {}), False)])
-def test_local_repair_resumes_from_the_settled_draft_and_never_replays_unknown_repairs(
+def test_redesign_resumes_after_the_settled_draft_and_never_replays_unknown_calls(
     resumable_case: tuple[Orchestrator, ScriptedCaller], interruption: NativeResult,
     resumes: bool,
 ) -> None:
     orch, caller = resumable_case
-    caller.responses["dsh:T-001"][:0] = [UNCLOSED, interruption, LOCAL_FIX]
+    caller.responses[ROOT][:0] = [VACUOUS, interruption]
     with pytest.raises(PlanError, match=interruption.outcome):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1)
     run_id = orch.state.usage.calls()[0].run_id
     resumed = Orchestrator(orch.repo, caller, local_runner, notify=lambda _: None)
     if resumes:
@@ -945,50 +748,25 @@ def test_local_repair_resumes_from_the_settled_draft_and_never_replays_unknown_r
         with pytest.raises(Conflict, match="Unresolved planning call"):
             resumed.resume_plan(run_id)
     calls = [(c.purpose, c.attempt) for c in resumed.state.usage.calls(run_id)
-             if c.task_id == "T-001"]
-    assert calls == [("test-design", 1), ("test-repair", 2)] + (
-        [("test-repair", 2)] if resumes else [])
-    assert caller.keys().count("dsh:T-001") == len(calls)
-
-
-DRAFT = "import unittest\nclass T(unittest.TestCase):\n    def test_r1_a(self):\n        x = 'a\n"
-REWRITE = "import unittest\nclass T(unittest.TestCase):\n    def test_r1_a(self):\n        pass\n"
-
-
-@pytest.mark.parametrize(("path", "search"), [
-    ("{outside}", "        x = 'a"),
-    ("../sentinel_test.py", "        x = 'a"),
-    ("helper.py", "        x = 'a"),
-    ("test_orch_t_001.py", DRAFT),
-    ("test_orch_t_001.py", f"\n  {DRAFT}  \n"),
-], ids=["absolute", "parent-escape", "not-a-test-file", "whole-draft", "whole-draft-padded"])
-def test_local_repair_cannot_escape_scratch_or_rewrite_the_whole_draft(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, search: str,
-) -> None:
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
-    monkeypatch.setattr("tempfile.tempdir", str(scratch))
-    sentinel = tmp_path / "sentinel_test.py"
-    sentinel.write_text("ORIGINAL\n")
-    target = path.format(outside=sentinel)
-    with pytest.raises(EditError):
-        revise_draft(target, DRAFT, [{"path": target, "search": search, "replace": REWRITE}])
-    assert sentinel.read_text() == "ORIGINAL\n" and not any(scratch.iterdir())
+             if c.task_id == "component-root"]
+    assert calls == [("test-design", 1), ("test-design", 2)] + (
+        [("test-design", 2)] if resumes else [])
+    assert caller.keys().count(ROOT) == len(calls)
 
 
 def test_shard_resume_replays_a_settled_bad_answer_instead_of_buying_it_again(
     resumable_case: tuple[Orchestrator, ScriptedCaller],
 ) -> None:
     orch, caller = resumable_case
-    caller.responses["dsh:T-001"][:0] = [DANGLING, NativeResult("auth_required", {})]
+    caller.responses[ROOT][:0] = [DANGLING, NativeResult("auth_required", {})]
     with pytest.raises(PlanError, match="auth_required"):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1)
     run_id = orch.state.usage.calls()[0].run_id
     resumed = Orchestrator(orch.repo, caller, local_runner, notify=lambda _: None)
     assert resumed.resume_plan(run_id).status == "planned"
-    assert caller.keys().count("dsh:T-001") == 3 and caller.keys().count("plan") == 1
-    assert [c.attempt for c in resumed.state.usage.calls(run_id) if c.task_id == "T-001"] == [
-        1, 2, 2]
+    assert caller.keys().count(ROOT) == 3 and caller.keys().count("plan") == 1
+    assert [c.attempt for c in resumed.state.usage.calls(run_id)
+            if c.task_id == "component-root"] == [1, 2, 2]
 
 
 @pytest.mark.parametrize("interrupted", ["review", "shard"])
@@ -1000,16 +778,15 @@ def test_reviewed_boundary_resume_reuses_finished_phases(
     if interrupted == "review":
         caller.responses["plan"].insert(1, NativeResult("timeout", {}))
     else:
-        caller.responses["dsh:T-002"].insert(0, NativeResult("auth_required", {}))
+        caller.responses[ROOT].insert(0, NativeResult("auth_required", {}))
     with pytest.raises(PlanError):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1,
-                  reviewed_boundary=True)
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1, reviewed_boundary=True)
     original = orch.state.usage.calls()
     resumed = Orchestrator(orch.repo, caller, local_runner, notify=lambda _: None)
     run = resumed.resume_plan(original[0].run_id, ack_unknown_calls=(
         [original[-1].id] if interrupted == "review" else []))
     calls = resumed.state.usage.calls(run.id)
-    assert run.status == "planned" and len(calls) == 5
+    assert run.status == "planned" and len(calls) == 5  # including the look-around
     assert sum(c.purpose == "boundary-draft" for c in calls) == 1
     assert sum(c.purpose == "boundary-review" for c in calls) == (
         2 if interrupted == "review" else 1)
@@ -1048,13 +825,14 @@ def test_boundary_revision_preserves_findings_for_author_and_independent_review(
         NativeResult("ok", {"approved": False, "issues": [findings[1]]}),
         revised(boundary, 2), NativeResult("ok", {"approved": True, "issues": []}),
     ]
+
     def fail_checkpoint(*args: object, **kwargs: object) -> Run:
         raise RuntimeError("injected checkpoint interruption")
 
     if interrupted:
         monkeypatch.setattr(orch, "_checkpoint", fail_checkpoint)
         with pytest.raises(RuntimeError, match="checkpoint interruption"):
-            orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1,
+            orch.plan("Implement adder.add and doubler.double", test_jobs=1,
                       reviewed_boundary=True, attempts=3)
         calls = len(caller.calls)
         run_id = orch.state.usage.calls()[0].run_id
@@ -1062,7 +840,7 @@ def test_boundary_revision_preserves_findings_for_author_and_independent_review(
         run = resumed.resume_plan(run_id)
         assert len(caller.calls) == calls
     else:
-        run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1,
+        run = orch.plan("Implement adder.add and doubler.double", test_jobs=1,
                         reviewed_boundary=True, attempts=3)
     last = {provider: [text for route, key, text in caller.calls
                        if route == provider and key == "plan"][-1]
@@ -1079,7 +857,7 @@ def test_boundary_roles_share_controller_stage_without_dropping_spec(role: str) 
               else boundary_review_prompt(spec, "repo", {}))
     assert isinstance(prompt, ContextPrompt)
     assert SPEC_AUTHORITY in prompt.shared and BOUNDARY_RULES in prompt.shared
-    evidence = json.loads(prompt.shared[prompt.shared.index('{'):])
+    evidence = json.loads(prompt.shared[prompt.shared.index('{"'):])
     assert evidence["controller_stage"] == BOUNDARY_STAGE
     assert evidence["spec" if role == "author" else "original_spec"] == spec
 
@@ -1103,7 +881,7 @@ def test_planning_checkpoint_resume_checks_saved_content_and_preserves_user_edit
     monkeypatch.setattr(orch, "git", interrupted_git)
     monkeypatch.setattr(orch.state, "create_run", interrupted_state)
     with pytest.raises(RuntimeError, match="injected checkpoint"):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1)
     calls = orch.state.usage.calls()
     run_id = calls[0].run_id
     owned = orch.integration(run_id) / "doubler.py"
@@ -1118,50 +896,45 @@ def test_planning_checkpoint_resume_checks_saved_content_and_preserves_user_edit
         run = resumed.resume_plan(run_id)
         assert run.status == "planned" and run.id == run_id
         assert Workspace.git(orch.repo, "rev-parse", f"orch/{run_id}/plan") == run.checkpoint
-    assert len(caller.calls) == len(calls) == 3
+    assert len(caller.calls) == len(calls) == 3  # look, boundary, design; none replayed
 
 
-@pytest.mark.parametrize("repair", [
-    "none", "ownership", "settled-json", "capacity", "duplicate-test", "rebound-test",
-])
-def test_distributed_existing_repo_parallel_tests_and_local_retry(
+@pytest.mark.parametrize("repair", ["none", "ownership", "settled-json", "capacity"])
+def test_distributed_existing_repo_component_tests_and_local_retry(
     distributed_case: tuple[Orchestrator, ScriptedCaller], repair: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("orchestragent.orch_run.DSF_BUDGET", 39919)
     orch, caller = distributed_case
-    if repair == "ownership":
-        caller.responses["dsh:T-001"].insert(0, NativeResult("ok", {"files": [{
-            "path": "test_foreign.py", "content": "import unittest\n",
-        }]}))
+    good = caller.responses[ROOT][0]
+    if repair == "ownership":  # a test file may not overwrite code a task owns
+        bad = copy.deepcopy(good)
+        shards = cast(list[dict[str, Any]], bad.data["shards"])
+        shards[0]["files"] = [{"path": "adder.py", "content": "def add(a, b):\n    return a + b\n"}]
+        caller.responses[ROOT].insert(0, bad)
     elif repair == "settled-json":
-        caller.responses["dsh:T-001"].insert(0, NativeResult(
+        caller.responses[ROOT].insert(0, NativeResult(
             "failed", {}, usage={"settled_cents": 1}, message="Invalid DSH JSON result: truncated"))
     elif repair == "capacity":
-        oversized = copy.deepcopy(caller.responses["dsh:T-001"][0])
-        cast(list[dict[str, str]], oversized.data["files"])[0]["content"] += "# verbose\n" * 5000
-        caller.responses["dsh:T-001"].insert(0, oversized)
-    elif repair in {"duplicate-test", "rebound-test"}:
-        invalid = copy.deepcopy(caller.responses["dsh:T-001"][0])
-        file = cast(list[dict[str, str]], invalid.data["files"])[0]
-        method = unittest_ids(file["path"], file["content"])[0].rsplit(".", 1)[1]
-        file["content"] += (f"\n    def {method}(self):\n        pass\n"
-                            if repair == "duplicate-test" else f"\n    {method} = None\n")
-        caller.responses["dsh:T-001"].insert(0, invalid)
-    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=2)
+        oversized = copy.deepcopy(good)
+        shards = cast(list[dict[str, Any]], oversized.data["shards"])
+        shards[0]["files"][0]["content"] += "# verbose\n" * 5000
+        caller.responses[ROOT].insert(0, oversized)
+    run = orch.plan("Implement adder.add and doubler.double", test_jobs=2)
     completed = orch.execute(run.id, jobs=2)
     calls = orch.state.usage.calls(run.id)
-    assert completed.status == "done" and run.strategy == "opus-dsf"
-    assert len([c for c in calls if c.provider == "claude"]) == 1
-    assert [(tid, len([c for c in calls if c.task_id == tid and c.purpose == "test-design"]))
-            for tid in ("T-001", "T-002")] == [("T-001", 1 + (repair != "none")), ("T-002", 1)]
-    assert all(c.scope == "planning" for c in calls if c.purpose == "test-design")
+    assert completed.status == "done"
+    assert len([c for c in calls if c.provider == "claude"]) == 2  # look-around and boundary
+    designs = [c for c in calls if c.purpose == "test-design"]
+    assert len(designs) == 1 + (repair != "none")
+    assert all(c.scope == "planning" and c.task_id == "component-root" for c in designs)
     assert any(e.kind == "plan.distributed" for e in orch.state.events(run.id))
     saved = [json.loads(path.read_text())
-             for path in (orch.run_dir(run.id) / "planning").glob("T-*.json")]
-    assert sum(item["accepted"] is True for item in saved) == 2
-    if repair == "capacity":
-        assert sum(item["accepted"] is False for item in saved) == 1
+             for path in (orch.run_dir(run.id) / "planning").glob("component-root-*.json")]
+    assert sum(item["accepted"] is True for item in saved) == 1
+    assert sum(item["accepted"] is False for item in saved) == int(repair == "capacity")
+    if repair == "ownership":
+        assert "adder.py" in [text for _, key, text in caller.calls if key == ROOT][1]
 
 
 def test_oversized_owned_source_is_rejected_before_test_generation(
@@ -1177,20 +950,21 @@ def test_oversized_owned_source_is_rejected_before_test_generation(
     Workspace.git(orch.repo, "commit", "-m", "large source")
     caller.responses["plan"].append(copy.deepcopy(caller.responses["plan"][0]))
     with pytest.raises(PlanError) as error:
-        orch.plan("Implement adder.add and doubler.double", distributed=True, attempts=2)
-    assert caller.keys() == ["plan", "plan"]
+        orch.plan("Implement adder.add and doubler.double", attempts=2)
+    assert caller.keys() == ["claude:look", "plan", "plan"]
     assert "builder budget" in str(error.value.errors)
 
 
-def test_shard_and_retry_details_follow_identical_shared_prefix(
+def test_component_design_and_retry_details_follow_identical_shared_prefix(
     boundary: dict[str, object],
 ) -> None:
-    prompts = [design_prompt("Original spec", boundary, "index map", errors, task_id=tid)
-               for tid, errors in [("T-001", []), ("T-002", []), ("T-001", ["repair"])]]
-    prefixes = [p.split("\n## ASSIGNED TEST SHARD\n")[0] for p in prompts]
+    prompts = [component_test_prompt("Original spec", boundary, "index map", errors,
+                                     component=ROOT_COMPONENT)
+               for errors in ([], ["repair"])]
+    prefixes = [p.split("\n## ASSIGNED COMPONENT\n")[0] for p in prompts]
     assert len(set(prefixes)) == 1 and "Original spec" in prefixes[0]
     assert SPEC_AUTHORITY in prefixes[0]
-    assert len(set(prompts)) == 3
+    assert len(set(prompts)) == 2 and "repair" in prompts[1] and "repair" not in prompts[0]
 
 
 def test_test_design_reads_pinned_legacy_source_before_builders(
@@ -1198,78 +972,33 @@ def test_test_design_reads_pinned_legacy_source_before_builders(
 ) -> None:
     orch, caller = distributed_case
     original = (orch.repo / "adder.py").read_text()
-    original = ("from facade import offset\n" + original
-                + "\ndef legacy_offset():\n    return offset()\n")
+    original += "\ndef legacy_offset():\n    return 7\n"
     (orch.repo / "adder.py").write_text(original)
-    (orch.repo / "facade.py").write_text("from helper import offset\nfrom noise import noise\n")
-    (orch.repo / "helper.py").write_text("def offset():\n    return 7\n")
-    (orch.repo / "noise.py").write_text("def noise():\n    return 'UNRELATED_GRAPH_FRAGMENT'\n")
-    Workspace.git(orch.repo, "add", "adder.py", "facade.py", "helper.py", "noise.py")
-    Workspace.git(orch.repo, "commit", "-m", "legacy facade with unrelated re-export")
+    Workspace.git(orch.repo, "add", "adder.py")
+    Workspace.git(orch.repo, "commit", "-m", "legacy helper")
     (orch.repo / "adder.py").write_text(original + "\n# UNCOMMITTED_SOURCE\n")
-    orch.plan("Implement adder.add and doubler.double", distributed=True)
-    shards = [prompt for provider, _, prompt in caller.calls if provider == "dsh"]
-    assert len(shards) == 2
-    assert all(original in prompt and "UNCOMMITTED_SOURCE" not in prompt for prompt in shards)
-    assert all("PINNED EXISTING SOURCE" in prompt for prompt in shards)
-    assert all("return 7" in prompt for prompt in shards)
-    assert all("UNRELATED_GRAPH_FRAGMENT" not in prompt for prompt in shards)
-    assert len({p.split("\n## ASSIGNED TEST SHARD\n")[0] for p in shards}) == 1
+    orch.plan("Implement adder.add and doubler.double")
+    [prompt] = [prompt for provider, _, prompt in caller.calls if provider == "dsh"]
+    assert original in prompt and "UNCOMMITTED_SOURCE" not in prompt
+    assert "PINNED EXISTING SOURCE" in prompt
 
 
-def test_distributed_rejection_stops_queued_shards_without_replaying_unknown_calls(
+def test_a_rejected_component_design_stops_planning_without_replaying_unknown_calls(
     distributed_case: tuple[Orchestrator, ScriptedCaller],
 ) -> None:
     orch, caller = distributed_case
-    orch.call = caller  # one slot: the integration fixture's parallel barrier is not needed
-    caller.responses["dsh:T-002"] = [NativeResult("timeout", {})]  # dispatched first
-    with pytest.raises(PlanError, match="test-designer T-002 returned timeout"):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
-    assert caller.keys() == ["plan", "dsh:T-002"]
+    caller.responses[ROOT] = [NativeResult("timeout", {})]
+    with pytest.raises(PlanError, match="test designer component-root returned timeout"):
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1)
+    assert caller.keys() == ["claude:look", "plan", ROOT]
+    assert "dsh:T-001" not in caller.keys() and not orch.state.runs()
 
 
-def test_thin_reuses_executor_with_independent_frozen_tests_and_distinct_receipts(
-    thin: Orchestrator,
-    thin_caller: ScriptedCaller,
-    boundary: dict[str, object],
-    design: dict[str, object],
-) -> None:
-    original = copy.deepcopy(boundary)
-    run = thin.execute(thin.plan("Add and double with boundary and failure cases").id, jobs=2)
-    calls = thin.state.usage.calls(run.id)
-    assert run.status == "done" and run.strategy == "sonnet-dsf"
-    assert [(call.provider, call.model, call.purpose, call.effort) for call in calls[:2]] == [
-        ("claude", SONNET_PLAN.model, "plan", "medium"),
-        ("dsh", "deepseek-flash", "test-design", DSF.effort),
-    ]
-    assert len(calls) == 4 and boundary == original
-    assert assemble(boundary, design) == run.plan and lint(run.plan) == []
-    assert all(call.model != CLAUDE_PLAN.model for call in calls)
-    assert "boundary placeholder" not in Workspace.git(
-        thin.repo, "show", f"{run.checkpoint}:test_mathops.py"
-    )
-    assert thin_caller.keys()[:2] == ["plan", "plan"]
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "cycle",
-        "ambiguous",
-        "extra-owner",
-        "tests",
-        "implementation",
-        "module-exec",
-        "class-control",
-        "computed-constant",
-        "header-call",
-        "oversize",
-    ],
-)
+@pytest.mark.parametrize("mutation", [
+    "cycle", "ambiguous", "extra-owner", "tests", "unsafe-path",
+])
 def test_invalid_boundary_is_rejected_before_any_dsf_call(
-    thin: Orchestrator,
-    boundary: dict[str, object],
-    thin_caller: ScriptedCaller,
+    orchestrator: Orchestrator, boundary: dict[str, object], caller: ScriptedCaller,
     mutation: str,
 ) -> None:
     tasks = cast(list[dict[str, object]], boundary["tasks"])
@@ -1281,67 +1010,59 @@ def test_invalid_boundary_is_rejected_before_any_dsf_call(
     elif mutation == "extra-owner":
         tasks[0]["files"] = ["unplanned.py"]
     elif mutation == "tests":
-        tasks[0]["tests"] = ["test_mathops.AddTest.test_r1_adds"]
-    elif mutation == "implementation":
-        files[0]["content"] = files[0]["content"].replace(
-            "raise NotImplementedError", "return a + b"
-        )
-    elif mutation == "module-exec":
-        files[0]["content"] += "\nexec('def hidden(): return 42')\n"
-    elif mutation == "class-control":
-        files[0]["content"] += "\nclass Hidden:\n    if True:\n        result=42\n"
-    elif mutation == "computed-constant":
-        files[0]["content"] += "\nRESULT=sum([1,2])\n"
-    elif mutation == "oversize":
-        files[0]["content"] = "#" + "x" * 80000
+        tasks[0]["tests"] = [ADD_TEST]
     else:
-        files[0]["content"] = files[0]["content"].replace("def add", "@factory()\ndef add")
+        files[0]["path"] = "../adder.py"
+        tasks[0]["files"] = ["../adder.py"]
+    caller.responses["plan"] = [NativeResult("ok", boundary)]
     with pytest.raises(PlanError):
-        thin.plan("invalid boundaries", attempts=1)
-    assert [provider for provider, _, _ in thin_caller.calls] == ["claude"]
-    assert not thin.state.runs() and boundary_errors(boundary)
+        orchestrator.plan("invalid boundaries", attempts=1)
+    assert [provider for provider, _, _ in caller.calls] == ["claude", "claude"]  # look, plan
+    assert not orchestrator.state.runs() and boundary_errors(boundary, frozenset())
 
 
-@pytest.mark.parametrize(
-    "mutation", ["extra-contract", "implementation", "unknown-r", "duplicate", "malformed"]
-)
-def test_bad_dsf_test_design_cannot_modify_frozen_boundary_or_create_a_checkpoint(
-    thin: Orchestrator,
-    design: dict[str, object],
-    thin_caller: ScriptedCaller,
-    mutation: str,
+@pytest.mark.parametrize("mutation", [
+    "extra-key", "stub-path", "escape", "duplicate", "empty", "missing-task", "foreign-task"])
+def test_bad_test_design_cannot_modify_frozen_boundary_or_create_a_checkpoint(
+    orchestrator: Orchestrator, caller: ScriptedCaller, mutation: str,
 ) -> None:
-    files = cast(list[dict[str, str]], design["files"])
-    if mutation == "extra-contract":
-        design["tasks"] = []
-    elif mutation == "implementation":
-        files[0]["path"] = "adder.py"
-    elif mutation == "unknown-r":
-        files[0]["content"] = files[0]["content"].replace("test_r1_", "test_r9_")
+    answer = copy.deepcopy(component_design(ADD_SHARD, DOUBLE_SHARD).data)
+    shards = cast(list[dict[str, Any]], answer["shards"])
+    files = cast(list[dict[str, str]], shards[1]["files"])
+    if mutation == "extra-key":
+        answer["tasks"] = []
+    elif mutation == "stub-path":
+        files[0]["path"] = "doubler.py"
+    elif mutation == "escape":
+        files[0]["path"] = "../test_double.py"
     elif mutation == "duplicate":
         files.append(dict(files[0]))
+    elif mutation == "missing-task":
+        shards.pop()
+    elif mutation == "foreign-task":
+        shards[1]["task"] = "T-009"
     else:
-        design.clear()
+        answer.clear()
+    caller.responses[ROOT] = [NativeResult("ok", answer)]
     with pytest.raises(PlanError):
-        thin.plan("test isolation", attempts=1)
-    assert [provider for provider, _, _ in thin_caller.calls] == ["claude", "dsh"]
-    assert not thin.state.runs()
+        orchestrator.plan("test isolation", attempts=1, test_jobs=1)
+    assert [provider for provider, _, _ in caller.calls] == ["claude", "claude", "dsh"]
+    assert not orchestrator.state.runs()
 
 
-def test_test_only_repair_keeps_original_sonnet_boundary(
-    thin: Orchestrator,
-    thin_caller: ScriptedCaller,
-    design: dict[str, object],
+def test_test_only_repair_keeps_the_original_boundary(
+    orchestrator: Orchestrator, caller: ScriptedCaller,
 ) -> None:
-    thin_caller.responses["plan"].insert(1, NativeResult("ok", {"bad": "design"}))
-    run = thin.execute(thin.plan("bounded test repair", attempts=2).id, jobs=1)
+    caller.responses[ROOT] = [NativeResult("ok", {"bad": "design"}),
+                              component_design(ADD_SHARD, DOUBLE_SHARD)]
+    caller.responses.update({"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
+    run = orchestrator.execute(orchestrator.plan("bounded test repair", attempts=2,
+                                                 test_jobs=1).id, jobs=1)
     assert run.status == "done"
-    assert [call.purpose for call in thin.state.usage.calls(run.id)][:3] == [
-        "plan",
-        "test-design",
-        "test-design",
-    ]
-    assert [provider for provider, _, _ in thin_caller.calls][:3] == ["claude", "dsh", "dsh"]
+    assert [call.purpose for call in orchestrator.state.usage.calls(run.id)][:4] == [
+        "look", "plan", "test-design", "test-design"]
+    assert [provider for provider, _, _ in caller.calls][:4] == ["claude", "claude", "dsh", "dsh"]
+    assert caller.keys().count("plan") == 1
 
 
 @pytest.mark.parametrize(
@@ -1356,24 +1077,22 @@ def test_test_only_repair_keeps_original_sonnet_boundary(
     ],
 )
 def test_provider_or_budget_stop_does_not_retry_or_fallback(
-    thin: Orchestrator,
-    thin_caller: ScriptedCaller,
-    stage: int,
-    outcome: str,
+    orchestrator: Orchestrator, caller: ScriptedCaller, stage: int, outcome: str,
 ) -> None:
-    thin_caller.responses["plan"][stage] = NativeResult(
-        outcome, {}, usage={"forwarded": 0, "rejected": 1}
-    )
+    stop = NativeResult(outcome, {}, usage={"forwarded": 0, "rejected": 1})
+    if stage == 0:
+        caller.responses["plan"][0] = stop
+    else:
+        caller.responses[ROOT][0] = stop
     with pytest.raises(PlanError):
-        thin.plan("stop safely", attempts=3)
-    assert len(thin_caller.calls) == stage + 1
-    assert thin.state.usage.calls()[-1].outcome == outcome
-    assert not thin.state.runs()
+        orchestrator.plan("stop safely", attempts=3, test_jobs=1)
+    assert len(caller.calls) == stage + 2  # the look-around precedes the boundary
+    assert orchestrator.state.usage.calls()[-1].outcome == outcome
+    assert not orchestrator.state.runs()
 
 
 def test_cancel_between_boundary_and_design_never_dispatches_dsf(
-    thin: Orchestrator,
-    thin_caller: ScriptedCaller,
+    orchestrator: Orchestrator, caller: ScriptedCaller,
 ) -> None:
     def cancel(
         provider: str,
@@ -1385,182 +1104,14 @@ def test_cancel_between_boundary_and_design_never_dispatches_dsf(
         *,
         effort: str = "",
     ) -> NativeResult:
-        result = thin_caller(provider, model, prompt, schema, run_id, lambda: False, effort=effort)
-        thin.cancel.set()
+        result = caller(provider, model, prompt, schema, run_id, lambda: False, effort=effort)
+        orchestrator.cancel.set()
         return result
 
-    thin.call = cancel
+    orchestrator.call = cancel
     with pytest.raises(PlanError, match="cancelled"):
-        thin.plan("stop before test design")
-    assert [provider for provider, _, _ in thin_caller.calls] == ["claude"]
-
-
-def test_failure_escalation_and_legacy_constructor_resume_use_saved_sonnet_route(
-    thin: Orchestrator,
-    thin_caller: ScriptedCaller,
-) -> None:
-    run = thin.plan("escalate")
-    thin_caller.responses["dsh:T-001"] = [BAD_ADD, BAD_ADD]
-    thin_caller.responses["claude:T-001"] = [GOOD_ADD]
-    resumed = Orchestrator(thin.repo, thin_caller, local_runner, notify=lambda _: None)
-    finished = resumed.execute(run.id, jobs=1)
-    patches = [call for call in resumed.state.usage.calls(run.id) if call.purpose == "patch"]
-    assert finished.status == "done" and resumed.strategy == "sonnet-dsf"
-    assert len(patches) == 1 and (patches[0].model, patches[0].effort) == (
-        SONNET_PLAN.model,
-        "medium",
-    )
-    assert SONNET_PLAN.label in Workspace.git(thin.repo, "log", finished.branch, "--format=%an")
-    assert all(call.model != CLAUDE_PLAN.model for call in resumed.state.usage.calls(run.id))
-
-
-@pytest.mark.parametrize("purpose", ["thicken", "review", "replan", "harden"])
-def test_exception_calls_read_saved_route_independent_of_constructor_preference(
-    thin: Orchestrator,
-    thin_caller: ScriptedCaller,
-    purpose: str,
-) -> None:
-    run = thin.plan("exception route")
-    thin_caller.responses["claude:T-001"] = [NativeResult("ok", {"answer": "ok"})]
-    resumed = Orchestrator(thin.repo, thin_caller, local_runner, notify=lambda _: None)
-    task = resumed.state.tasks(run.id)[0]
-    assert resumed._claude(run.id, task, purpose, "exception details", {}) == {"answer": "ok"}
-    receipt = resumed.state.usage.calls(run.id)[-1]
-    assert (receipt.model, receipt.purpose, receipt.effort) == (
-        SONNET_PLAN.model,
-        purpose,
-        "medium",
-    )
-
-
-@pytest.mark.parametrize("mode", ["modules", "samples", "policy", "evolve"])
-def test_unsupported_thin_modes_fail_before_dispatch(thin: Orchestrator, mode: str) -> None:
-    if mode == "policy":
-        thin.policies.enable()
-    with pytest.raises((PlanError, ValueError)):
-        if mode == "evolve":
-            thin.evolve()
-        else:
-            thin.plan(
-                "unsupported", modules=mode == "modules", samples=2 if mode == "samples" else 1
-            )
-    assert thin.state.usage.calls() == []
-
-
-def test_disallowed_route_fails_closed_but_explicit_legacy_sonnet_baseline_remains_allowed(
-    thin: Orchestrator,
-    thin_caller: ScriptedCaller,
-) -> None:
-    with pytest.raises(ValueError, match="Disallowed route"):
-        thin._call_model("unknown", CLAUDE_PLAN, "bad fallback", {}, "blocked", purpose="plan")
-    assert not thin_caller.calls
-    legacy = Orchestrator(thin.repo, thin_caller, local_runner, notify=lambda _: None)
-    legacy._call_model(
-        "baseline",
-        SONNET_PLAN,
-        "explicit single-Sonnet baseline",
-        {},
-        "baseline-call",
-        purpose="baseline",
-    )
-    assert legacy.state.usage.calls()[-1].model == SONNET_PLAN.model
-
-
-def test_existing_seed_imports_are_visible_only_as_interfaces_and_seed_tests_stay_unchanged(
-    thin: Orchestrator,
-    thin_caller: ScriptedCaller,
-    boundary: dict[str, object],
-) -> None:
-    (thin.repo / "seed.py").write_text("def seed_value(x: int) -> int:\n    return x + 912345678\n")
-    source = (
-        "import unittest\nclass Seed(unittest.TestCase):\n"
-        "    def test_seed(self):\n        self.assertTrue('PRIVATE_SEED_ASSERTION')\n"
-    )
-    (thin.repo / "test_seed.py").write_text(source)
-    Workspace.git(thin.repo, "add", "seed.py", "test_seed.py")
-    Workspace.git(thin.repo, "commit", "-m", "seed interfaces and tests")
-    files = cast(list[dict[str, str]], boundary["files"])
-    files[0]["content"] = "from seed import seed_value\n" + files[0]["content"]
-    run = thin.execute(thin.plan("seed-aware additive feature").id, jobs=1)
-    prompt = thin_caller.calls[1][2]
-    assert run.status == "done" and "def seed_value(x: int) -> int" in prompt
-    assert "912345678" not in prompt and "PRIVATE_SEED_ASSERTION" not in prompt
-    assert (
-        Workspace.git(thin.repo, "show", f"{run.verified_head}:test_seed.py", strip=False) == source
-    )
-
-
-def test_saved_profiles_and_old_run_decode_remain_stable_across_concurrent_route_reads(
-    thin: Orchestrator,
-    thin_caller: ScriptedCaller,
-    math_plan: dict[str, object],
-) -> None:
-    run = thin.plan("thin saved profile")
-    legacy_caller = ScriptedCaller({"plan": [NativeResult("ok", math_plan)]})
-    legacy = Orchestrator(thin.repo, legacy_caller, local_runner, notify=lambda _: None)
-    old = legacy.plan("legacy saved profile")
-    body = asdict(old)
-    del body["strategy"]
-    assert Run(**body).strategy == "opus-dsf"
-    ids = [run.id, old.id] * 8
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        models = list(pool.map(lambda value: legacy._claude_route(value).model, ids))
-    assert models == [SONNET_PLAN.model, CLAUDE_PLAN.model] * 8
-
-
-def test_boundary_preserves_ordinary_constants_and_class_interface_stubs(
-    boundary: dict[str, object],
-) -> None:
-    files = cast(list[dict[str, str]], boundary["files"])
-    files[0]["content"] += (
-        "\nLIMIT=3\nclass Marker:\n    kind: str\n"
-        "    def read(self) -> str:\n        raise NotImplementedError\n"
-    )
-    assert boundary_errors(boundary) == []
-
-
-def test_thin_preserves_legacy_rules_and_never_writes_lessons_to_shared_bank(
-    thin: Orchestrator,
-    thin_caller: ScriptedCaller,
-    boundary: dict[str, object],
-    design: dict[str, object],
-) -> None:
-    legacy_lesson = "An Opus-trained rule must not leak into the thin prompts."
-    thin.state.add_rule(legacy_lesson, "legacy-opus")
-    before = [asdict(rule) for rule in thin.state.rules()]
-    thin_caller.responses["plan"].insert(1, NativeResult("ok", {"bad": "test response"}))
-    thin_caller.responses["dsh:T-001"] = [BAD_ADD, BAD_ADD]
-    thin_caller.responses["claude:T-001"] = [
-        replace(
-            GOOD_ADD,
-            data={
-                **GOOD_ADD.data,
-                "lesson": "A thin lesson must not train the legacy Opus policy.",
-            },
-        )
-    ]
-    run = thin.execute(thin.plan("thin with legacy rule bank", attempts=2).id, jobs=1)
-    thin._learn(run.id, "Thin exception/mutation lesson", "thin", "planner")
-    assert run.status == "done" and [asdict(rule) for rule in thin.state.rules()] == before
-    assert all(legacy_lesson not in prompt for _, _, prompt in thin_caller.calls)
-    thin_caller.responses["plan"] = [NativeResult("ok", boundary), NativeResult("ok", design)]
-    repeated = thin.plan("a second thin plan remains possible")
-    assert (
-        repeated.strategy == "sonnet-dsf"
-        and [asdict(rule) for rule in thin.state.rules()] == before
-    )
-
-
-def test_conflicting_pending_and_saved_profiles_fail_before_dispatch(
-    thin: Orchestrator, thin_caller: ScriptedCaller,
-) -> None:
-    run = thin.plan("saved thin route")
-    thin._planning_strategies[run.id] = "opus-dsf"
-    before = len(thin_caller.calls)
-    with pytest.raises(ValueError, match="conflicts with saved run"):
-        thin._call_model(run.id, CLAUDE_PLAN, "wrong profile", {}, "blocked-collision",
-                         purpose="plan")
-    assert len(thin_caller.calls) == before
+        orchestrator.plan("stop before test design")
+    assert [provider for provider, _, _ in caller.calls] == ["claude"]
 
 
 STREAM_CLOSED = NativeResult(
@@ -1576,12 +1127,12 @@ def test_a_dropped_shard_stream_repeats_only_that_call_and_planning_continues(
     # Run r073174b7 lost the whole Boltons run to one DSF STREAM_CLOSED.
     monkeypatch.setattr("orchestragent.orch_run.TRANSIENT_RETRY_DELAYS", (0.0, 0.0))
     orch, caller = resumable_case
-    caller.responses["dsh:T-001"][:0] = [STREAM_CLOSED]
-    orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
-    designed = [c for c in orch.state.usage.calls() if c.task_id == "T-001"]
+    caller.responses[ROOT][:0] = [STREAM_CLOSED]
+    orch.plan("Implement adder.add and doubler.double", test_jobs=1)
+    designed = [c for c in orch.state.usage.calls() if c.task_id == "component-root"]
     assert [(c.attempt, c.sample, c.outcome) for c in designed] == [
         (1, "", "failed"), (1, "~retry1", "ok")]
-    assert caller.keys().count("dsh:T-001") == 2
+    assert caller.keys().count(ROOT) == 2
     count = len(caller.calls)
     run_id = designed[0].run_id
     resumed = Orchestrator(orch.repo, caller, local_runner, notify=lambda _: None)
@@ -1594,10 +1145,10 @@ def test_a_shard_that_keeps_dropping_stops_after_its_repeats(
 ) -> None:
     monkeypatch.setattr("orchestragent.orch_run.TRANSIENT_RETRY_DELAYS", (0.0, 0.0))
     orch, caller = resumable_case
-    caller.responses["dsh:T-001"][:0] = [STREAM_CLOSED] * 3
-    with pytest.raises(PlanError, match="test-designer T-001 returned failed"):
-        orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
-    designed = [c for c in orch.state.usage.calls() if c.task_id == "T-001"]
+    caller.responses[ROOT][:0] = [STREAM_CLOSED] * 3
+    with pytest.raises(PlanError, match="test designer component-root returned failed"):
+        orch.plan("Implement adder.add and doubler.double", test_jobs=1)
+    designed = [c for c in orch.state.usage.calls() if c.task_id == "component-root"]
     assert [c.sample for c in designed] == ["", "~retry1", "~retry2"]
 
 
@@ -1606,7 +1157,7 @@ def test_test_design_effort_switch_routes_only_test_design_without_thinking(
 ) -> None:
     monkeypatch.setattr("orchestragent.orch_run.DSF_TEST", Route("dsh", "deepseek-flash", "off"))
     orch, _ = resumable_case
-    orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+    orch.plan("Implement adder.add and doubler.double", test_jobs=1)
     designed = [c for c in orch.state.usage.calls() if c.purpose.endswith("test-design")]
     assert designed and {c.effort for c in designed} == {"off-extended"}
 
@@ -1616,161 +1167,34 @@ def test_planner_effort_switch_changes_only_the_orchestrated_planner(
 ) -> None:
     monkeypatch.setattr("orchestragent.orch_run.PLANNER", replace(CLAUDE_PLAN, effort="medium"))
     orch, _ = resumable_case
-    orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
+    orch.plan("Implement adder.add and doubler.double", test_jobs=1)
     planned = [c for c in orch.state.usage.calls() if c.provider == "claude"]
     assert planned and {c.effort for c in planned} == {"medium"}
     assert CLAUDE_PLAN.effort == "high"  # the single-agent baseline's route is untouched
 
 
-GAP_EDIT = NativeResult("ok", {
-    "status": "DONE", "summary": "", "reason": "", "need_files": [],
-    "edits": [{"path": "test_orch_t_001.py",
-               "search": "        self.assertEqual(add(2, 3), 5)\n",
-               "replace": "        self.assertEqual(add(2, 3), 5)\n\n"
-                          "    def test_r1_zero(self):\n        self.assertEqual(add(0, 0), 0)\n"}],
-})
-
-
-def test_coverage_review_has_unasserted_behaviour_added_in_place(
-    resumable_case: tuple[Orchestrator, ScriptedCaller], monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", True)
-    orch, caller = resumable_case
-    caller.responses["claude:T-001"] = [
-        NativeResult("ok", {"missing": [{"req": "R1", "clause": "add(0, 0) returns 0"}],
-                            "wrong": [{"test": "test_r1_value", "problem": "fine, kept"}]}),
-        # Second look at the revised draft: only `wrong` counts, so no third edit.
-        NativeResult("ok", {"missing": [{"req": "R1", "clause": "add(1, 1) returns 2"}],
-                            "wrong": []}),
-    ]
-    caller.responses["claude:T-002"] = [NativeResult("ok", {"missing": [], "wrong": []})]
-    caller.responses["dsh:T-001"].insert(1, GAP_EDIT)
-    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
-    calls = orch.state.usage.calls(run.id)
-    t1 = [(c.provider, c.purpose) for c in calls if c.task_id == "T-001"]
-    assert t1 == [("dsh", "test-design"), ("claude", "coverage-review"), ("dsh", "test-repair"),
-                  ("claude", "coverage-review")]
-    review = next(p for _, key, p in caller.calls if key == "claude:T-001")
-    assert "ASSIGNED REQUIREMENTS" in review and "def test_r1_value" in review
-    repair = [p for _, key, p in caller.calls if key == "dsh:T-001"][1]
-    assert "Test review before freezing" in repair and "missing R1: add(0, 0) returns 0" in repair
-    assert "LOCAL REPAIR OF YOUR DRAFT" in repair and "wrong test_r1_value" in repair
-    frozen = orch.git(orch.repo, "show", f"{run.checkpoint}:test_orch_t_001.py")
-    assert "def test_r1_zero" in frozen and "def test_r1_value" in frozen
-    tasks = {task.id: task for task in orch.state.tasks(run.id)}
-    assert "test_orch_t_001.TestContract.test_r1_zero" in tasks["T-001"].tests
-
-
-@pytest.mark.parametrize("review", [
-    NativeResult("ok", {"missing": []}),
-    NativeResult("failed", {}, message="DSH upstream HTTP 400", usage={"rejected": 400}),
-], ids=["covered", "review-failed"])
-def test_coverage_review_without_gaps_or_failing_never_blocks_planning(
-    resumable_case: tuple[Orchestrator, ScriptedCaller], monkeypatch: pytest.MonkeyPatch,
-    review: NativeResult,
-) -> None:
-    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", True)
-    orch, caller = resumable_case
-    caller.responses["claude:T-001"] = [review]
-    caller.responses["claude:T-002"] = [NativeResult("ok", {"missing": []})]
-    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
-    purposes = [c.purpose for c in orch.state.usage.calls(run.id) if c.task_id == "T-001"]
-    assert purposes == ["test-design", "coverage-review"]
-
-
-def test_second_review_corrects_a_wrong_added_test_once_more(
-    resumable_case: tuple[Orchestrator, ScriptedCaller], monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", True)
-    orch, caller = resumable_case
-    fix_zero = NativeResult("ok", {
-        "status": "DONE", "summary": "", "reason": "", "need_files": [],
-        "edits": [{"path": "test_orch_t_001.py",
-                   "search": "self.assertEqual(add(0, 0), 0)",
-                   "replace": "self.assertEqual(add(0, 1), 1)"}],
-    })
-    caller.responses["claude:T-001"] = [
-        NativeResult("ok", {"missing": [{"req": "R1", "clause": "zero"}], "wrong": []}),
-        NativeResult("ok", {"missing": [], "wrong": [
-            {"test": "test_r1_zero", "problem": "use add(0, 1) == 1"}]}),
-    ]
-    caller.responses["claude:T-002"] = [NativeResult("ok", {"missing": [], "wrong": []})]
-    caller.responses["dsh:T-001"][1:1] = [GAP_EDIT, fix_zero]
-    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
-    t1 = [c.purpose for c in orch.state.usage.calls(run.id) if c.task_id == "T-001"]
-    assert t1 == ["test-design", "coverage-review", "test-repair", "coverage-review",
-                  "test-repair"]
-    frozen = orch.git(orch.repo, "show", f"{run.checkpoint}:test_orch_t_001.py")
-    assert "add(0, 1), 1" in frozen and "add(0, 0), 0" not in frozen
-
-
-
-def test_a_failed_review_repair_freezes_the_reviewed_draft_without_redesign(
-    resumable_case: tuple[Orchestrator, ScriptedCaller], monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", True)
-    orch, caller = resumable_case
-    unusable = NativeResult("ok", {
-        "status": "DONE", "summary": "", "reason": "", "need_files": [],
-        "edits": [{"path": "test_orch_t_001.py", "search": "not in the draft",
-                   "replace": "anything"}],
-    })
-    caller.responses["claude:T-001"] = [
-        NativeResult("ok", {"missing": [{"req": "R1", "clause": "zero"}], "wrong": []})]
-    caller.responses["claude:T-002"] = [NativeResult("ok", {"missing": [], "wrong": []})]
-    caller.responses["dsh:T-001"].insert(1, unusable)
-    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
-    t1 = [c.purpose for c in orch.state.usage.calls(run.id) if c.task_id == "T-001"]
-    assert t1 == ["test-design", "coverage-review", "test-repair"]  # no second full design
-    frozen = orch.git(orch.repo, "show", f"{run.checkpoint}:test_orch_t_001.py")
-    assert "def test_r1_value" in frozen and "anything" not in frozen
-
-
-def test_shard_prompts_and_review_demand_decisive_assertions(
+def test_an_omitted_requirement_list_is_taken_from_the_numbered_spec(
     boundary: dict[str, object],
 ) -> None:
-    from orchestragent.orch_thin import coverage_prompt
-    for integration in (False, True):
-        prompt = design_prompt("spec", boundary, "", [], task_id="T-001",
-                               integration=integration)
-        assert "Never write try/except or if/else that lets either of two behaviours pass" in prompt
-    review = coverage_prompt({"R1": "add raises ValueError"}, "t.py", "pass")
-    assert "does not assert it: list it in `missing`" in review
+    """Meridian r470549eb: a draft returned "requirements": []. The spec numbers them, so
+    they are facts the controller already has, not something to send the planner back for."""
+    spec = "# Feature\nR1. Add two ints.\nR2. Double an integer.\n"
+    for empty in ([], None):
+        draft = {**boundary, "requirements": empty}
+        if empty is None:
+            draft.pop("requirements")
+        filled = fill_requirements(draft, spec_requirements(spec))
+        assert filled["requirements"] == [{"id": "R1", "text": "Add two ints."},
+                                          {"id": "R2", "text": "Double an integer."}]
+        assert boundary_errors(filled, frozenset()) == []
+    assert fill_requirements({**boundary, "requirements": []}, None)["requirements"] == []
 
 
-@pytest.mark.parametrize(("model", "provider"), [("sonnet", "claude"), ("dsf", "dsh")])
-def test_review_model_switch_routes_the_shard_review(
-    resumable_case: tuple[Orchestrator, ScriptedCaller], monkeypatch: pytest.MonkeyPatch,
-    model: str, provider: str,
-) -> None:
-    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", True)
-    monkeypatch.setattr("orchestragent.orch_run.REVIEW_MODEL", model)
-    orch, caller = resumable_case
-    clean = NativeResult("ok", {"missing": [], "wrong": []})
-    for tid in ("T-001", "T-002"):
-        key = f"{provider}:{tid}"
-        caller.responses.setdefault(key, [])
-        caller.responses[key].insert(1 if provider == "dsh" else 0, clean)
-    run = orch.plan("Implement adder.add and doubler.double", distributed=True, test_jobs=1)
-    reviews = [c for c in orch.state.usage.calls(run.id) if c.purpose == "coverage-review"]
-    assert len(reviews) == 2 and {c.provider for c in reviews} == {provider}
-
-
-def test_tasks_citing_an_upstream_requirement_get_integration_shards() -> None:
-    from orchestragent.orch_thin import citing_tasks
-    boundary: dict[str, object] = {
-        "requirements": [
-            {"id": "R1", "text": "solve() returns a schedule."},
-            {"id": "R2", "text": "audit() computes baseline R1 cost per scenario."},
-            {"id": "R3", "text": "report() formats R2 results; see also R9."},
-            {"id": "R4", "text": "cli() mentions R1 but does not depend on it."},
-        ],
-        "tasks": [
-            {"id": "T-001", "reqs": ["R1"], "depends_on": []},
-            {"id": "T-002", "reqs": ["R2"], "depends_on": ["T-001"]},
-            {"id": "T-003", "reqs": ["R3"], "depends_on": ["T-002"]},
-            {"id": "T-004", "reqs": ["R4"], "depends_on": []},  # cites R1, no upstream link
-        ],
-    }
-    assert citing_tasks(boundary) == {"T-002", "T-003"}
-    assert citing_tasks({"tasks": [], "requirements": []}) == set()
+def test_an_empty_file_is_a_valid_stub(boundary: dict[str, object]) -> None:
+    """An empty package marker (Python's __init__.py, a .gitkeep) is a normal file; whether
+    a stub needs a body is the language's business, not the controller's."""
+    files = cast(list[dict[str, str]], boundary["files"])
+    files.append({"path": "pkg/__init__.py", "content": ""})
+    tasks = cast(list[dict[str, object]], boundary["tasks"])
+    tasks[0]["files"] = [*cast(list[str], tasks[0]["files"]), "pkg/__init__.py"]
+    assert boundary_errors(boundary, frozenset()) == []

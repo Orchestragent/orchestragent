@@ -1,0 +1,82 @@
+name: macOS app
+
+on:
+  pull_request:
+    paths: ['apps/macos/**', '.github/workflows/macos-app.yml', 'src/**', 'pyproject.toml']
+  push:
+    branches: [main]
+    paths: ['apps/macos/**', '.github/workflows/macos-app.yml', 'src/**', 'pyproject.toml']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write  # a v* tag attaches the DMG to its GitHub release
+
+jobs:
+  studio:
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - name: Install the no-cost demo backend
+        run: uv sync --locked --no-editable
+      - name: Verify generated project and translations
+        run: |
+          python3 apps/macos/scripts/update_strings.py
+          python3 apps/macos/scripts/generate_project.py
+          git diff --exit-code -- apps/macos/OrchStudio.xcodeproj apps/macos/Resources/Localizable.xcstrings
+      - name: Decode, SSE, layout, sending rules and live demo integration
+        run: |
+          export TEST_RUNNER_ORCH_STUDIO_EXECUTABLE="$PWD/.venv/bin/orch"
+          export ORCH_STUDIO_EXECUTABLE="$PWD/.venv/bin/orch"
+          xcodebuild -project apps/macos/OrchStudio.xcodeproj -scheme OrchStudio \
+            -configuration Debug -destination 'platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioTest" \
+            -resultBundlePath "$RUNNER_TEMP/StudioTests.xcresult" test CODE_SIGN_IDENTITY=- ONLY_ACTIVE_ARCH=YES
+      - name: Release app and ad-hoc signature
+        run: |
+          xcodebuild -project apps/macos/OrchStudio.xcodeproj -scheme OrchStudio \
+            -configuration Release -derivedDataPath "$RUNNER_TEMP/StudioRelease" build CODE_SIGN_IDENTITY=-
+          APP="$RUNNER_TEMP/StudioRelease/Build/Products/Release/OrchStudio.app"
+          # orch itself goes inside the app: no Homebrew, no terminal.
+          apps/macos/scripts/bundle_runtime.sh "$APP"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/OrchStudio.zip"
+          echo "APP=$APP" >> "$GITHUB_ENV"
+      - name: The bundled orch serves the studio with a Finder-like environment
+        run: |
+          line=$(env -i HOME="$HOME" PATH=/usr/bin:/bin \
+            "$APP/Contents/Resources/orch-runtime/bin/orch" studio --demo --port 0 --machine \
+            < /dev/null | head -n 1)
+          echo "$line"
+          echo "$line" | python3 -c 'import json, sys; assert json.load(sys.stdin)["api"] == 1'
+      - name: Disk image (drag Orch Studio to Applications)
+        run: |
+          mkdir -p "$RUNNER_TEMP/dmg"
+          cp -R "$APP" "$RUNNER_TEMP/dmg/Orch Studio.app"
+          ln -s /Applications "$RUNNER_TEMP/dmg/Applications"
+          hdiutil create -volname "Orch Studio" -srcfolder "$RUNNER_TEMP/dmg" -ov \
+            -format UDZO "$RUNNER_TEMP/OrchStudio-macOS-arm64.dmg"
+          ls -lh "$RUNNER_TEMP"/OrchStudio*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OrchStudio-app
+          path: |
+            ${{ runner.temp }}/OrchStudio-macOS-arm64.dmg
+            ${{ runner.temp }}/OrchStudio.zip
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "Orch Studio for macOS (Apple silicon)"
+          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/OrchStudio-macOS-arm64.dmg" --clobber
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: OrchStudio-tests
+          path: ${{ runner.temp }}/StudioTests.xcresult

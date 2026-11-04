@@ -1,43 +1,22 @@
+import os
 import re
 import subprocess
-import sys
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, cast
+from typing import cast
 
 import pytest
 
-from orchestragent.controller import Controller
-from orchestragent.jev import Decision
-from orchestragent.live_workspace import LiveWorkspace
+from orchestragent import orch_verify
 from orchestragent.native import NativeResult
-from orchestragent.orch_bench import ACCEPTANCE_PACKAGE, Case
-from orchestragent.orch_environment import PytestEnvironment
 from orchestragent.orch_run import Orchestrator
+from orchestragent.orch_sandbox import Result
 from orchestragent.orch_state import Run
 from orchestragent.orch_usage import Call
-from orchestragent.settings import SettingsStore
-from orchestragent.store import Store
+from orchestragent.orch_verify import Check
 from orchestragent.workspace import Workspace
-
-
-class CaseProjectFactory(Protocol):
-    def __call__(self, case: Case, name: str, sources: dict[str, str] | None = None,
-                 *, acceptance: bool = True) -> Path: ...
-
-
-
-@pytest.fixture(autouse=True)
-def no_coverage_review(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Scripted callers predate the coverage review; tests that cover it turn it back on."""
-    monkeypatch.setattr("orchestragent.orch_run.COVERAGE_REVIEW", False)
-
-@pytest.fixture
-def dependency_environment(tmp_path: Path, request: pytest.FixtureRequest) -> PytestEnvironment:
-    return PytestEnvironment.create(tmp_path / "dependencies", packages=("typing_extensions",),
-                                    source_roots=getattr(request, "param", (".",)))
 
 
 @pytest.fixture
@@ -58,36 +37,20 @@ def unfinished_call(orchestrator: Orchestrator, planned: Run) -> Iterator[Call]:
         yield receipt
 
 
-@pytest.fixture
-def case_project(tmp_path: Path) -> CaseProjectFactory:
-    """Assemble a seeded benchmark project with optional reference/held-out files."""
-    def build(case: Case, name: str, sources: dict[str, str] | None = None,
-              *, acceptance: bool = True) -> Path:
-        project = tmp_path / f"{case.id}-{name}"
-        project.mkdir()
-        files = {**case.seed, **(sources or {})}
-        if acceptance:
-            files[f"{ACCEPTANCE_PACKAGE}/__init__.py"] = ""
-            files.update({f"{ACCEPTANCE_PACKAGE}/{path}": source
-                          for path, source in case.acceptance.items()})
-        for path, source in files.items():
-            assert LiveWorkspace.safe_path(path)
-            target = project / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(source)
-        return project
-    return build
-
-
 @pytest.fixture(autouse=True)
 def _keychain_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """Tests must never read or write the real login keychain, and must not depend on
     whether this machine has the DSH CLI (tests of the direct API transport opt in)."""
     monkeypatch.setenv("ORCHESTRA_KEYCHAIN", "0")
     monkeypatch.setenv("ORCHESTRA_DSF_TRANSPORT", "cli")
-    # Scripted Python cases run in seed repos holding only a README, which a real run
-    # would route to the generic engine; generic-engine tests set ORCH_ENGINE themselves.
-    monkeypatch.setenv("ORCH_ENGINE", "python")
+
+
+@pytest.fixture(autouse=True)
+def _red_judgment_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scripted runs count their model calls; the red-reason judgment (one extra call per
+    design round) is off unless a test turns it on (tests/test_orch_red_judgment.py)."""
+    from orchestragent import orch_run
+    monkeypatch.setattr(orch_run, "RED_JUDGMENT", False)
 
 
 @dataclass
@@ -103,29 +66,9 @@ def clock() -> Clock:
     return Clock()
 
 
-@pytest.fixture
-def controller(tmp_path: Path, clock: Clock) -> Controller:
-    return Controller(
-        Store(tmp_path / "tasks.sqlite"), Workspace(tmp_path / "workspaces"), clock=clock
-    )
-
-
-@pytest.fixture
-def settings(tmp_path: Path) -> SettingsStore:
-    return SettingsStore(Store(tmp_path / "settings.db"))
-
-
-@pytest.fixture
-def policy(settings: SettingsStore) -> dict[str, object]:
-    return cast(dict[str, object], settings.read()["policy"])
-
-
-@pytest.fixture
-def providers(policy: dict[str, object]) -> list[dict[str, object]]:
-    return cast(list[dict[str, object]], policy["providers"])
-
-
-# --- orchestration CLI fixtures ------------------------------------------------
+# --- orchestration fixtures -----------------------------------------------------
+# The scripted "models" chose Python and unittest for this project; orch itself only sees
+# stub files, frozen test files and the shell command each test designer declared.
 ADDER_STUB = (
     '"""Addition."""\n\n\ndef add(a: int, b: int) -> int:\n'
     '    """Return a + b."""\n    raise NotImplementedError\n'
@@ -135,13 +78,50 @@ DOUBLER_STUB = (
     'def double(a: int) -> int:\n    """Return 2 * a using add."""\n'
     "    raise NotImplementedError\n"
 )
-MATH_TESTS = (
-    "import unittest\n\nfrom adder import add\nfrom doubler import double\n\n\n"
+ADD_TESTS = (
+    "import unittest\n\nfrom adder import add\n\n\n"
     "class AddTest(unittest.TestCase):\n    def test_r1_adds(self) -> None:\n"
-    "        self.assertEqual(add(2, 3), 5)\n\n\n"
+    "        self.assertEqual(add(2, 3), 5)\n"
+)
+DOUBLE_TESTS = (
+    "import unittest\n\nfrom doubler import double\n\n\n"
     "class DoubleTest(unittest.TestCase):\n    def test_r2_doubles(self) -> None:\n"
     "        self.assertEqual(double(4), 8)\n"
 )
+ADD_CHECK = Check("python3 -m unittest -q test_add", ("test_add.py",))
+DOUBLE_CHECK = Check("python3 -m unittest -q test_double", ("test_double.py",))
+ADD_TEST = ADD_CHECK.id
+DOUBLE_TEST = DOUBLE_CHECK.id
+
+
+def design(path: str, content: str, command: str) -> NativeResult:
+    """A test designer's answer: frozen test files plus the command that runs them."""
+    return NativeResult("ok", {"files": [{"path": path, "content": content}],
+                               "command": command})
+
+
+def component_design(*shards: tuple[str, str, str, str]) -> NativeResult:
+    """One component designer's answer: (task, path, content, command) per task."""
+    return NativeResult("ok", {"shards": [
+        {"task": task, "files": [{"path": path, "content": content}], "command": command}
+        for task, path, content, command in shards]})
+
+
+def integration(*checks: tuple[list[str], str, str, str]) -> NativeResult:
+    """The planner's integration checks: (tasks, path, content, command) each."""
+    return NativeResult("ok", {"checks": [
+        {"tasks": tasks, "files": [{"path": path, "content": content}], "command": command}
+        for tasks, path, content, command in checks]})
+
+
+ADD_SHARD = ("T-001", "test_add.py", ADD_TESTS, ADD_CHECK.command)
+DOUBLE_SHARD = ("T-002", "test_double.py", DOUBLE_TESTS, DOUBLE_CHECK.command)
+ADD_DESIGN = design("test_add.py", ADD_TESTS, ADD_CHECK.command)
+DOUBLE_DESIGN = design("test_double.py", DOUBLE_TESTS, DOUBLE_CHECK.command)
+# The math plan declares no components: one implicit component at the root designs both
+# tasks' tests in a single answer. T-002 depends on T-001 only, so no integration design.
+MATH_DESIGNS: dict[str, list[NativeResult]] = {
+    "dsh:design:root": [component_design(ADD_SHARD, DOUBLE_SHARD)]}
 
 
 def edit_result(
@@ -163,19 +143,30 @@ def edit_result(
 GOOD_ADD = edit_result("adder.py", "return a + b")
 BAD_ADD = edit_result("adder.py", "return a - b")
 GOOD_DOUBLE = edit_result("doubler.py", "return add(a, a)")
-THICK = NativeResult("ok", {"verdict": "contract", "explanation": "", "edits": [],
-                            "lesson": "", "contract": "add(a, b) returns a + b exactly"})
-EMPTY_REPLAN = NativeResult("ok", {"summary": "", "tasks": []})
-# Persistent failure walks every rung: 0, 1 (DSF), 3 (Claude patch), 4 (thicken + DSF),
-# then 5 (replan) parks because the replan proposes nothing.
+
+
+def supervise(action: str, **fields: object) -> NativeResult:
+    """A supervisor's answer (orch_supervisor.SUPERVISOR_SCHEMA)."""
+    data: dict[str, object] = {"action": action, "explanation": f"scripted {action}",
+                               "guidance": "", "test_edits": [], "contract": "", "tasks": []}
+    data.update(fields)
+    return NativeResult("ok", data, usage={"input_tokens": 500, "output_tokens": 50})
+
+
+SUPERVISE_RETRY = supervise("retry", guidance="Read the failure; fix the root cause.")
+SUPERVISE_ESCALATE = supervise("escalate", guidance="A stronger model takes the next attempt.")
+SUPERVISE_GIVE_UP = supervise("give_up", explanation="a person should look at adder.py")
+# Persistent failure: a1, a2 (cheap retry) -> supervisor says retry -> a3 -> supervisor
+# says escalate -> a4 by the strong model -> supervisor gives up -> PARKED.
 PARKING: dict[str, list[NativeResult]] = {
     "dsh:T-001": [BAD_ADD, BAD_ADD, BAD_ADD],
-    "claude:T-001": [BAD_ADD, THICK, EMPTY_REPLAN],
+    "claude:T-001": [SUPERVISE_RETRY, SUPERVISE_ESCALATE, BAD_ADD, SUPERVISE_GIVE_UP],
 }
 
 
 @pytest.fixture
 def math_plan() -> dict[str, object]:
+    """The planner's boundary: requirements, tasks and stubs; test designers add checks."""
     return {
         "summary": "math ops",
         "requirements": [
@@ -185,19 +176,17 @@ def math_plan() -> dict[str, object]:
         "files": [
             {"path": "adder.py", "content": ADDER_STUB},
             {"path": "doubler.py", "content": DOUBLER_STUB},
-            {"path": "test_mathops.py", "content": MATH_TESTS},
         ],
         "tasks": [
             {
                 "id": "T-001", "goal": "implement add", "reqs": ["R1"], "files": ["adder.py"],
-                "depends_on": [], "tests": ["test_mathops.AddTest.test_r1_adds"],
+                "depends_on": [], "interface_depends_on": [], "tests": [],
                 "contract": "add(a, b) == a + b",
             },
             {
                 "id": "T-002", "goal": "implement double", "reqs": ["R2"],
-                "files": ["doubler.py"], "depends_on": ["T-001"],
-                "tests": ["test_mathops.DoubleTest.test_r2_doubles"],
-                "contract": "double(a) == add(a, a)",
+                "files": ["doubler.py"], "depends_on": ["T-001"], "interface_depends_on": [],
+                "tests": [], "contract": "double(a) == add(a, a)",
             },
         ],
     }
@@ -222,11 +211,31 @@ class ScriptedCaller:
         *,
         effort: str = "",
     ) -> NativeResult:
+        # call ids name their subject: a task (builds), a component (test design) or the
+        # planner's integration design; the boundary itself is "plan"
+        component = re.search(r"-test-design-component-([A-Za-z0-9_.]+)-\d+-", run_id)
         task = re.search(r"T-[0-9]{3}", run_id)
-        key = f"{provider}:{task.group(0)}" if task else "plan"
+        if component:
+            key = f"{provider}:design:{component.group(1)}"
+        elif "-integration-design-planner-" in run_id:
+            key = f"{provider}:integration"
+        elif re.search(r"-look-\d+-", run_id):
+            key = f"{provider}:look"
+        elif "-red-judge-integration-" in run_id:
+            key = f"{provider}:red:integration"
+        elif "-red-judge-" in run_id:
+            key = f"{provider}:red"
+        else:
+            key = f"{provider}:{task.group(0)}" if task else "plan"
         with self.lock:
             self.calls.append((provider, key, prompt))
             queue = self.responses.get(key)
+            if not queue and key.endswith(":look"):
+                # looking around is optional: an unscripted planner sees enough already
+                return NativeResult("ok", {"requests": [], "note": ""})
+            if not queue and (key.endswith(":red") or key.endswith(":red:integration")):
+                # unscripted, every check failed on the stubs for the right reason
+                return NativeResult("ok", {"checks": []})
             if not queue:
                 pytest.fail(f"unexpected model call {key} ({model})")
             return queue.pop(0)
@@ -235,19 +244,55 @@ class ScriptedCaller:
         return [key for _, key, _ in self.calls]
 
 
+def scripted(boundary: dict[str, object],
+             builds: dict[str, list[NativeResult]] | None = None,
+             designs: dict[str, list[NativeResult]] | None = None) -> ScriptedCaller:
+    """A caller that plans `boundary`, designs each task's tests, then answers `builds`."""
+    queues = {key: list(value) for key, value in (MATH_DESIGNS if designs is None
+                                                   else designs).items()}
+    for key, answers in (builds or {}).items():
+        queues[key] = [*queues.get(key, []), *answers]
+    return ScriptedCaller({"plan": [NativeResult("ok", boundary)], **queues})
+
+
+def local_command(execution: Path, command: str, timeout: float,
+                  seed: Path | None = None) -> Result:
+    """Unsandboxed stand-in for orch_verify.run_command: /bin/sh -c from the root."""
+    try:
+        result = subprocess.run(
+            ["/bin/sh", "-c", command], cwd=execution, capture_output=True, text=True,
+            timeout=timeout, check=False, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    except subprocess.TimeoutExpired:
+        return Result(124, f"timed out after {timeout:g}s", timed_out=True)
+    return Result(result.returncode, result.stdout + result.stderr)
+
+
 def local_runner(
     execution: Path, scratch: Path, revision: str, names: list[str] | None,
     *, timeout: float = 25.0,
 ) -> tuple[bool, str]:
-    """Unsandboxed stand-in for LiveWorkspace.run_unittests; same contract."""
-    try:
-        result = subprocess.run(
-            [sys.executable, "-B", "-m", "unittest", *(names or ["discover"])],
-            cwd=execution, capture_output=True, text=True, timeout=timeout, check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"timed out after {timeout:g}s"
-    return result.returncode == 0, result.stdout + result.stderr
+    """Unsandboxed stand-in for orch_verify.run; same contract and report lines."""
+    checks = [c for c in (orch_verify.parse(n) for n in names or []) if c is not None]
+    if not checks:
+        return False, "No verification command to run."
+    passed, lines, tails = True, [], []
+    for check in dict.fromkeys(checks):
+        result = local_command(execution, check.command, timeout)
+        passed &= result.ok
+        status = "PASS" if result.ok else (
+            "TIMEOUT" if result.timed_out else f"FAIL (exit {result.code})")
+        lines.append(f"{status}: {check.id}")
+        if not result.ok:
+            tails.append(f"--- {check.command}\n{result.output[-6000:]}")
+    return passed, "\n".join(lines) + ("\n\n" + "\n\n".join(tails) if tails else "")
+
+
+@pytest.fixture
+def unsandboxed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Planning's red gate runs declared commands without the OS sandbox (fast, portable);
+    test_orch_verify and the generic end-to-end test exercise the real sandbox."""
+    monkeypatch.setattr(orch_verify, "run_command", local_command)
 
 
 @pytest.fixture
@@ -263,11 +308,12 @@ def orch_repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def caller(math_plan: dict[str, object]) -> ScriptedCaller:
-    return ScriptedCaller({"plan": [NativeResult("ok", math_plan)]})
+    return scripted(math_plan)
 
 
 @pytest.fixture
-def orchestrator(orch_repo: Path, caller: ScriptedCaller, clock: Clock) -> Orchestrator:
+def orchestrator(orch_repo: Path, caller: ScriptedCaller, clock: Clock,
+                 unsandboxed: None) -> Orchestrator:
     return Orchestrator(orch_repo, caller, local_runner, notify=lambda line: None, clock=clock)
 
 
@@ -289,35 +335,3 @@ def independent_run(math_plan: dict[str, object], orchestrator: Orchestrator) ->
 def finished(orchestrator: Orchestrator, caller: ScriptedCaller, planned: Run) -> Run:
     caller.responses.update({"dsh:T-001": [GOOD_ADD], "dsh:T-002": [GOOD_DOUBLE]})
     return orchestrator.execute(planned.id, jobs=2)
-
-
-# --- Jev fixtures -------------------------------------------------------------
-def rung(choice: str, confidence: float) -> Decision:
-    return Decision(
-        "ok",
-        {"rung": {"type": "choice", "choice": choice,
-                  "probabilities": {choice: confidence, "retry": 1 - confidence}}},
-        {"settled_cents": 1},
-    )
-
-
-def cheat(probability: float) -> Decision:
-    return Decision("ok", {"cheat": {"type": "boolean", "probability": probability}},
-                    {"settled_cents": 1})
-
-
-@dataclass
-class ScriptedJev:
-    """Answers triage ('rung') and pre-screen ('cheat') questions from queues."""
-
-    triage: list[Decision] = field(default_factory=list)
-    screen: list[Decision] = field(default_factory=list)
-    states: list[object] = field(default_factory=list)
-
-    def __call__(self, state: object, questions: dict[str, object], run_id: str) -> Decision:
-        self.states.append(state)
-        if "cheat" in questions:
-            return self.screen.pop(0) if self.screen else cheat(0.0)
-        if not self.triage:
-            pytest.fail("unexpected triage question")
-        return self.triage.pop(0)

@@ -1,12 +1,12 @@
 """Which model serves each orch role, and whether that is the benchmarked set.
 
-Roles: the planner (task boundaries), the test designer (frozen test shards), the builder
-(implementations) and the reviewer (checks each test shard before it is frozen). The
+Roles: the planner (task boundaries, integration checks, supervision), the test designer
+(each component's tests) and the builder (implementations). The
 VERIFIED set is what the published benchmarks measured; any other choice works through
 the same adapters but is unverified. Precedence: environment variable > the user's
 `orch models set` file (<data dir>/models.json) > the verified default.
 
-A route is written `provider/model:effort`; the reviewer takes a short name. Providers:
+A route is written `provider/model:effort`. Providers:
 bring your own CLI subscription or key — `claude` (Claude Code), `codex` (Codex CLI),
 `cursor` (Cursor CLI) — or bring your own key — `dsh` (DeepSeek, pinned route) and any
 OpenAI-compatible endpoint registered with `orch providers add`. Kimi's subscription
@@ -35,7 +35,7 @@ class Choice:
         return f"{self.provider}/{self.model}" + (f":{self.effort}" if self.effort else "")
 
 
-CLAUDE_EFFORTS = ("low", "medium", "high", "max")
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DSF_MODELS = ("deepseek-flash",)  # V4 Pro is not offered (maintainer decision)
 DSF_EFFORTS = ("off", "low", "high", "max")
@@ -43,43 +43,40 @@ BYOK_EFFORTS = ("", "low", "medium", "high")
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}")
 # Subscriptions whose terms forbid automated, non-interactive use.
 FORBIDDEN = {"kimi": "Kimi's subscription does not allow non-interactive automation"}
-REVIEWERS = ("planner", "opus-low", "sonnet", "sonnet-high", "dsf", "off")
 
-ROLES = ("planner", "test_designer", "builder", "reviewer")
+ROLES = ("planner", "supervisor", "test_designer", "builder")
 # What the published benchmarks ran (README, docs/measurements).
 VERIFIED: dict[str, str] = {
     "planner": "claude/claude-opus-5-5:medium",
+    "supervisor": "claude/claude-opus-5-5:medium",
     "test_designer": "dsh/deepseek-flash:low",
     "builder": "dsh/deepseek-flash:low",
     # Off by default: on NetworkX (2026-11-02) the shard review added US$1-3 and 100-300 s of
     # planning per run without a consistent acceptance gain; the decisive-assertion rule in
     # test design fixed the misses it targeted (rollout 8/8, 975 s, review off).
-    "reviewer": "off",
 }
 DESCRIPTIONS = {
-    "planner": "splits the spec into tasks, boundaries and interfaces",
+    "planner": "splits the spec into components, tasks and contracts; writes the "
+               "integration checks",
+    "supervisor": "judges a task's failures (retry, revise tests, split, escalate ...) "
+                  "and makes the escalated attempt",
     "test_designer": "writes each task's frozen tests",
     "builder": "implements tasks against the frozen tests",
-    "reviewer": "checks each test shard before it is frozen",
 }
 # Environment variables that override a role (older single-purpose names included).
 ENVIRONMENT = {
     "planner": "ORCHESTRA_PLANNER",
+    "supervisor": "ORCHESTRA_SUPERVISOR",
     "test_designer": "ORCHESTRA_TEST_DESIGNER",
     "builder": "ORCHESTRA_BUILDER",
-    "reviewer": "ORCHESTRA_REVIEW_MODEL",
 }
 
 
 def parse(role: str, value: str, data_dir: Path | None = None) -> Choice | str:
-    """Validate one role's value: a Choice for model roles, a name for the reviewer."""
+    """Validate one role's value as a Choice."""
     if role not in ROLES:
         raise ValueError(f"role must be one of {', '.join(ROLES)}")
     value = value.strip()
-    if role == "reviewer":
-        if value not in REVIEWERS:
-            raise ValueError(f"reviewer must be one of {', '.join(REVIEWERS)}")
-        return value
     provider, _, rest = value.partition("/")
     model, _, effort = rest.rpartition(":") if ":" in rest else (rest, "", "")
     if provider not in {"claude", "codex", "cursor", "dsh"} and effort not in BYOK_EFFORTS:
@@ -127,8 +124,6 @@ def legacy(role: str) -> str | None:
         return f"claude/claude-opus-5-5:{os.environ['ORCHESTRA_PLAN_EFFORT']}"
     if role == "test_designer" and os.environ.get("ORCHESTRA_DSF_TEST_EFFORT"):
         return f"dsh/deepseek-flash:{os.environ['ORCHESTRA_DSF_TEST_EFFORT']}"
-    if role == "reviewer" and os.environ.get("ORCHESTRA_COVERAGE_REVIEW") == "0":
-        return "off"
     return None
 
 

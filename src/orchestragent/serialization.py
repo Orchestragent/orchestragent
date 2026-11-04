@@ -19,3 +19,16 @@ def normalize(value: object) -> object:
 
 def dumps(value: object) -> str:
     return json.dumps(normalize(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def object_schema(properties: dict[str, object]) -> dict[str, object]:
+    """A closed JSON-schema object whose every property is required."""
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+TEXT = {"type": "string"}

@@ -1,0 +1,4 @@
+{
+  "command": "cd api && GOCACHE=\"$TMPDIR/gocache\" go test ./... && cd ../web && npx vitest run test/acceptance.test.ts && npx tsc --noEmit -p .",
+  "files": ["api/ledger/acceptance_test.go", "web/test/acceptance.test.ts"]
+}

@@ -19,7 +19,6 @@ from orchestragent.store import Conflict, Store
 # API routes that may hold a CNY budget, with the per-call reservations each may make.
 BUDGETED: dict[str, frozenset[int]] = {
     "dsh": frozenset({300, 1000}),
-    "jev": frozenset({2}),
 }
 # The existing DSH guard's explicit pre-inference rejection list, shared by all transports.
 REJECTED_STATUSES = frozenset({400, 401, 402, 403, 404, 413, 415, 422, 429})
@@ -58,7 +57,7 @@ class Access:
     def operation(provider: str, cap_cents: int, funding_kind: str) -> dict[str, object]:
         # 0 = no local cap (the default for orch keys); a cap is recorded, never enforced.
         if provider not in BUDGETED or type(cap_cents) is not int or not 0 <= cap_cents <= 50000:
-            raise ValueError("API budget must be 0–500 CNY for dsh or jev")
+            raise ValueError("API budget must be 0–500 CNY for dsh")
         if funding_kind not in {"balance", "budget"}:
             raise ValueError("Confirm whether the quoted amount is balance or budget")
         operation: dict[str, object] = {
